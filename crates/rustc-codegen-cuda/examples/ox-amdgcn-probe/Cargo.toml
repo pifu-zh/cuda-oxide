@@ -1,0 +1,14 @@
+[package]
+name = "ox-amdgcn-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# [PORT gfx1030] AMDGPU 探针例: device 管线最小验证
+# 刻意不依赖 cuda-core/cuda-host(即 cuda-bindings): host 侧无 CUDA 依赖,
+# 构建不触发 CUDA toolkit 探测; device 产物(.ll/.ptx)用于 AMD 后端验证。
+
+[dependencies]
+cuda-device = { path = "../../../cuda-device" }
+
+[workspace]
