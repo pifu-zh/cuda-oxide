@@ -149,10 +149,15 @@ def _append_ntid_kernarg_param(text: str) -> str:
             body = "\n".join(block)
             # 仅当函数体用到 %ntid_x 且签名尚未含该参数时追加
             if "%ntid_x" in body and "%ntid_x" not in block[0]:
-                m = re.search(r"\)\s*(?:#\d+\s*)?\{\s*$", block[0])
-                if m:
+                # 参数表收尾 ")" = "{" 之前最后一个 ")"（")" 与 "{" 之间只允许
+                # 空白/flags（alwaysinline 等）/属性引用 #N——参数内的 "())"
+                # （如 captures(none)）必然位于收尾 ")" 之前
+                brace = block[0].rfind("{")
+                paren = block[0].rfind(")", 0, brace)
+                between = block[0][paren + 1 : brace]
+                if paren >= 0 and re.fullmatch(r"[\s#\w,=]*", between):
                     block[0] = (
-                        block[0][: m.start()] + ", i32 %ntid_x" + block[0][m.start() :]
+                        block[0][:paren] + ", i32 %ntid_x" + block[0][paren:]
                     )
             out.extend(block)
         else:
