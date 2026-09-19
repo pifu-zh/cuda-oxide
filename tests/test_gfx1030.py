@@ -333,6 +333,63 @@ def test_ir_translate_barrier():
     assert translate_nvvm_to_amdgcn(out) == out, "barrier 改写不幂等"
 
 
+# Step 10（warp shuffle → ds_bpermute）探针 fixture
+SAMPLE_SHFL_IR = """\
+target datalayout = "e-i64:64-i128:128-v16:16-v32:32-n16:32:64"
+target triple = "nvptx64-nvidia-cuda"
+
+declare float @llvm.nvvm.shfl.sync.bfly.f32(i32, float, i32, i32) #3
+declare float @llvm.nvvm.shfl.sync.down.f32(i32, float, i32, i32) #3
+declare float @llvm.nvvm.shfl.sync.idx.f32(i32, float, i32, i32) #3
+declare float @llvm.nvvm.shfl.sync.up.f32(i32, float, i32, i32) #3
+declare i32 @llvm.nvvm.read.ptx.sreg.laneid() #2
+
+define ptx_kernel void @warp_probe(ptr %v0, i64 %v1) #1 {
+entry:
+  %lane = tail call i32 @llvm.nvvm.read.ptx.sreg.laneid() #3
+  %val = load float, ptr %v0, align 4
+  %bf = tail call float @llvm.nvvm.shfl.sync.bfly.f32(i32 -1, float %val, i32 1, i32 31) #3
+  %dn = tail call float @llvm.nvvm.shfl.sync.down.f32(i32 -1, float %val, i32 2, i32 31) #3
+  %ix = tail call float @llvm.nvvm.shfl.sync.idx.f32(i32 -1, float %val, i32 0, i32 31) #3
+  %up = tail call float @llvm.nvvm.shfl.sync.up.f32(i32 -1, float %val, i32 1, i32 31) #3
+  %s = fadd float %bf, %dn
+  %s2 = fadd float %s, %ix
+  %s3 = fadd float %s2, %up
+  store float %s3, ptr %v0, align 4
+  ret void
+}
+
+define ptx_kernel void @f64_probe(ptr %v0, i64 %v1) #1 {
+entry:
+  %v = load i64, ptr %v0, align 8
+  %bf64 = tail call i64 asm sideeffect "{ .reg .b32 lo; .reg .b32 hi; mov.b64 {lo, hi}, $1; shfl.sync.bfly.b32 lo, lo, $2, 31, $3; shfl.sync.bfly.b32 hi, hi, $2, 31, $3; mov.b64 $0, {lo, hi}; }", "=l,l,r,r"(i64 %v, i32 1, i32 -1) #3
+  store i64 %bf64, ptr %v0, align 8
+  ret void
+}
+"""
+
+
+def test_ir_translate_shuffle():
+    """Step 10/10c：shfl → ds_bpermute（*4 字节偏移）、laneid → mbcnt.lo、
+    f64 PTX-asm 拆分 → 双 ds_bpermute（GPU 数值已验证四模式 + i32 + f64）。"""
+    out = translate_nvvm_to_amdgcn(SAMPLE_SHFL_IR)
+
+    assert "llvm.nvvm" not in out, "shfl/laneid intrinsic 残留"
+    # laneid → mbcnt.lo；shfl 结果写回原 SSA 名
+    assert "%lane = call i32 @llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)" in out
+    # NV lane 号 → AMD 字节偏移：shl src, 2（f32×4 + f64 拆分的 off 共 5）
+    assert out.count("shl i32") == 5, "字节偏移转换缺失"
+    assert out.count("@llvm.amdgcn.ds.bpermute") == 4 + 2, "f32×4 + f64 拆分×2"
+    # down 的段外回自身：select + icmp ule
+    assert "icmp ule i32" in out
+    assert "select i1" in out
+    # f64 asm：lo/hi 双通道 + 重组
+    assert "trunc i64 %v to i32" in out
+    assert "or i64" in out
+    assert "shfl.sync.bfly.b32" not in out, "PTX asm 残留"
+    assert translate_nvvm_to_amdgcn(out) == out, "shuffle 改写不幂等"
+
+
 # ---------------------------------------------------------------------------
 # 测试 2：cuda-oxide 管线副产物 .ptx 存在性
 # ---------------------------------------------------------------------------
