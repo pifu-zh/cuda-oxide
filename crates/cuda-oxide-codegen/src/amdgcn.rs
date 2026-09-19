@@ -71,6 +71,187 @@ pub fn amdgcn_target(arch: Option<&str>) -> Option<&str> {
     valid.then_some(arch)
 }
 
+/// Whether a line is a typed-pointer-IR `bitcast <ty>* %name` use (the
+/// non-`opt` IR shape where an addrspace(5) alloca would make the bitcast
+/// illegal across address spaces).
+fn has_typed_pointer_bitcast(ll: &str) -> bool {
+    ll.lines().any(|line| {
+        let Some(idx) = line.find("bitcast") else {
+            return false;
+        };
+        line[idx..].split(';').next().is_some_and(|code| code.contains("* %"))
+    })
+}
+
+/// Splits `s` on top-level commas: `<`, `[`, `(` open a group and `,` inside
+/// a group does not split (port of the script's `_split_top_level_commas`).
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '<' | '[' | '(' => depth += 1,
+            '>' | ']' | ')' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(s[start..].trim());
+    parts
+}
+
+/// Replaces whole-token occurrences of `name` with `repl` (token = not
+/// surrounded by [`w.$`]).
+fn replace_token(line: &str, name: &str, repl: &str) -> String {
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_' || c == '.' || c == '$';
+    let mut out = String::with_capacity(line.len() + repl.len());
+    let mut rest = line;
+    while let Some(pos) = rest.find(name) {
+        let before_ok = pos == 0 || !rest[..pos].chars().next_back().is_some_and(is_ident);
+        let after = &rest[pos + name.len()..];
+        let after_ok = !after.chars().next().is_some_and(is_ident);
+        if before_ok && after_ok {
+            out.push_str(&rest[..pos]);
+            out.push_str(repl);
+            rest = after;
+        } else {
+            out.push_str(&rest[..pos + name.len()]);
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Rewrites generic-address-space allocas to `addrspace(5)` inside every
+/// function, inserting one `addrspacecast` per alloca right after its
+/// definition and renaming uses to the cast (Rust port of the script's
+/// `_rewrite_allocas`, gfx1030 batch-verified).
+///
+/// Correctness (script doc): an entry-block alloca dominates every use, so
+/// one cast per alloca suffices; use replacement is a token-level SSA rename.
+/// `llvm.lifetime`/`dbg` uses that require the alloca's own address space do
+/// not occur in cuda-oxide output (14-example batch grep evidence); if one
+/// ever does, the module fails verification explicitly instead of silently.
+fn rewrite_allocas(ll: &str) -> String {
+    if !ll.contains("= alloca ") || has_typed_pointer_bitcast(ll) {
+        return ll.to_string();
+    }
+    let lines: Vec<&str> = ll.lines().collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        if !(lines[i].starts_with("define ") && lines[i].trim_end().ends_with('{')) {
+            out.push(lines[i].to_string());
+            i += 1;
+            continue;
+        }
+        // Collect the function body (define line .. closing "}" line).
+        let func_start = i;
+        let mut end = i + 1;
+        while end < lines.len() && lines[end] != "}" {
+            end += 1;
+        }
+        let body: Vec<&str> = lines[func_start..=end.min(lines.len() - 1)].to_vec();
+        out.extend(rewrite_allocas_in_function(&body));
+        i = end + 1;
+    }
+    let mut text = out.join("\n");
+    if ll.ends_with('\n') && !text.is_empty() {
+        text.push('\n');
+    }
+    text
+}
+
+/// Single-function alloca rewrite (body = define line .. "}" line).
+fn rewrite_allocas_in_function(body: &[&str]) -> Vec<String> {
+    struct Alloca<'a> {
+        line: usize,
+        name: &'a str,
+        new_def: String,
+    }
+    let mut allocas: Vec<Alloca> = Vec::new();
+    for (k, line) in body.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let indent_len = line.len() - trimmed.len();
+        let Some(eq) = trimmed.find(" = alloca ") else {
+            continue;
+        };
+        if !trimmed.starts_with('%') {
+            continue;
+        }
+        let name = &trimmed[..eq];
+        // `%` prefix + [\w.$] body (script's `%[\w.$]+`).
+        if !name.starts_with('%')
+            || !name[1..]
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'$'))
+        {
+            continue;
+        }
+        let rest = trimmed[eq + " = alloca ".len()..].trim();
+        if rest.contains("addrspace(") || rest.contains('-') || rest.contains('>') {
+            continue;
+        }
+        // Script order: strip the trailing `, align N` FIRST, then split the
+        // remaining `<ty>[, <count>]` on top-level commas.
+        let mut align = None;
+        let mut head = rest;
+        if let Some(idx) = rest.rfind(", align ") {
+            let candidate = rest[idx + ", align ".len()..].trim();
+            if !candidate.is_empty() && candidate.bytes().all(|b| b.is_ascii_digit()) {
+                align = Some(candidate);
+                head = rest[..idx].trim();
+            }
+        }
+        let parts = split_top_level_commas(head);
+        if parts.len() > 2 || parts.first() == Some(&"void") {
+            continue; // unparseable shape: keep as-is, llc verifier fails loudly
+        }
+        let ty = parts[0];
+        let count = parts.get(1).copied();
+        let mut new_def = format!("{}{} = alloca {}", &line[..indent_len], name, ty);
+        if let Some(count) = count {
+            new_def.push_str(&format!(", {count}"));
+        }
+        if let Some(align) = align {
+            new_def.push_str(&format!(", align {align}"));
+        }
+        new_def.push_str(", addrspace(5)");
+        allocas.push(Alloca {
+            line: k,
+            name,
+            new_def,
+        });
+    }
+    if allocas.is_empty() {
+        return body.iter().map(|l| l.to_string()).collect();
+    }
+    let mut out: Vec<String> = Vec::with_capacity(body.len() + allocas.len());
+    for (k, line) in body.iter().enumerate() {
+        if let Some(alloca) = allocas.iter().find(|a| a.line == k) {
+            // Alloca definition line: new def + the cast right after it (the
+            // alloca dominates all uses, so one cast serves the function).
+            out.push(alloca.new_def.clone());
+            out.push(format!(
+                "{}.ac = addrspacecast ptr addrspace(5) {} to ptr",
+                alloca.name, alloca.name
+            ));
+            continue;
+        }
+        let mut line = line.to_string();
+        for alloca in &allocas {
+            line = replace_token(&line, alloca.name, &format!("{}.ac", alloca.name));
+        }
+        out.push(line);
+    }
+    out
+}
+
 /// Removes a `declare` line for one fully-qualified intrinsic name.
 fn strip_declares(ll: &str, callee: &str) -> String {
     let needle = format!("@{callee}(");
@@ -241,7 +422,24 @@ pub fn rewrite_ir_for_amdgcn(ll: &str) -> Result<String, String> {
     ] {
         text = strip_declares(&text, callee);
     }
+    // 8. generic allocas → addrspace(5) + per-alloca addrspacecast at the use
+    //    sites (AMDGPU module verifier contract; batch-verified).
+    text = rewrite_allocas(&text);
     Ok(text)
+}
+
+/// The pre-`opt` half of the prep pass: only the alloca → `addrspace(5)`
+/// rewrite (step 8), which `opt` requires just to *accept* an amdgcn-layout
+/// module.
+///
+/// `opt` must run BEFORE the ntid/nctaid rewrite (steps 5-7): `alwaysinline`
+/// device helpers that read `ntid` fold into their kernels there, so the
+/// kernarg parameter lands on the kernel's own signature exactly like the
+/// Phase-1 pipeline (which rewrote post-`opt` output). Appending the
+/// parameter to an as-yet-uninlined device function would leave its call
+/// sites at the old arity — a silently mismatched ABI.
+pub fn rewrite_allocas_for_amdgcn(ll: &str) -> Result<String, String> {
+    Ok(rewrite_allocas(ll))
 }
 
 #[cfg(test)]
@@ -365,5 +563,59 @@ entry:
         let out = rewrite_ir_for_amdgcn(ll).unwrap();
         assert!(out.contains("= or i32 %ntid_x, 0"));
         assert!(out.contains("define hidden i32 @helper(i32 %ntid_x) #0 {"));
+    }
+
+    #[test]
+    fn zst_alloca_moves_to_addrspace5_with_use_renamed() {
+        // The exact shape that failed `opt` on the probe example.
+        let ll = "\
+define amdgpu_kernel void @k(i64 %n) #0 {
+entry:
+  %v15 = alloca {}, align 1
+  %v16 = getelementptr inbounds {}, ptr %v15, i64 0
+  ret void
+}
+";
+        let out = rewrite_ir_for_amdgcn(ll).unwrap();
+        assert!(out.contains("  %v15 = alloca {}, align 1, addrspace(5)\n"));
+        assert!(out.contains("%v15.ac = addrspacecast ptr addrspace(5) %v15 to ptr\n"));
+        assert!(out.contains("getelementptr inbounds {}, ptr %v15.ac, i64 0"));
+        // no bare uses of the alloca name outside its own definition/cast
+        for line in out.lines() {
+            if line.contains("%v15")
+                && !line.contains("alloca")
+                && !line.contains("addrspacecast")
+            {
+                assert!(line.contains("%v15.ac"), "bare use survived: {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn allocas_already_in_addrspace5_are_untouched() {
+        let ll = "\
+define amdgpu_kernel void @k() #0 {
+entry:
+  %buf = alloca [16 x i32], align 4, addrspace(5)
+  %g = addrspacecast ptr addrspace(5) %buf to ptr
+  ret void
+}
+";
+        assert_eq!(rewrite_ir_for_amdgcn(ll).unwrap(), ll);
+    }
+
+    #[test]
+    fn typed_pointer_bitcast_shapes_are_left_for_an_explicit_failure() {
+        let ll = "\
+define amdgpu_kernel void @k() #0 {
+entry:
+  %p = alloca i8, align 1
+  %q = bitcast i8* %p to i32*
+  ret void
+}
+";
+        // Typed-pointer IR is rejected upstream anyway; the pass must not
+        // produce an illegal cross-address-space bitcast.
+        assert!(rewrite_ir_for_amdgcn(ll).unwrap().contains("alloca i8, align 1\n"));
     }
 }
