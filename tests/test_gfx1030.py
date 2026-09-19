@@ -633,6 +633,44 @@ def test_ir_translate_counted_barrier():
     assert translate_nvvm_to_amdgcn(out) == out, "counted barrier 改写不幂等"
 
 
+# Step 15（libdevice __nv_* → ocml __ocml_*）探针 fixture
+SAMPLE_OCML_IR = """\
+target datalayout = "e-i64:64-i128:128-v16:16-v32:32-n16:32:64"
+target triple = "nvptx64-nvidia-cuda"
+
+declare double @__nv_tan(double)
+declare float @__nv_tanf(float)
+declare double @__nv_nonstandard_weird(double)
+
+define ptx_kernel void @tan_probe(ptr %out, double %x, float %y) #1 {
+entry:
+  %t64 = call double @__nv_tan(double %x) #0
+  %t32 = call float @__nv_tanf(float %y) #0
+  %w = call double @__nv_nonstandard_weird(double %x) #0
+  %s = fadd double %t64, %w
+  store float %t32, ptr %out, align 4
+  ret void
+}
+"""
+
+
+def test_ir_translate_ocml():
+    """Step 15：libdevice 名 → ocml 名（__nv_Xf → __ocml_X_f32、__nv_X →
+    __ocml_X_f64；导出名经 llvm-nm ocml.bc 实证，llvm-link 链接期解析）。
+    表外 __nv_* 保留（链接期 undefined symbol 显式失败）。
+    （GPU 数值已验证：f32/f64 tan 对 host libm ≤2 ULP。）"""
+    out = translate_nvvm_to_amdgcn(SAMPLE_OCML_IR)
+
+    assert "@__nv_tanf(" not in out and "@__nv_tan(" not in out, "libdevice 名残留"
+    assert "declare double @__ocml_tan_f64(double)" in out, "f64 声明未映射"
+    assert "declare float @__ocml_tan_f32(float)" in out, "f32 声明未映射"
+    assert "call double @__ocml_tan_f64(double %x)" in out
+    assert "call float @__ocml_tan_f32(float %y)" in out
+    # 表外符号不动（显式失败信号）
+    assert "@__nv_nonstandard_weird(" in out
+    assert translate_nvvm_to_amdgcn(out) == out, "ocml 改写不幂等"
+
+
 # ---------------------------------------------------------------------------
 # 测试 2：cuda-oxide 管线副产物 .ptx 存在性
 # ---------------------------------------------------------------------------
