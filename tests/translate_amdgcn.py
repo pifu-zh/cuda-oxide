@@ -17,6 +17,10 @@
 #   7. 删除已映射 intrinsic 的 nvvm declare（llc 自动声明 amdgcn 目标 intrinsic）
 #   8. alloca → addrspace(5) + use 点 addrspacecast（AMDGPU 本地帧契约，
 #      "alloca on amdgpu must be in addrspace(5)"，批量实证 module verifier 拒绝）
+#  12. isspacep.local/shared/global → llvm.amdgcn.is.private/shared/global
+#      （atomic 地址分类；HIP 语境 local=scratch/private）
+# 12b. membar.gl/cta/sys → fence（agent/workgroup/system 域，.ll 层直接写）
+# 12c. syncscope("device"/"block") → ("agent"/"workgroup")（NV scope 名 → AMD）
 #
 # 未映射 intrinsic 的 declare 保留——其调用点让 llc 报 Cannot select，
 # 作为"能力未覆盖"的显式失败信号（不静默放弃）。
@@ -81,6 +85,8 @@ def translate_nvvm_to_amdgcn(ll_text: str) -> str:
         r"|nvvm\.shfl\.sync\.(?:idx|bfly|up|down)\.(?:f32|i32)"
         r"|nvvm\.read\.ptx\.sreg\.laneid"
         r"|nvvm\.redux\.sync\.add"
+        r"|nvvm\.isspacep\.(?:local|shared|global)"
+        r"|nvvm\.membar\.(?:gl|sys|cta)"
         r"|amdgcn\.work(?:group|item)\.id\.x"
         r")\("
     )
@@ -122,6 +128,13 @@ def translate_nvvm_to_amdgcn(ll_text: str) -> str:
 
     # 11. redux.sync.add → 蝶形归约软件回退（gfx1030 无硬件 redux 指令）
     text = _rewrite_redux_add(text)
+
+    # 12. atomics 族：isspacep → amdgcn.is.*、membar → fence、NV scope 名 → AMD
+    text = _rewrite_atomics(text)
+
+    # 12d. Rust core atomics 的内嵌 PTX asm（fence/acquire load/release store/
+    #      seqcst load）→ LLVM 原子指令（层叠契约：isspacep 清零后才暴露）
+    text = _rewrite_ptx_atomic_asm(text)
 
     return text
 
@@ -481,6 +494,140 @@ def _rewrite_redux_add(text: str) -> str:
     return "\n".join(out)
 
 
+# ---------------------------------------------------------------------------
+# Step 12: atomics 族（isspacep / membar / NV scope 名）
+# ---------------------------------------------------------------------------
+
+# 探针实证（nightly-2026-08-28 llc, gfx1030）：
+# - llvm.amdgcn.is.private/is.shared/is.global 均存在，签名 i1(ptr)，
+#   对 generic 指针做硬件地址域判定（alloca 派生 → private=true、全局参数=false，
+#   GPU 数值探针 ATOMPROBE PASS）
+# - fence 语法：fence syncscope("<domain>") seq_cst / fence seq_cst（空=system）
+# - atomicrmw/cmpxchg 的 NV scope 名不被接受（"Unsupported atomic synchronization
+#   scope"）：device→agent、block→workgroup（层叠契约：isspacep 清零后才暴露）
+
+
+def _rewrite_atomics(text: str) -> str:
+    """地址分类 + 内存栅栏 + 同步域名的跨架构映射（同名替换保 SSA 引用不变）。"""
+    if "isspacep" in text:
+        # HIP/AMD 地址空间语义：NV local(线程私有 scratch) = AMD private(AS5)
+        text = text.replace("@llvm.nvvm.isspacep.local(", "@llvm.amdgcn.is.private(")
+        text = text.replace("@llvm.nvvm.isspacep.shared(", "@llvm.amdgcn.is.shared(")
+        text = text.replace("@llvm.nvvm.isspacep.global(", "@llvm.amdgcn.is.global(")
+    if "membar" in text:
+        # membar.gl（设备域）→ agent；membar.cta（CTA 域）→ workgroup；
+        # membar.sys（系统域）→ 空 syncscope = system
+        text = re.sub(
+            r"(?:tail )?call void @llvm\.nvvm\.membar\.gl\(\)(?:\s*#\d+)?",
+            'fence syncscope("agent") seq_cst',
+            text,
+        )
+        text = re.sub(
+            r"(?:tail )?call void @llvm\.nvvm\.membar\.cta\(\)(?:\s*#\d+)?",
+            'fence syncscope("workgroup") seq_cst',
+            text,
+        )
+        text = re.sub(
+            r"(?:tail )?call void @llvm\.nvvm\.membar\.sys\(\)(?:\s*#\d+)?",
+            "fence seq_cst",
+            text,
+        )
+    # NV 与 AMD 的 scope 命名不同（atomics 实产：device ×22、block ×2）
+    text = text.replace('syncscope("device")', 'syncscope("agent")')
+    text = text.replace('syncscope("block")', 'syncscope("workgroup")')
+    return text
+
+
+# 实产形态（atomics 实例 .opt.ll，Rust core::sync::atomic 的 NVPTX 降级）：
+#   call void asm sideeffect "fence.acq_rel.{cta|gpu|sys};", "~{memory}"()
+#   %r = {tail }call i32 asm sideeffect "ld.acquire.{gpu|sys}.b32 $0, [$1];",
+#          "=r,l,~{memory}"(ptr %p)                       ; b64 → i64/ptr 结果
+#   %r = call {i64|ptr} asm sideeffect
+#          "fence.sc.sys; ld.acquire.sys.b64 $0, [$1];", "=l,l,~{memory}"(ptr %p)
+#   call void asm sideeffect "st.release.{gpu|sys}.b{32|64} [$0], $1;",
+#          "l,{r|l},~{memory}"(ptr %p, {i32|i64|ptr} %v)
+# 映射（语法经 llc 探针实证；GPU MP 数值探针 ATOMPROBE/MP PROBE PASS）：
+#   fence: cta→workgroup、gpu→agent、sys→空(system)；acq_rel→acq_rel、sc→seq_cst
+#   ld.acquire: load atomic acquire（gpu→syncscope("agent")，sys→默认 system 域）；
+#   fence.sc 前缀的 seqcst load → 单条 load atomic seq_cst（更强的单指令等价）
+#   st.release: store atomic release（scope 同上）
+_PTXX_ASM_FENCE_RE = re.compile(
+    r'^(?P<indent>\s*)(?:tail )?call\s+void\s+asm\s+sideeffect\s+'
+    r'"fence\.(?P<ord>acq_rel|sc)\.(?P<scope>cta|gpu|sys);",\s*'
+    r'"~\{memory\}"\(\)\s*(?:#\d+)?\s*$'
+)
+
+_PTXX_ASM_LOAD_RE = re.compile(
+    r'^(?P<indent>\s*)(?:(?P<res>%[\w.$]+)\s*=\s*)?(?:tail )?call\s+'
+    r'(?P<ty>i32|i64|ptr)\s+asm\s+sideeffect\s+'
+    r'"(?:(?P<sc>fence\.sc\.sys); )?ld\.acquire\.(?P<scope>gpu|sys)\.'
+    r'b(?P<bits>32|64)\s+\$0,\s*\[\$1\];",\s*"=[rl],l,~\{memory\}"\(\s*ptr\s+'
+    r'(?P<attrsq>(?:nonnull\s+)?)?(?P<ptr>[^,)]+?)\s*\)\s*(?:#\d+)?\s*$'
+)
+
+_PTXX_ASM_STORE_RE = re.compile(
+    r'^(?P<indent>\s*)(?:tail )?call\s+void\s+asm\s+sideeffect\s+'
+    r'"st\.release\.(?P<scope>gpu|sys)\.b(?P<bits>32|64)\s+\[\$0\], \$1;",\s*'
+    r'"l,[rl],~\{memory\}"\(\s*ptr\s+(?P<attrsq>(?:nonnull\s+)?)?'
+    r'(?P<ptr>[^,]+?),\s*(?P<vty>i32|i64|ptr)\s+(?P<val>[^,)]+?)\s*\)\s*(?:#\d+)?\s*$'
+)
+
+_SCOPE_MAP = {"cta": 'syncscope("workgroup")', "gpu": 'syncscope("agent")', "sys": ""}
+_ORD_MAP = {"acq_rel": "acq_rel", "sc": "seq_cst"}
+
+
+def _strip_param_attrs(operand: str) -> str:
+    """store 值操作数剥参数属性（nonnull/noundef——store 目标无需携带）。"""
+    return re.sub(r"^(?:nonnull|noundef)\s+", "", operand.strip())
+
+
+def _rewrite_ptx_atomic_asm(text: str) -> str:
+    if 'asm sideeffect "fence.' not in text and "ld.acquire." not in text \
+            and "st.release." not in text:
+        return text
+    lines = text.split("\n")
+    out = []
+    for line in lines:
+        m = _PTXX_ASM_FENCE_RE.match(line)
+        if m:
+            scope = _SCOPE_MAP[m.group("scope")]
+            scope_s = f"{scope} " if scope else ""
+            out.append(f"{m.group('indent')}fence {scope_s}"
+                       f"{_ORD_MAP[m.group('ord')]}")
+            continue
+        m = _PTXX_ASM_LOAD_RE.match(line)
+        if m:
+            if not m.group("res"):
+                out.append(line)  # 结果未使用：保守留残
+                continue
+            scope = _SCOPE_MAP[m.group("scope")]
+            scope_s = f" {scope}" if scope else ""
+            order = "seq_cst" if m.group("sc") else "acquire"
+            align = 4 if m.group("bits") == "32" else 8
+            out.append(
+                f"{m.group('indent')}{m.group('res')} = load atomic "
+                f"{m.group('ty')}, ptr {m.group('ptr')}{scope_s} {order}, "
+                f"align {align}"
+            )
+            continue
+        m = _PTXX_ASM_STORE_RE.match(line)
+        if m:
+            scope = _SCOPE_MAP[m.group("scope")]
+            scope_s = f" {scope}" if scope else ""
+            align = 4 if m.group("bits") == "32" else 8
+            out.append(
+                f"{m.group('indent')}store atomic {m.group('vty')} "
+                f"{_strip_param_attrs(m.group('val'))}, ptr {m.group('ptr')}"
+                f"{scope_s} release, align {align}"
+            )
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def _append_ntid_kernarg_param(text: str) -> str:
     """给调用了 ntid.x 的 kernel 签名末尾追加 `i32 %ntid_x` 参数。"""
     lines = text.split("\n")
