@@ -592,6 +592,47 @@ def test_ir_translate_dotprod():
     assert translate_nvvm_to_amdgcn(out) == out, "dotprod 改写不幂等"
 
 
+# Step 14（counted barrier → LDS 计数器+世代自旋）探针 fixture
+SAMPLE_CBAR_IR = """\
+target datalayout = "e-i64:64-i128:128-v16:16-v32:32-n16:32:64"
+target triple = "nvptx64-nvidia-cuda"
+
+declare void @llvm.nvvm.barrier.cta.sync.count(i32, i32) #1
+declare void @llvm.nvvm.barrier.cta.arrive.count(i32, i32) #1
+
+define ptx_kernel void @cb_probe(ptr %out, i64 %nout) #1 {
+entry:
+  %tid = tail call i32 @llvm.nvvm.read.ptx.sreg.tid.x() #3
+  tail call void @llvm.nvvm.barrier.cta.sync.count(i32 1, i32 64) #3
+  tail call void @llvm.nvvm.barrier.cta.arrive.count(i32 2, i32 64) #3
+  ret void
+}
+"""
+
+
+def test_ir_translate_counted_barrier():
+    """Step 14：counted barrier → 软件 LDS 计数器+世代自旋回退（helper 函数 +
+    入口槽位清零 + 全组 s.barrier）。（GPU 数值已验证：producer/consumer 与
+    split arrive/sync，128 线程 wave64 PASS。）"""
+    out = translate_nvvm_to_amdgcn(SAMPLE_CBAR_IR)
+
+    assert "llvm.nvvm.barrier" not in out, "counted barrier intrinsic 残留"
+    assert "call void @__port_cb_sync(i32 1, i32 64)" in out, "sync.count 未映射"
+    assert "call void @__port_cb_arrive(i32 2, i32 64)" in out, "arrive.count 未映射"
+    # 槽位状态 + helper 定义
+    assert "@__port_cb_cnt = addrspace(3) global [16 x i32] undef, align 4" in out
+    assert "@__port_cb_gen = addrspace(3) global [16 x i32] undef, align 4" in out
+    assert "define internal void @__port_cb_arrive(i32 %id, i32 %n)" in out
+    assert "define internal void @__port_cb_sync(i32 %id, i32 %n) convergent" in out
+    # 入口 init：两槽清零 + 全组 barrier（保证清零对原子操作可见）
+    assert "counted-barrier slot init (ids: 1,2)" in out
+    assert out.count("store atomic i32 0, ptr addrspace(3) %__port_cb_i") == 4
+    assert "call void @llvm.amdgcn.s.barrier()" in out
+    # 世代自旋（volatile 防优化掉）
+    assert "load atomic volatile i32" in out
+    assert translate_nvvm_to_amdgcn(out) == out, "counted barrier 改写不幂等"
+
+
 # ---------------------------------------------------------------------------
 # 测试 2：cuda-oxide 管线副产物 .ptx 存在性
 # ---------------------------------------------------------------------------
