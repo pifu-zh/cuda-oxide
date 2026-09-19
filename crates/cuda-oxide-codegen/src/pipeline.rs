@@ -152,6 +152,10 @@ pub enum ModuleArtifactKind {
     Ptx,
     /// NVVM-compatible LLVM IR for a later libNVVM/nvJitLink step.
     NvvmIr,
+    /// [PORT gfx1030] Linked AMDGPU code object (shared ELF) produced by
+    /// `llc -march=amdgcn --filetype=obj` + `lld -shared`, loadable via
+    /// `hipModuleLoadData`.
+    Hsaco,
 }
 
 /// Successful shared-pipeline result.
@@ -298,17 +302,32 @@ pub fn compile_translated_module(
             ToolchainPolicy::Explicit(toolchain) => toolchain.llvm_link.is_some(),
         };
 
+    // [PORT gfx1030] `CUDA_OXIDE_TARGET=gfx…` selects the AMDGPU path. The
+    // value must also survive into `ptx.rs`, which re-parses the same
+    // `backend.target_arch` string.
+    let amdgcn_target = crate::amdgcn::amdgcn_target(backend.target_arch.as_deref());
     // Choose the intrinsic ABI while calls are still typed MIR. Generated
     // intrinsics may have different LLVM signatures for `llc` and libNVVM, so
     // discovering NVVM mode only after lowering is too late.
-    let backend_selection =
-        select_pre_lowering_backend(ctx, module, request.output_policy, can_ir_link_libdevice);
+    let backend_selection = select_pre_lowering_backend(
+        ctx,
+        module,
+        request.output_policy,
+        can_ir_link_libdevice,
+        amdgcn_target.is_some(),
+    );
     let generated_requirements = collect_generated_intrinsic_requirements_for_backend(
         ctx,
         module,
         request.generated_marker_policy,
         match backend_selection.intrinsic_backend {
-            mir_lower::IntrinsicBackend::LlvmNvptx => GeneratedIntrinsicBackend::LlvmNvptx,
+            // [PORT gfx1030] The AMDGPU path keeps the `LlvmNvptx` generated
+            // ABI forms as its base; the sreg name remap happens in lowering
+            // and the ntid/nctaid rewrite in the amdgcn prep pass, so no
+            // generated-requirements variant is needed for it.
+            mir_lower::IntrinsicBackend::LlvmNvptx | mir_lower::IntrinsicBackend::Amdgcn => {
+                GeneratedIntrinsicBackend::LlvmNvptx
+            }
             mir_lower::IntrinsicBackend::LibNvvm => GeneratedIntrinsicBackend::LibNvvm,
         },
     )?;
@@ -369,6 +388,7 @@ pub fn compile_translated_module(
             ctx,
             module,
             request.device_externs,
+            false,
             false,
             None,
             DebugExport {
@@ -481,6 +501,7 @@ pub fn compile_translated_module(
         request.device_externs,
         request.files.llvm_ir,
         emit_nvvm_ir,
+        amdgcn_target.is_some(),
         nvvm_dialect,
         DebugExport {
             kind: request.debug_kind,
@@ -517,7 +538,11 @@ pub fn compile_translated_module(
     if request.trace.verbose {
         request.trace.emit("\n=== Generating PTX ===");
     }
-    let ptx_libdevice = if needs_libdevice && can_ir_link_libdevice {
+    // [PORT gfx1030] Never link NVIDIA libdevice.10.bc into an AMDGPU
+    // module: it is NVPTX bitcode. Math-heavy kernels fail later with
+    // undefined `__nv_*` externs at the code-object link — the ocml mapping
+    // is a Stage-3 work item.
+    let ptx_libdevice = if needs_libdevice && can_ir_link_libdevice && amdgcn_target.is_none() {
         libdevice_path.as_deref()
     } else {
         None
@@ -556,7 +581,12 @@ pub fn compile_translated_module(
     // `ExternalLinkAllowed` (the rustc frontend) an unresolved `__nv_*` stays
     // legitimate: that consumer owns a later libNVVM/nvJitLink step and
     // resolves it there, so this check must not run for that policy.
-    if matches!(request.output_policy, OutputPolicy::SelfContainedPtx { .. }) {
+    //
+    // [PORT gfx1030] The AMDGPU path produces a binary code object, not PTX
+    // text; the textual unresolved-libdevice scan below does not apply (the
+    // code-object link reports the same problem on the ELF side).
+    let is_amdgcn = amdgcn_target.is_some();
+    if matches!(request.output_policy, OutputPolicy::SelfContainedPtx { .. }) && !is_amdgcn {
         let ptx_text = std::fs::read_to_string(request.files.ptx).map_err(|error| {
             PipelineError::PtxGeneration(format!(
                 "failed to read generated PTX to check for unresolved libdevice symbols ({}): {error}",
@@ -577,14 +607,21 @@ pub fn compile_translated_module(
     }
 
     if request.trace.verbose {
+        let artifact = if is_amdgcn { "code object" } else { "PTX" };
         request.trace.emit(format!(
-            "✓ PTX written to {} (target: {})",
+            "✓ {artifact} written to {} (target: {})",
             request.files.ptx.display(),
             generated.target
         ));
     }
     Ok(ModulePipelineOutput {
-        artifact_kind: ModuleArtifactKind::Ptx,
+        // [PORT gfx1030] The AMDGPU branch of `generate_ptx_impl` writes a
+        // linked code object (llc --filetype=obj + lld -shared).
+        artifact_kind: if is_amdgcn {
+            ModuleArtifactKind::Hsaco
+        } else {
+            ModuleArtifactKind::Ptx
+        },
         target: generated.target,
         diagnostics: generated.diagnostics,
     })
@@ -610,6 +647,8 @@ fn select_pre_lowering_backend(
     module: Ptr<Operation>,
     output_policy: OutputPolicy,
     can_ir_link_libdevice: bool,
+    // [PORT gfx1030]
+    is_amdgcn: bool,
 ) -> PreLoweringBackendSelection {
     // The rustc frontend supplies typed MIR, while the standalone frontend may
     // also supply an already-lowered LLVM declaration in the same module.
@@ -638,9 +677,13 @@ fn select_pre_lowering_backend(
         module,
         &dialect_mir::rust_intrinsics::is_backend_dependent_libdevice_placeholder,
     );
-    let emit_nvvm_ir =
-        should_emit_nvvm_ir(output_policy, uses_strict_libdevice, can_ir_link_libdevice);
-    let intrinsic_backend = if emit_nvvm_ir {
+    // [PORT gfx1030] The AMDGPU path never stops at NVVM IR (libNVVM is an
+    // NVIDIA-only consumer) and lowers through the Amdgcn intrinsic form.
+    let emit_nvvm_ir = !is_amdgcn
+        && should_emit_nvvm_ir(output_policy, uses_strict_libdevice, can_ir_link_libdevice);
+    let intrinsic_backend = if is_amdgcn {
+        mir_lower::IntrinsicBackend::Amdgcn
+    } else if emit_nvvm_ir {
         mir_lower::IntrinsicBackend::LibNvvm
     } else {
         mir_lower::IntrinsicBackend::LlvmNvptx
@@ -649,8 +692,14 @@ fn select_pre_lowering_backend(
     // for the post-lowering consistency check: rounding and sign placeholders
     // lower to `__nv_*` precisely when the LibNvvm backend was chosen (and
     // LibNvvm is chosen exactly when NVVM IR is emitted).
-    let needs_libdevice =
-        uses_strict_libdevice || (emit_nvvm_ir && uses_backend_dependent_libdevice);
+    // [PORT gfx1030] On the AMD path the backend-dependent placeholders lower
+    // to native LLVM intrinsics exactly as on the NVPTX path, so only strict
+    // use predicts a lowered `__nv_*` call (LibNvvm is never selected).
+    let needs_libdevice = if is_amdgcn {
+        uses_strict_libdevice
+    } else {
+        uses_strict_libdevice || (emit_nvvm_ir && uses_backend_dependent_libdevice)
+    };
 
     PreLoweringBackendSelection {
         needs_libdevice,
@@ -911,8 +960,8 @@ mod tests {
             OutputPolicy::ExternalLinkAllowed {
                 request_nvvm_ir: false,
             },
-            false,
-        );
+            false, false,
+    );
         assert!(selection.needs_libdevice);
         assert!(selection.emit_nvvm_ir);
         assert_eq!(
@@ -933,8 +982,8 @@ mod tests {
             OutputPolicy::ExternalLinkAllowed {
                 request_nvvm_ir: false,
             },
-            true,
-        );
+            true, false,
+    );
         assert!(selection.needs_libdevice);
         assert!(!selection.emit_nvvm_ir);
         assert_eq!(
@@ -964,8 +1013,8 @@ mod tests {
                 OutputPolicy::ExternalLinkAllowed {
                     request_nvvm_ir: false,
                 },
-                can_ir_link_libdevice,
-            );
+                can_ir_link_libdevice, false,
+    );
             assert!(!selection.needs_libdevice);
             assert!(!selection.emit_nvvm_ir);
             assert_eq!(
@@ -990,8 +1039,8 @@ mod tests {
             OutputPolicy::ExternalLinkAllowed {
                 request_nvvm_ir: true,
             },
-            false,
-        );
+            false, false,
+    );
         assert!(selection.needs_libdevice);
         assert!(selection.emit_nvvm_ir);
         assert_eq!(
@@ -1023,8 +1072,8 @@ mod tests {
                 OutputPolicy::ExternalLinkAllowed {
                     request_nvvm_ir: false,
                 },
-                can_ir_link_libdevice,
-            );
+                can_ir_link_libdevice, false,
+    );
             assert!(!selection.needs_libdevice);
             assert!(!selection.emit_nvvm_ir);
             assert_eq!(
@@ -1047,7 +1096,8 @@ mod tests {
 
         let sign_module =
             typed_mir_test_module(&mut ctx, &[dialect_mir::rust_intrinsics::CALLEE_FABS]);
-        let sign = select_pre_lowering_backend(&ctx, sign_module, nvvm_requested, false);
+        let sign = select_pre_lowering_backend(&ctx, sign_module, nvvm_requested, false, false,
+    );
         assert!(sign.needs_libdevice);
         assert!(sign.emit_nvvm_ir);
         assert_eq!(sign.intrinsic_backend, mir_lower::IntrinsicBackend::LibNvvm);
@@ -1056,7 +1106,8 @@ mod tests {
             &mut ctx,
             &[dialect_mir::rust_intrinsics::CALLEE_MAXNUM_NSZ_F32],
         );
-        let minmax = select_pre_lowering_backend(&ctx, minmax_module, nvvm_requested, false);
+        let minmax = select_pre_lowering_backend(&ctx, minmax_module, nvvm_requested, false, false,
+    );
         assert!(!minmax.needs_libdevice);
         assert!(minmax.emit_nvvm_ir);
         assert_eq!(
@@ -1084,7 +1135,8 @@ mod tests {
 
         // No IR-level linking: sin forces NVVM IR; rounding joins it on
         // libdevice under the LibNvvm backend.
-        let no_link = select_pre_lowering_backend(&ctx, module, automatic, false);
+        let no_link = select_pre_lowering_backend(&ctx, module, automatic, false, false,
+    );
         assert!(no_link.needs_libdevice);
         assert!(no_link.emit_nvvm_ir);
         assert_eq!(
@@ -1094,7 +1146,8 @@ mod tests {
 
         // IR-level linking available: PTX path; sin resolves against
         // libdevice.10.bc while rounding lowers to LLVM intrinsics.
-        let ir_link = select_pre_lowering_backend(&ctx, module, automatic, true);
+        let ir_link = select_pre_lowering_backend(&ctx, module, automatic, true, false,
+    );
         assert!(ir_link.needs_libdevice);
         assert!(!ir_link.emit_nvvm_ir);
         assert_eq!(
@@ -1114,8 +1167,8 @@ mod tests {
             OutputPolicy::ExternalLinkAllowed {
                 request_nvvm_ir: true,
             },
-            false,
-        );
+            false, false,
+    );
         assert!(!nvvm.needs_libdevice);
         assert!(nvvm.emit_nvvm_ir);
         assert_eq!(nvvm.intrinsic_backend, mir_lower::IntrinsicBackend::LibNvvm);
@@ -1126,8 +1179,8 @@ mod tests {
             OutputPolicy::SelfContainedPtx {
                 allow_libdevice: false,
             },
-            false,
-        );
+            false, false,
+    );
         assert!(!standalone.emit_nvvm_ir);
         assert_eq!(
             standalone.intrinsic_backend,

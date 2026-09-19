@@ -16,6 +16,7 @@
 #![warn(missing_docs)]
 
 mod api;
+mod amdgcn;
 mod error;
 mod export;
 mod generated;
@@ -114,6 +115,8 @@ pub mod experimental {
 pub mod __private {
     #[doc(hidden)]
     pub use crate::error::PipelineError;
+    #[doc(hidden)]
+    pub use crate::amdgcn::{amdgcn_target, rewrite_ir_for_amdgcn};
     #[doc(hidden)]
     pub use crate::export::{DeviceExternAttrs, DeviceExternDecl};
     #[doc(hidden)]

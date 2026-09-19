@@ -153,6 +153,9 @@ pub enum CompilationArtifactKind {
     Ltoir,
     /// Final cubin image, loadable by the CUDA driver.
     Cubin,
+    /// [PORT gfx1030] Linked AMDGPU code object (shared ELF), loadable via
+    /// `hipModuleLoadData`.
+    Hsaco,
 }
 
 /// Launch bounds attached to one kernel entry.
@@ -574,9 +577,19 @@ pub fn run_pipeline(
     }
 
     let ll_path = config.output_dir.join(format!("{}.ll", config.output_name));
-    let ptx_path = config
-        .output_dir
-        .join(format!("{}.ptx", config.output_name));
+    // [PORT gfx1030] A `gfx…` target override produces a linked AMDGPU code
+    // object instead of PTX text; it lands on the same "device image" slot.
+    let amdgcn = cuda_oxide_codegen::__private::amdgcn_target(config.target_arch.as_deref());
+    let device_image_path = if amdgcn.is_some() {
+        config
+            .output_dir
+            .join(format!("{}.hsaco", config.output_name))
+    } else {
+        config
+            .output_dir
+            .join(format!("{}.ptx", config.output_name))
+    };
+    let ptx_path = device_image_path.clone();
     let stale_artifacts = stale_compilation_artifact_paths(&config.output_dir, &config.output_name);
 
     let backend_options = backend_options_for(config);
@@ -588,7 +601,7 @@ pub fn run_pipeline(
         config.debug_kind,
         OutputFiles {
             llvm_ir: &ll_path,
-            ptx: &ptx_path,
+            ptx: &device_image_path,
             stale_before_export: &stale_artifacts,
         },
         PipelineTrace {
@@ -624,6 +637,17 @@ pub fn run_pipeline(
         ModuleArtifactKind::Ptx => Ok(CompilationResult {
             artifact_path: ptx_path.clone(),
             artifact_kind: CompilationArtifactKind::Ptx,
+            ll_path,
+            ptx_path,
+            target: generated.target,
+            allow_fma_contraction: config.allow_fma_contraction,
+            kernel_launch_bounds,
+        }),
+        // [PORT gfx1030] llc+lld already produced the linked code object at
+        // the device-image path.
+        ModuleArtifactKind::Hsaco => Ok(CompilationResult {
+            artifact_path: device_image_path.clone(),
+            artifact_kind: CompilationArtifactKind::Hsaco,
             ll_path,
             ptx_path,
             target: generated.target,

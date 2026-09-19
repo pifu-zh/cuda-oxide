@@ -51,6 +51,9 @@ pub struct BackendOptions {
     pub llc_override: Option<PathBuf>,
     /// Explicit `opt` binary (was `CUDA_OXIDE_OPT`).
     pub opt_override: Option<PathBuf>,
+    /// [PORT gfx1030] Explicit `lld` binary for the AMDGPU code-object link
+    /// (`CUDA_OXIDE_LLD`; `rust-lld` counts, the flavor is inferred).
+    pub lld_override: Option<PathBuf>,
     /// Optional staged dialect-mir pass pipeline (`CUDA_OXIDE_MIR_PASSES`).
     ///
     /// Empty or `None` preserves the default pipeline. The available names
@@ -71,6 +74,7 @@ impl Default for BackendOptions {
             verbose: false,
             llc_override: None,
             opt_override: None,
+            lld_override: None,
             mir_pass_pipeline: None,
         }
     }
@@ -107,6 +111,7 @@ impl BackendOptions {
             verbose: std::env::var("CUDA_OXIDE_VERBOSE").is_ok(),
             llc_override: std::env::var("CUDA_OXIDE_LLC").ok().map(PathBuf::from),
             opt_override: std::env::var("CUDA_OXIDE_OPT").ok().map(PathBuf::from),
+            lld_override: std::env::var("CUDA_OXIDE_LLD").ok().map(PathBuf::from),
             mir_pass_pipeline: std::env::var("CUDA_OXIDE_MIR_PASSES").ok(),
         }
     }

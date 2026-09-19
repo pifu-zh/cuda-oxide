@@ -239,6 +239,7 @@ pub fn export_llvm_ir(
     device_externs: &[DeviceExternDecl],
     path: &Path,
     emit_nvvm_ir: bool,
+    amdgcn: bool,
     nvvm_dialect: Option<NvvmIrDialect>,
     debug: DebugExport,
 ) -> Result<llvm_export::export::ExportedModule, PipelineError> {
@@ -247,6 +248,7 @@ pub fn export_llvm_ir(
         module_op_ptr,
         device_externs,
         emit_nvvm_ir,
+        amdgcn,
         nvvm_dialect,
         debug,
     )?;
@@ -268,6 +270,7 @@ pub fn render_llvm_ir(
     module_op_ptr: Ptr<Operation>,
     device_externs: &[DeviceExternDecl],
     emit_nvvm_ir: bool,
+    amdgcn: bool,
     nvvm_dialect: Option<NvvmIrDialect>,
     debug: DebugExport,
 ) -> Result<String, PipelineError> {
@@ -276,6 +279,7 @@ pub fn render_llvm_ir(
         module_op_ptr,
         device_externs,
         emit_nvvm_ir,
+        amdgcn,
         nvvm_dialect,
         debug,
     )
@@ -287,18 +291,35 @@ fn render_exported_llvm_ir(
     module_op_ptr: Ptr<Operation>,
     device_externs: &[DeviceExternDecl],
     emit_nvvm_ir: bool,
+    amdgcn: bool,
     nvvm_dialect: Option<NvvmIrDialect>,
     debug: DebugExport,
 ) -> Result<llvm_export::export::ExportedModule, PipelineError> {
     let module_op = Operation::get_op::<pliron::builtin::ops::ModuleOp>(module_op_ptr, ctx)
         .ok_or_else(|| PipelineError::Export("Not a module op".to_string()))?;
 
+    // [PORT gfx1030] Three export forms: NVVM IR (libNVVM), the AMDGPU
+    // amdgcn form, and the default NVPTX PTX path.
     let exported = if emit_nvvm_ir {
         let dialect = nvvm_dialect.ok_or_else(|| {
             PipelineError::Export("NVVM export reached without a selected IR dialect".to_string())
         })?;
         let config = PipelineExportConfig {
             inner: llvm_export::export::NvvmExportConfig::new(dialect),
+            debug,
+        };
+        llvm_export::export::export_module_with_externs_and_roots(
+            ctx,
+            &module_op,
+            device_externs,
+            &config,
+        )
+        .map_err(PipelineError::Export)?
+    } else if amdgcn {
+        // [PORT gfx1030] AMDGPU backend path: amdgcn triple/datalayout and
+        // `amdgpu_kernel` calling convention (Phase-1 rewrite steps 1-3).
+        let config = PipelineExportConfig {
+            inner: llvm_export::export::AmdgcnExportConfig,
             debug,
         };
         llvm_export::export::export_module_with_externs_and_roots(
@@ -353,6 +374,14 @@ impl<C: ExportBackendConfig> ExportBackendConfig for PipelineExportConfig<C> {
 
     fn emit_ptx_kernel_keyword(&self) -> bool {
         self.inner.emit_ptx_kernel_keyword()
+    }
+
+    fn target_triple(&self) -> &'static str {
+        self.inner.target_triple()
+    }
+
+    fn kernel_callconv_keyword(&self) -> &'static str {
+        self.inner.kernel_callconv_keyword()
     }
 
     fn nvvm_ir_dialect(&self) -> Option<NvvmIrDialect> {
@@ -778,6 +807,7 @@ mod tests {
             &ctx,
             module_ptr,
             &[],
+            false,
             false,
             None,
             DebugExport {

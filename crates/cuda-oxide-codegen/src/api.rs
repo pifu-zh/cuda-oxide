@@ -676,6 +676,7 @@ impl Compiler {
             verbose: options.verbose,
             llc_override: None,
             opt_override: None,
+            lld_override: None,
             mir_pass_pipeline: options.mir_pass_pipeline.clone(),
         };
         let request = ModulePipelineRequest::for_standalone_ptx(

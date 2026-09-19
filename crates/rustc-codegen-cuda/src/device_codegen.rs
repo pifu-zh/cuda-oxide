@@ -333,6 +333,9 @@ pub enum DeviceCodegenArtifactKind {
     NvvmIr,
     Ltoir,
     Cubin,
+    /// [PORT gfx1030] Linked AMDGPU code object (shared ELF) produced by the
+    /// `gfx…` target path.
+    Hsaco,
 }
 
 pub struct DeviceCodegenArtifact {
@@ -1337,6 +1340,7 @@ fn read_compilation_artifact(
         mir_importer::CompilationArtifactKind::NvvmIr => DeviceCodegenArtifactKind::NvvmIr,
         mir_importer::CompilationArtifactKind::Ltoir => DeviceCodegenArtifactKind::Ltoir,
         mir_importer::CompilationArtifactKind::Cubin => DeviceCodegenArtifactKind::Cubin,
+        mir_importer::CompilationArtifactKind::Hsaco => DeviceCodegenArtifactKind::Hsaco,
     };
 
     match std::fs::read(&result.artifact_path) {
