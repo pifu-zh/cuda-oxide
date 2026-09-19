@@ -25,6 +25,8 @@
 #      idp2a.* → 乘加展开（a 2×i16 × b 低/高 2 字节 i8，符号按后缀 sext/zext）
 #  14. barrier.cta.sync.count / arrive.count → 软件 counted barrier
 #      （LDS 计数器+世代自旋回退，helper 函数 + 入口 init，见 _rewrite_counted_barriers）
+#  15. __nv_<f>f / __nv_<f> → __ocml_<f>_f32 / __ocml_<f>_f64
+#      （libdevice → ocml；符号名经 llvm-nm ocml.bc 实证，llvm-link 链接期解析）
 #
 # 未映射 intrinsic 的 declare 保留——其调用点让 llc 报 Cannot select，
 # 作为"能力未覆盖"的显式失败信号（不静默放弃）。
@@ -149,6 +151,9 @@ def translate_nvvm_to_amdgcn(ll_text: str) -> str:
 
     # 14. counted barrier → 软件 LDS 计数器+世代自旋回退
     text = _rewrite_counted_barriers(text)
+
+    # 15. libdevice __nv_* → ocml __ocml_*（链接期经 llvm-link ocml.bc 解析）
+    text = _rewrite_ocml(text)
 
     return text
 
@@ -886,6 +891,46 @@ def _rewrite_cb_in_function(body: "list[str]") -> "tuple[list[str], set, bool]":
 
 
 # ---------------------------------------------------------------------------
+# Step 15: libdevice __nv_* → ocml __ocml_*
+# ---------------------------------------------------------------------------
+#
+# ROCm 的 ocml.bc（容器 /opt/rocm/amdgcn/bitcode/）在链接期由 llvm-link 并入
+# module，符号名经 llvm-nm 实证：__ocml_<stem>_f32 / __ocml_<stem>_f64。
+# NV libdevice 命名：__nv_<stem>f（f32）/ __nv_<stem>（f64）。下表只收录
+# 双方命名一一对应且 ocml.bc 导出实证的 stem；表外 __nv_* 留残（链接期
+# undefined symbol，显式失败信号）。GPU 数值探针 TANPROBE PASS（f32/f64
+# tan 对 host libm ≤2 ULP）。
+
+_OCML_STEMS = (
+    # 三角/双曲
+    "acos acos acosh asin asinh atan atan2 atanh cbrt cos cosh sin sinh tan tanh",
+    # 指数/对数
+    "exp exp2 exp10 expm1 log log2 log10 log1p",
+    # 幂/取整/绝对值等
+    "fabs floor ceil round trunc rint nearbyint fmod fmin fmax fdim fma pow "
+    "hypot cbrt copysign fabs rsqrt sqrt erf erfc erfcx erfinv erfcinv tgamma "
+    "lgamma ilogb ldexp scalbn frexp modf remainder remquo nextafter",
+    # Bessel / 判定
+    "j0 j1 y0 y1 i0 i1 isfinite isinf isnan signbit",
+    # 复数（NV: __nv_cacosf …）
+    "cabs cacos cacosh casin casinh catan catanh ccos ccosh cexp clog csin "
+    "csinh csqrt ctan ctanh",
+    # sincos（指针出参，签名一致）
+    "sincos",
+)
+_OCML_STEM_SET = sorted(set(" ".join(_OCML_STEMS).split()))
+
+
+def _rewrite_ocml(text: str) -> str:
+    if "__nv_" not in text:
+        return text
+    for stem in _OCML_STEM_SET:
+        # f32 变体在前（@__nv_<stem>f( 与 @__nv_<stem>( 因 "(" 终结互不误配）
+        text = text.replace(f"@__nv_{stem}f(", f"@__ocml_{stem}_f32(")
+        text = text.replace(f"@__nv_{stem}(", f"@__ocml_{stem}_f64(")
+    return text
+
+
 def _append_ntid_kernarg_param(text: str) -> str:
     """给调用了 ntid.x 的 kernel 签名末尾追加 `i32 %ntid_x` 参数。"""
     lines = text.split("\n")
