@@ -337,6 +337,235 @@ fn base_llc_args(target: &str) -> Vec<String> {
     ]
 }
 
+/// [PORT gfx1030] The unconditional head of every AMDGPU `llc` invocation.
+///
+/// `--filetype=obj` emits a *relocatable* ELF, which
+/// `hipModuleLoadData`/`cuModuleLoadData` reject; the pipeline therefore
+/// always follows this with `lld -shared` (Phase-1 root cause one). Code
+/// object version 5 is pinned explicitly: version 6 objects are rejected by
+/// the host kernel driver in use (Phase-1 control experiment).
+/// `-amdhsa-code-object-version=5` is the llc-side spelling of that pin.
+fn base_llc_args_amdgcn(gfx: &str) -> Vec<String> {
+    vec![
+        "-march=amdgcn".to_string(),
+        format!("-mcpu={gfx}"),
+        "-amdhsa-code-object-version=5".to_string(),
+        "--filetype=obj".to_string(),
+    ]
+}
+
+/// [PORT gfx1030] An `lld` invocation able to produce a shared ELF.
+struct AmdgcnLld {
+    path: PathBuf,
+    /// Driver arguments that select the GNU flavor; empty for `ld.lld`-style
+    /// entry points, `["-flavor", "gnu"]` for multi-flavor drivers such as
+    /// `lld` and the Rust toolchain's `rust-lld`.
+    flavor_args: Vec<String>,
+    provenance: String,
+}
+
+/// Locates an executable in `PATH`.
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Resolves the `lld` that links the AMDGPU code object.
+///
+/// `llc --filetype=obj` emits a relocatable ELF; `hipModuleLoadData` needs a
+/// linked shared object, so this link step is mandatory (Phase-1 root cause
+/// one: `ld.lld -shared` is the hidden final step of `hipcc --genco`).
+/// Discovery order:
+/// 1. `CUDA_OXIDE_LLD` (a specific binary; flavor inferred from its name),
+/// 2. `ld.lld` on `PATH`,
+/// 3. `ld.lld` / `rust-lld` next to the resolved `llc` (the Rust toolchain's
+///    llvm-tools ship `rust-lld`, so this works with no extra installs).
+fn discover_amdgcn_lld(
+    toolchain: &LlvmToolchain,
+    opts: &BackendOptions,
+) -> Result<AmdgcnLld, PipelineError> {
+    fn flavor_for(file_name: &str) -> Vec<String> {
+        // `ld.lld`-style entry points select the GNU flavor by name; plain
+        // `lld` and `rust-lld` are multi-flavor drivers.
+        if file_name == "lld" || file_name.starts_with("rust-lld") {
+            vec!["-flavor".to_string(), "gnu".to_string()]
+        } else {
+            Vec::new()
+        }
+    }
+    fn from_candidate(path: PathBuf, provenance: String) -> Option<AmdgcnLld> {
+        let file_name = path.file_name()?.to_str()?.to_string();
+        Some(AmdgcnLld {
+            path,
+            flavor_args: flavor_for(&file_name),
+            provenance,
+        })
+    }
+
+    if let Some(explicit) = &opts.lld_override {
+        return from_candidate(explicit.clone(), "CUDA_OXIDE_LLD".to_string()).ok_or_else(|| {
+            PipelineError::PtxGeneration(format!(
+                "CUDA_OXIDE_LLD points at `{}`, which is not a file",
+                explicit.display()
+            ))
+        });
+    }
+    if let Some(path) = std::env::var_os("CUDA_OXIDE_LLD") {
+        if let Some(found) = from_candidate(PathBuf::from(path), "CUDA_OXIDE_LLD".to_string()) {
+            return Ok(found);
+        }
+    }
+    if let Some(path) = find_in_path("ld.lld") {
+        if let Some(found) = from_candidate(path, "PATH".to_string()) {
+            return Ok(found);
+        }
+    }
+    let llc_dir = std::path::Path::new(&toolchain.llc_path).parent();
+    if let Some(dir) = llc_dir {
+        for name in ["ld.lld", "rust-lld"] {
+            let candidate = dir.join(name);
+            if candidate.is_file()
+                && let Some(found) =
+                    from_candidate(candidate, format!("llvm-tools directory of the resolved llc"))
+            {
+                return Ok(found);
+            }
+        }
+    }
+    Err(PipelineError::PtxGeneration(
+        "No working `lld` found for the AMDGPU code-object link.\n\
+         cuda-oxide tries (in order): CUDA_OXIDE_LLD, `ld.lld` on PATH, then \
+         `ld.lld`/`rust-lld` next to the resolved `llc`. The Rust toolchain's \
+         llvm-tools component ships a working `rust-lld`:\n\
+             rustup component add llvm-tools"
+            .to_string(),
+    ))
+}
+
+/// [PORT gfx1030] Generates a linked gfx… code object from the exported IR.
+///
+/// Pipeline (each stage Phase-1 verified on gfx1030 with a numeric check):
+/// amdgcn prep pass → `opt -O2` → `llc -march=amdgcn -mcpu=<gfx>
+/// -amdhsa-code-object-version=5 --filetype=obj` → `lld -shared`.
+///
+/// Deliberately absent compared with the NVPTX path: PTX feature/ISA target
+/// resolution (an `sm_…` vocabulary), NVIDIA libdevice IR linking (`__nv_*`
+/// calls fail at the code-object link until the ocml mapping lands — Stage 3),
+/// the NVPTX branch-layout llc controls, and the post-llc PTX text scans (the
+/// output here is ELF).
+fn generate_amdgcn_code_object(
+    module: PtxModule<'_>,
+    gfx: &str,
+    toolchain: &LlvmToolchain,
+    opts: &BackendOptions,
+    diagnostic_sink: Option<fn(&str)>,
+) -> Result<GeneratedPtx, PipelineError> {
+    let mut diagnostics = Vec::new();
+
+    // 1. Prep pass (ntid kernarg / 1-D constant folding / declare cleanup).
+    let original =
+        std::fs::read_to_string(module.llvm_ir).map_err(|error| {
+            PipelineError::PtxGeneration(format!(
+                "failed to read LLVM IR for the AMDGPU prep pass ({}): {error}",
+                module.llvm_ir.display()
+            ))
+        })?;
+    let rewritten = crate::amdgcn::rewrite_ir_for_amdgcn(&original)
+        .map_err(PipelineError::PtxGeneration)?;
+    let amdgcn_ll = module.llvm_ir.with_extension("amdgcn.ll");
+    std::fs::write(&amdgcn_ll, &rewritten).map_err(|error| {
+        PipelineError::PtxGeneration(format!(
+            "failed to write AMDGPU prep-pass output ({}): {error}",
+            amdgcn_ll.display()
+        ))
+    })?;
+    if opts.verbose {
+        record_diagnostic(
+            &mut diagnostics,
+            diagnostic_sink,
+            format!("amdgcn prep pass: {} → {}", module.llvm_ir.display(), amdgcn_ll.display()),
+        );
+    }
+
+    // 2. Middle-end. Target-agnostic; `optimize_ll` keeps `public_symbols`
+    //    external so kernels survive internalization.
+    let llc_input: std::path::PathBuf = if opts.no_opt {
+        amdgcn_ll.clone()
+    } else {
+        optimize_ll(
+            &amdgcn_ll,
+            module.public_symbols,
+            toolchain,
+            opts,
+            true,
+            llvm_export::export::DebugKind::Off,
+        )?
+        .0
+        .unwrap_or_else(|| amdgcn_ll.clone())
+    };
+
+    // 3. llc → relocatable ELF.
+    let unlinked = module.output.with_extension("unlinked.co");
+    let llc_desc = format!("llc ({})", toolchain.llc_path);
+    let result = std::process::Command::new(&toolchain.llc_path)
+        .args(base_llc_args_amdgcn(gfx))
+        .arg(&llc_input)
+        .arg("-o")
+        .arg(&unlinked)
+        .output();
+    match result {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            return Err(PipelineError::PtxGeneration(format!(
+                "{llc_desc} failed for the amdgcn target:
+{}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Err(error) => {
+            return Err(PipelineError::PtxGeneration(format!("{llc_desc}: {error}")));
+        }
+    }
+
+    // 4. lld -shared → loadable code object.
+    let lld = discover_amdgcn_lld(toolchain, opts)?;
+    let lld_desc = format!("lld ({}, {})", lld.path.display(), lld.provenance);
+    let result = std::process::Command::new(&lld.path)
+        .args(&lld.flavor_args)
+        .arg("-shared")
+        .arg(&unlinked)
+        .arg("-o")
+        .arg(module.output)
+        .output();
+    match result {
+        Ok(output) if output.status.success() => {
+            if opts.verbose {
+                record_diagnostic(
+                    &mut diagnostics,
+                    diagnostic_sink,
+                    format!(
+                        "linked gfx{gfx} code object: {} (llc input: {})",
+                        module.output.display(),
+                        llc_input.display()
+                    ),
+                );
+            }
+            Ok(GeneratedPtx {
+                target: gfx.to_string(),
+                diagnostics,
+            })
+        }
+        Ok(output) => Err(PipelineError::PtxGeneration(format!(
+            "{lld_desc} failed while linking the AMDGPU code object:
+{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))),
+        Err(error) => Err(PipelineError::PtxGeneration(format!("{lld_desc}: {error}"))),
+    }
+}
+
 /// Full-debug modules need PTX ISA 7.5 or newer declared, whatever the
 /// target's own floor is.
 ///
@@ -577,6 +806,12 @@ fn generate_ptx_impl(
         toolchain,
         generated,
     } = backend;
+    // [PORT gfx1030] A `gfx…` target override selects the AMDGPU backend
+    // path; every `sm_…` value (and no override) keeps the NVPTX path
+    // byte-identical to before.
+    if let Some(gfx) = crate::amdgcn::amdgcn_target(opts.target_arch.as_deref()) {
+        return generate_amdgcn_code_object(module, gfx, toolchain, opts, diagnostic_sink);
+    }
     // Explicit, hard override: `--arch` or a caller-set `opts.target_arch`.
     let explicit_override = opts.target_arch.clone();
     // Advisory hint: the arch of the GPU in this machine, forwarded by
