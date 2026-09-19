@@ -35,7 +35,7 @@ pub(crate) fn convert_generated_dot_product(
     }
 
     match context::lowering_options(ctx).intrinsic_backend {
-        IntrinsicBackend::LlvmNvptx => lower_with_llvm_intrinsic(
+        IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => lower_with_llvm_intrinsic(
             ctx,
             rewriter,
             op,

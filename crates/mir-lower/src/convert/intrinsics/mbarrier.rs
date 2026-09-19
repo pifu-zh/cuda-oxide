@@ -50,7 +50,7 @@ pub(crate) fn convert_init(
     let bar_ptr = cast_to_shared_addrspace(ctx, rewriter, bar_ptr);
 
     match context::lowering_options(ctx).intrinsic_backend {
-        IntrinsicBackend::LlvmNvptx => {
+        IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => {
             let ptr_ty = llvm_types::PointerType::get(ctx, llvm_types::address_space::SHARED);
             let func_ty = llvm_types::FuncType::get(
                 ctx,
@@ -98,7 +98,7 @@ pub(crate) fn convert_arrive(
     let bar_ptr = cast_to_shared_addrspace(ctx, rewriter, operands[0]);
 
     let producer = match context::lowering_options(ctx).intrinsic_backend {
-        IntrinsicBackend::LlvmNvptx => {
+        IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => {
             let ptr_ty = llvm_types::PointerType::get(ctx, llvm_types::address_space::SHARED);
             let func_ty = llvm_types::FuncType::get(ctx, i64_ty.into(), vec![ptr_ty.into()], false);
             call_intrinsic(
@@ -141,7 +141,7 @@ pub(crate) fn convert_arrive_no_complete(
     let count = operands[1];
 
     let producer = match context::lowering_options(ctx).intrinsic_backend {
-        IntrinsicBackend::LlvmNvptx => {
+        IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => {
             let ptr_ty = llvm_types::PointerType::get(ctx, llvm_types::address_space::SHARED);
             let func_ty = llvm_types::FuncType::get(
                 ctx,
@@ -225,7 +225,7 @@ pub(crate) fn convert_inval(
     let bar_ptr = cast_to_shared_addrspace(ctx, rewriter, operands[0]);
 
     match context::lowering_options(ctx).intrinsic_backend {
-        IntrinsicBackend::LlvmNvptx => {
+        IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => {
             let ptr_ty = llvm_types::PointerType::get(ctx, llvm_types::address_space::SHARED);
             let func_ty =
                 llvm_types::FuncType::get(ctx, void_ty.into(), vec![ptr_ty.into()], false);

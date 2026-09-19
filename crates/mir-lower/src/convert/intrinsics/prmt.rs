@@ -34,7 +34,7 @@ pub(crate) fn convert_generated_prmt(
     }
     let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
     match context::lowering_options(ctx).intrinsic_backend {
-        IntrinsicBackend::LlvmNvptx => {
+        IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => {
             let argument_types = vec![i32_ty.into(); operands.len()];
             let function_ty = llvm_types::FuncType::get(ctx, i32_ty.into(), argument_types, false);
             let call = call_intrinsic(
