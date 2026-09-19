@@ -545,6 +545,53 @@ def test_ir_translate_atomics():
     assert translate_nvvm_to_amdgcn(out) == out, "atomics 改写不幂等"
 
 
+# Step 13（idp4a/idp2a → sdot4/udot4/乘加展开）探针 fixture
+SAMPLE_DOTPROD_IR = """\
+target datalayout = "e-i64:64-i128:128-v16:16-v32:32-n16:32:64"
+target triple = "nvptx64-nvidia-cuda"
+
+declare i32 @llvm.nvvm.idp4a.s.s(i32, i32, i32) #3
+declare i32 @llvm.nvvm.idp4a.u.u(i32, i32, i32) #3
+declare i32 @llvm.nvvm.idp2a.s.s(i32, i32, i1 immarg, i32) #3
+declare i32 @llvm.nvvm.idp2a.u.u(i32, i32, i1 immarg, i32) #3
+
+define ptx_kernel void @dot_probe(i32 %a4, i32 %b4, i32 %a2, i32 %b2, ptr %out) #1 {
+entry:
+  %r0 = tail call i32 @llvm.nvvm.idp4a.s.s(i32 %a4, i32 %b4, i32 100) #3
+  %r1 = tail call i32 @llvm.nvvm.idp4a.u.u(i32 %a4, i32 %b4, i32 100) #3
+  %r2 = tail call i32 @llvm.nvvm.idp2a.s.s(i32 %a2, i32 %b2, i1 false, i32 100) #3
+  %r3 = tail call i32 @llvm.nvvm.idp2a.u.u(i32 %a2, i32 %b2, i1 true, i32 100) #3
+  %s = add i32 %r0, %r1
+  %s2 = add i32 %s, %r2
+  %s3 = add i32 %s2, %r3
+  store i32 %s3, ptr %out, align 4
+  ret void
+}
+"""
+
+
+def test_ir_translate_dotprod():
+    """Step 13：idp4a.s.s/.u.u → sdot4/udot4（v_dot4 硬件，clamp=false）；
+    idp2a → 乘加展开（a 2×i16 × b 低/高 2 字节 i8，符号按后缀）。
+    （GPU 数值已验证：-310/1738/-24/262120 与例源期望精确一致。）"""
+    out = translate_nvvm_to_amdgcn(SAMPLE_DOTPROD_IR)
+
+    assert "llvm.nvvm" not in out, "idp intrinsic 残留"
+    assert "call i32 @llvm.amdgcn.sdot4(i32 %a4, i32 %b4, i32 100, i1 false)" in out
+    assert "call i32 @llvm.amdgcn.udot4(i32 %a4, i32 %b4, i32 100, i1 false)" in out
+    # idp2a isbottom=false：b 取低 2 字节（shift 0/8），signed → sext
+    assert "%r2.d_a0 = sext i16 %r2.d_a0t to i32" in out
+    assert "%r2.d_b0 = sext i8 %r2.d_b0t to i32" in out
+    assert "%r2.d_b1s = lshr i32 %b2, 8" in out
+    assert "%r2 = add i32 %r2.d_r0, %r2.d_m1" in out, "结果未写回原 SSA 名"
+    # idp2a isbottom=true：b 取高 2 字节（shift 16/24），unsigned → zext
+    assert "%r3.d_b0s = lshr i32 %b2, 16" in out
+    assert "%r3.d_b1s = lshr i32 %b2, 24" in out
+    assert "%r3.d_a0 = zext i16 %r3.d_a0t to i32" in out
+    assert "%s = add i32 %r0, %r1" in out, "下游引用未保持"
+    assert translate_nvvm_to_amdgcn(out) == out, "dotprod 改写不幂等"
+
+
 # ---------------------------------------------------------------------------
 # 测试 2：cuda-oxide 管线副产物 .ptx 存在性
 # ---------------------------------------------------------------------------
