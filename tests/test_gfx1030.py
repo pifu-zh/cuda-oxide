@@ -21,7 +21,10 @@
 #
 # 运行前提（本仓库 gfx1030 分支的验收环境）：
 #   - 宿主 zhuo-ms：ROCm GPU gfx1030（RX 6950 XT）空闲可用（跑前 rocm-smi 自检）
+#   - rocminfo（设备识别测试用：解析 gfx1030 agent / RX 6950 XT Marketing Name）
 #   - rustup nightly-2026-08-28（含 rustc-dev / llvm-tools；llc 用工具链自带）
+#     以及 ~/.cargo/bin/cargo-oxide 二进制（cargo oxide 子命令的真正落点；
+#     探针 crate 在 /tmp 下构建时仓库 .cargo/config.toml alias 不生效）
 #   - ~/opt/cuda13（CUDA_TOOLKIT_PATH；device-only 构建不触发 toolkit 探测，仅为与
 #     phase1 验收命令保持一致）
 #   - docker 容器 zhuo：hipcc + ld.lld + ROCm runtime（GPU 验证在其中执行）
@@ -140,8 +143,9 @@ def built_probe(tmp_path_factory):
     env = dict(os.environ, CUDA_TOOLKIT_PATH=CUDA_TOOLKIT_PATH)
     proc = _run(["cargo", f"+{NIGHTLY}", "oxide", "build"], cwd=crate_dir, env=env)
     assert proc.returncode == 0, (
-        f"cargo oxide build 失败:\nstdout:\n{proc.stdout[-4000:]}\n"
-        f"stderr:\n{proc.stderr[-4000:]}"
+        f"[阶段 .ll-产出: cargo oxide build] 失败 (rc={proc.returncode})\n"
+        f"--- 关键错误输出（尾20行）---\n{_tail(proc.stdout + proc.stderr)}\n"
+        f"--- 环境前提状态 ---\n{_env_diag()}"
     )
 
     opt_ll = sorted(crate_dir.glob("*.opt.ll"))
@@ -169,6 +173,45 @@ def _docker_available() -> bool:
     return _run(["docker", "info"]).returncode == 0 and _run(
         ["docker", "exec", DOCKER_CONTAINER, "true"]
     ).returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# 失败诊断助手：每个阶段失败时，断言消息 = 阶段名 + 关键错误输出（尾20行）
+#                + 已确认的环境前提状态，让人不看代码就知道死在哪层。
+# ---------------------------------------------------------------------------
+
+
+def _tail(text: str, n: int = 20) -> str:
+    """关键错误输出的尾 n 行。"""
+    return "\n".join((text or "").splitlines()[-n:])
+
+
+def _env_diag() -> str:
+    """已确认的环境前提状态快照（工具链/容器/GPU）。仅在失败分支调用。"""
+    llc_ok = LLC.exists()
+    cargo = _run(["cargo", f"+{NIGHTLY}", "--version"])
+    docker = _run(["docker", "exec", DOCKER_CONTAINER, "true"])
+    gpu = _run(["rocm-smi"])
+    return "\n".join(
+        [
+            f"工具链 llc: {'OK' if llc_ok else '缺失'} ({LLC})",
+            (
+                f"工具链 cargo {NIGHTLY}: "
+                + (f"OK ({cargo.stdout.strip()})" if cargo.returncode == 0
+                   else f"FAIL: {_tail(cargo.stderr, 5)}")
+            ),
+            (
+                f"容器 {DOCKER_CONTAINER}: "
+                + ("OK" if docker.returncode == 0
+                   else f"FAIL: {_tail(docker.stderr, 5)}")
+            ),
+            (
+                "rocm-smi: "
+                + ("OK" if gpu.returncode == 0
+                   else f"FAIL: {_tail(gpu.stderr, 5)}")
+            ),
+        ]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -439,6 +482,61 @@ def test_ptx_also_generated(built_probe):
 
 
 # ---------------------------------------------------------------------------
+# 测试 2.5：设备识别（GPU 前提：本机确为 gfx1030 / RX 6950 XT）
+# ---------------------------------------------------------------------------
+
+
+def _gfx_agents():
+    """rocminfo 解析：返回 [(agent 名, Marketing Name)]，仅保留 gfx* agent。
+
+    每个取值块内首个 Name: 是 agent 名（后续 cache/pool 小节的 Name 不覆盖）。
+    """
+    proc = _run(["rocminfo"])
+    assert proc.returncode == 0, (
+        f"[阶段 设备识别: rocminfo] 失败 (rc={proc.returncode})\n"
+        f"--- 关键错误输出（尾20行）---\n{_tail(proc.stderr)}\n"
+        f"--- 环境前提状态 ---\n{_env_diag()}"
+    )
+    agents = []
+    cur_name = None
+    cur_mkt = None
+    for line in proc.stdout.splitlines():
+        if re.match(r"\s*Agent\s+\d+", line):
+            if cur_name and cur_name.startswith("gfx"):
+                agents.append((cur_name, cur_mkt or "?"))
+            cur_name = cur_mkt = None
+            continue
+        if cur_name is None:
+            m = re.match(r"\s*Name:\s+(\S+)", line)
+            if m:
+                cur_name = m.group(1)
+        if cur_mkt is None:
+            m = re.match(r"\s*Marketing Name:\s+(.+?)\s*$", line)
+            if m:
+                cur_mkt = m.group(1)
+    if cur_name and cur_name.startswith("gfx"):
+        agents.append((cur_name, cur_mkt or "?"))
+    return agents
+
+
+def test_gfx1030_device_identity():
+    """本机 GPU 确为 gfx1030 / RX 6950 XT（防"测在错误的卡上"）。
+
+    选 rocminfo（宿主侧、不初始化 GPU context）为权威源，而非容器内
+    `python3 -c "import torch; print(torch.cuda.get_device_name(0))"`；
+    后者 2026-09-19 实测同样报告 "AMD Radeon RX 6950 XT"，可作交叉验证。
+    """
+    agents = _gfx_agents()
+    actual = "; ".join(f"{n} ({m})" for n, m in agents) or "<无 gfx agent>"
+    assert any(n == "gfx1030" for n, _ in agents), (
+        f"本机未报告 gfx1030 agent，实际: {actual}"
+    )
+    assert any(n == "gfx1030" and "6950" in m for n, m in agents), (
+        f"gfx1030 agent 的 Marketing Name 不含 6950，实际: {actual}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 测试 3：端到端（构建 → 改写 → llc → 容器内链接/编译 → GPU 数值校验）
 # ---------------------------------------------------------------------------
 
@@ -453,7 +551,9 @@ def test_vecadd_end_to_end(built_probe):
     src_ll = built_probe.opt_ll or built_probe.ll
     translated = translate_nvvm_to_amdgcn(src_ll.read_text())
     assert "llvm.nvvm" not in translated, (
-        f"真实产物改写后有 nvvm 残留: {src_ll}"
+        f"[阶段 IR-改写] 真实产物改写后有 nvvm 残留: {src_ll}\n"
+        "--- 残留行（尾20行）---\n"
+        f"{_tail(chr(10).join(l for l in translated.splitlines() if 'llvm.nvvm' in l))}"
     )
     amdgcn_ll = built_probe.dir / "vecadd_amdgcn.ll"
     amdgcn_ll.write_text(translated)
@@ -472,7 +572,11 @@ def test_vecadd_end_to_end(built_probe):
             str(co),
         ]
     )
-    assert proc.returncode == 0, f"llc 失败:\n{proc.stderr[-4000:]}"
+    assert proc.returncode == 0, (
+        f"[阶段 llc→code-object] 失败 (rc={proc.returncode})\n"
+        f"--- 关键错误输出（尾20行）---\n{_tail(proc.stderr)}\n"
+        f"--- 环境前提状态 ---\n{_env_diag()}"
+    )
     assert co.stat().st_size > 0
 
     # -- 容器内：ld.lld -shared → hipcc 编 host 探针 → 运行 ----------------
@@ -489,11 +593,15 @@ def test_vecadd_end_to_end(built_probe):
     ).format(wd=CONTAINER_WORKDIR)
     proc = _run(["docker", "exec", DOCKER_CONTAINER, "bash", "-c", cmds], timeout=300)
     assert proc.returncode == 0, (
-        f"容器内链接/编译/运行失败 (rc={proc.returncode}):\n"
-        f"stdout:\n{proc.stdout[-4000:]}\nstderr:\n{proc.stderr[-4000:]}"
+        f"[阶段 容器内链接/编译/运行] 失败 (rc={proc.returncode})\n"
+        f"--- 关键错误输出 stdout（尾20行）---\n{_tail(proc.stdout)}\n"
+        f"--- 关键错误输出 stderr（尾20行）---\n{_tail(proc.stderr)}\n"
+        f"--- 环境前提状态 ---\n{_env_diag()}"
     )
     assert "PASS: all 1024 elements correct" in proc.stdout, (
-        f"数值校验未 PASS:\n{proc.stdout[-4000:]}"
+        f"[阶段 GPU-数值校验] 未 PASS\n"
+        f"--- 关键错误输出 stdout（尾20行）---\n{_tail(proc.stdout)}\n"
+        f"--- 环境前提状态 ---\n{_env_diag()}"
     )
 
 
@@ -511,7 +619,11 @@ def docker_cp(src: Path, dest_name: str):
             f"{DOCKER_CONTAINER}:{CONTAINER_WORKDIR}/{dest_name}",
         ]
     )
-    assert proc.returncode == 0, f"docker cp 失败: {proc.stderr}"
+    assert proc.returncode == 0, (
+        f"[阶段 docker-cp（容器编译前置）] 失败 (rc={proc.returncode})\n"
+        f"--- 关键错误输出（尾20行）---\n{_tail(proc.stderr)}\n"
+        f"--- 环境前提状态 ---\n{_env_diag()}"
+    )
 
 
 # host 探针：docs/research/cuda-oxide/host_v6.cpp 的参数化版本。
