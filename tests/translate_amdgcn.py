@@ -21,6 +21,8 @@
 #      （atomic 地址分类；HIP 语境 local=scratch/private）
 # 12b. membar.gl/cta/sys → fence（agent/workgroup/system 域，.ll 层直接写）
 # 12c. syncscope("device"/"block") → ("agent"/"workgroup")（NV scope 名 → AMD）
+#  13. idp4a.s.s/.u.u → llvm.amdgcn.sdot4/udot4（v_dot4_i32_i8 硬件，clamp=false）；
+#      idp2a.* → 乘加展开（a 2×i16 × b 低/高 2 字节 i8，符号按后缀 sext/zext）
 #
 # 未映射 intrinsic 的 declare 保留——其调用点让 llc 报 Cannot select，
 # 作为"能力未覆盖"的显式失败信号（不静默放弃）。
@@ -87,6 +89,8 @@ def translate_nvvm_to_amdgcn(ll_text: str) -> str:
         r"|nvvm\.redux\.sync\.add"
         r"|nvvm\.isspacep\.(?:local|shared|global)"
         r"|nvvm\.membar\.(?:gl|sys|cta)"
+        r"|nvvm\.idp4a\.[su]\.[su]"
+        r"|nvvm\.idp2a\.[su]\.[su]"
         r"|amdgcn\.work(?:group|item)\.id\.x"
         r")\("
     )
@@ -135,6 +139,9 @@ def translate_nvvm_to_amdgcn(ll_text: str) -> str:
     # 12d. Rust core atomics 的内嵌 PTX asm（fence/acquire load/release store/
     #      seqcst load）→ LLVM 原子指令（层叠契约：isspacep 清零后才暴露）
     text = _rewrite_ptx_atomic_asm(text)
+
+    # 13. 整数点积：idp4a → sdot4/udot4（硬件 v_dot4），idp2a → 乘加展开
+    text = _rewrite_dotprod(text)
 
     return text
 
@@ -626,6 +633,105 @@ def _rewrite_ptx_atomic_asm(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Step 13: 整数点积（idp4a / idp2a）
+# ---------------------------------------------------------------------------
+
+# 实产形态（dotprod 实例 .opt.ll）：
+#   %r = tail call i32 @llvm.nvvm.idp4a.s.s(i32 %a, i32 %b, i32 %c)
+#   %r = tail call i32 @llvm.nvvm.idp2a.s.s(i32 %a, i32 %b, i1 false, i32 %c)
+# 语义（例源注释 + NVVM 命名，GPU 数值探针 DOTPROBE PASS，期望值取自例源）：
+#   idp4a: d = c + Σ a.byte[i]*b.byte[i]（4×i8，小端打包）
+#   idp2a: d = c + a.half0*b.byte[k] + a.half1*b.byte[k+1]
+#          （a 为 2×i16；isbottom=false 取 b 低 2 字节，true 取高 2 字节）
+# 映射：s.s → sdot4（v_dot4c_i32_i8）、u.u → udot4（v_dot4_u32_u8），clamp=false
+# （PTX dp4a 无 clamp）；混合符号 sdot4 覆盖不了、idp2a 无对应单指令 → 乘加展开。
+
+
+_IDP4A_RE = re.compile(
+    r"^(?P<indent>\s*)(?:(?P<res>%[\w.$]+)\s*=\s*)?(?:tail )?call\s+i32\s+"
+    r"@llvm\.nvvm\.idp4a\.(?P<sa>[su])\.(?P<sb>[su])\((?P<args>[^)]*)\)\s*(?:#\d+)?\s*$"
+)
+
+_IDP2A_RE = re.compile(
+    r"^(?P<indent>\s*)(?:(?P<res>%[\w.$]+)\s*=\s*)?(?:tail )?call\s+i32\s+"
+    r"@llvm\.nvvm\.idp2a\.(?P<sa>[su])\.(?P<sb>[su])\((?P<args>[^)]*)\)\s*(?:#\d+)?\s*$"
+)
+
+
+def _rewrite_dotprod(text: str) -> str:
+    if "idp4a" not in text and "idp2a" not in text:
+        return text
+    lines = text.split("\n")
+    out = []
+    for line in lines:
+        m4 = _IDP4A_RE.match(line)
+        if m4:
+            args = [a.strip() for a in _split_top_level_commas(m4.group("args"))]
+            if len(args) == 3 and m4.group("sa") == m4.group("sb"):
+                dot = "sdot4" if m4.group("sa") == "s" else "udot4"
+                lhs = f"{m4.group('res')} = " if m4.group("res") else ""
+                out.append(
+                    f"{m4.group('indent')}{lhs}call i32 @llvm.amdgcn.{dot}"
+                    f"({args[0]}, {args[1]}, {args[2]}, i1 false)"
+                )
+                continue
+            # 混合符号 idp4a：保守留残（llc 显式失败），不用展开路径
+            out.append(line)
+            continue
+        m2 = _IDP2A_RE.match(line)
+        if m2:
+            seq = _expand_idp2a(m2)
+            out.extend(seq if seq is not None else [line])
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def _expand_idp2a(m) -> "list[str] | None":
+    """idp2a.<sa>.<sb>(a, b, isbottom, c) → 提取+乘加直线 IR。
+
+    a 的 2×i16 与 b 的 2×i8 均按符号后缀 sext/zext 后在 i32 域做乘加
+    （与 v_dot2 语义一致且无溢出歧义）。isbottom 仅接受字面量（实产 immarg）。"""
+    res, indent = m.group("res"), m.group("indent")
+    args = [a.strip() for a in _split_top_level_commas(m.group("args"))]
+    if len(args) != 4:
+        return None
+    a, b, isbot, c = (_arg_operand(x) for x in args)
+    if isbot == "false":
+        sh = 0
+    elif isbot == "true":
+        sh = 16
+    else:
+        return None  # 非字面量 select：保守不支持
+    z = "zext" if m.group("sa") == "u" else "sext"
+    bz = "zext" if m.group("sb") == "u" else "sext"
+    if not res:
+        return None  # 结果未使用的调用：保留残信号
+    D = f"{res}.d_"  # SSA 名前缀（不含缩进；L = indent + D 用于定义行）
+    L = indent + D
+    seq = [
+        f"{L}a0t = trunc i32 {a} to i16",
+        f"{L}a0 = {z} i16 {D}a0t to i32",
+        f"{L}a1s = lshr i32 {a}, 16",
+        f"{L}a1t = trunc i32 {D}a1s to i16",
+        f"{L}a1 = {z} i16 {D}a1t to i32",
+    ]
+    if sh:
+        seq.append(f"{L}b0s = lshr i32 {b}, {sh}")
+        seq.append(f"{L}b0t = trunc i32 {D}b0s to i8")
+    else:
+        seq.append(f"{L}b0t = trunc i32 {b} to i8")
+    seq.append(f"{L}b0 = {bz} i8 {D}b0t to i32")
+    seq.append(f"{L}b1s = lshr i32 {b}, {sh + 8}")
+    seq.append(f"{L}b1t = trunc i32 {D}b1s to i8")
+    seq.append(f"{L}b1 = {bz} i8 {D}b1t to i32")
+    seq.append(f"{L}m0 = mul i32 {D}a0, {D}b0")
+    seq.append(f"{L}m1 = mul i32 {D}a1, {D}b1")
+    seq.append(f"{L}r0 = add i32 {c}, {D}m0")
+    seq.append(f"{indent}{res} = add i32 {D}r0, {D}m1")
+    return seq
+
+
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 def _append_ntid_kernarg_param(text: str) -> str:
