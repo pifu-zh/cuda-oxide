@@ -36,7 +36,7 @@ pub(crate) fn convert_generated_cp_async_copy(
     let operands: Vec<_> = op.deref(ctx).operands().collect();
 
     match context::lowering_options(ctx).intrinsic_backend {
-        IntrinsicBackend::LlvmNvptx => lower_copy_with_llvm_intrinsic(
+        IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => lower_copy_with_llvm_intrinsic(
             ctx,
             rewriter,
             op,
@@ -87,7 +87,7 @@ pub(crate) fn convert_generated_cp_async_control(
     }
 
     match context::lowering_options(ctx).intrinsic_backend {
-        IntrinsicBackend::LlvmNvptx => {
+        IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => {
             lower_control_with_llvm_intrinsic(ctx, rewriter, op, operands, typed_intrinsic_name)?;
         }
         IntrinsicBackend::LibNvvm => {
@@ -149,7 +149,7 @@ pub(crate) fn convert_generated_cp_async_mbarrier(
     let void_ty = llvm_types::VoidType::get(ctx);
 
     match context::lowering_options(ctx).intrinsic_backend {
-        IntrinsicBackend::LlvmNvptx => {
+        IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => {
             let pointer_ty = llvm_types::PointerType::get(ctx, output_address_space);
             let function_ty =
                 llvm_types::FuncType::get(ctx, void_ty.into(), vec![pointer_ty.into()], false);

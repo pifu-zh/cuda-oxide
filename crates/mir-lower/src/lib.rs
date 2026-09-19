@@ -172,6 +172,26 @@ pub enum IntrinsicBackend {
     LlvmNvptx,
     /// Emit intrinsic forms consumed by NVIDIA's libNVVM compiler.
     LibNvvm,
+    /// [PORT gfx1030] Emit intrinsic forms consumed by LLVM's AMDGPU backend
+    /// (`llc -march=amdgcn`).
+    ///
+    /// Stage-1 mapping (Phase-1 probe verified on gfx1030): the sreg reads
+    /// `ctaid.*`/`tid.*` lower to `llvm.amdgcn.workgroup.id.*` /
+    /// `llvm.amdgcn.workitem.id.*`. Everything else keeps the `LlvmNvptx`
+    /// form as a base; intrinsics with no AMDGPU equivalent (e.g. `ntid.*`,
+    /// `nctaid.*`) are rewritten or constant-folded by the codegen-side AMD
+    /// IR prep pass (`cuda-oxide-codegen/src/amdgcn.rs`), and unmapped
+    /// intrinsics fail at `llc` with an explicit `Cannot select` — the
+    /// "capability not yet covered" signal, never a silent wrong result.
+    ///
+    /// Deliberately NOT a per-backend signature switch like `LlvmNvptx` vs
+    /// `LibNvvm`: the generated converters keep their two-arm matches
+    /// (extended mechanically with `| Amdgcn`), and the only name-level
+    /// divergence lives in the sreg converters plus the prep pass. This
+    /// keeps the cuda-intrinsics-gen catalog (which models two NV ABIs)
+    /// untouched — regeneration will clobber only the mechanical arm
+    /// extensions, not the mapping design.
+    Amdgcn,
 }
 
 /// Options controlling the `dialect-mir` to LLVM dialect lowering pass.

@@ -43,7 +43,7 @@ fn convert_generated_wgmma_control(
     }
     let void_ty = llvm_types::VoidType::get(ctx);
     match context::lowering_options(ctx).intrinsic_backend {
-        IntrinsicBackend::LlvmNvptx => {
+        IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => {
             let arguments = if has_immediate {
                 vec![IntegerType::get(ctx, 64, Signedness::Signless).into()]
             } else {

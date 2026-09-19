@@ -1486,7 +1486,7 @@ fn generated_elect_sync_uses_the_selected_backend_route() -> Result<(), anyhow::
 
         assert_eq!(extract_count, 2);
         match backend {
-            mir_lower::IntrinsicBackend::LlvmNvptx => {
+            mir_lower::IntrinsicBackend::LlvmNvptx | mir_lower::IntrinsicBackend::Amdgcn => {
                 assert_eq!(typed_call_count, 1);
                 assert_eq!(inline_asm_count, 0);
                 assert_eq!(trunc_count, 0);

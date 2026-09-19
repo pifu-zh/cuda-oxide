@@ -184,7 +184,7 @@ fn convert_generated_stmatrix(
     }
     let void_ty = llvm_types::VoidType::get(ctx);
     match context::lowering_options(ctx).intrinsic_backend {
-        IntrinsicBackend::LlvmNvptx => {
+        IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => {
             let shared = cast_to_shared_addrspace(ctx, rewriter, operands[0]);
             let shared_ty = llvm_types::PointerType::get(ctx, llvm_types::address_space::SHARED);
             let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);

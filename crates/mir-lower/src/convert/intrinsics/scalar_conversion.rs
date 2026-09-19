@@ -38,7 +38,7 @@ pub(crate) fn convert_generated_scalar_conversion(
 
     let result_ty = IntegerType::get(ctx, 32, Signedness::Signless);
     let lowered = match context::lowering_options(ctx).intrinsic_backend {
-        IntrinsicBackend::LlvmNvptx => {
+        IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => {
             let function_ty = llvm_types::FuncType::get(
                 ctx,
                 result_ty.into(),

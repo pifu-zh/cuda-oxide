@@ -1354,7 +1354,7 @@ fn float_math_intrinsic_symbol(
     loc: pliron::location::Location,
 ) -> Result<&'static str> {
     match crate::context::lowering_options(ctx).intrinsic_backend {
-        crate::IntrinsicBackend::LlvmNvptx => {
+        crate::IntrinsicBackend::LlvmNvptx | crate::IntrinsicBackend::Amdgcn => {
             match intrinsic.llvm_intrinsic_name(ctx, result_ty, loc.clone())? {
                 Some(llvm_name) => Ok(llvm_name),
                 None => intrinsic.libdevice_name(ctx, result_ty, loc),

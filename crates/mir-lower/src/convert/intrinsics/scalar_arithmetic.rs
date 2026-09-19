@@ -45,12 +45,16 @@ pub(crate) fn convert_generated_scalar_arithmetic(
     };
     let backend = context::lowering_options(ctx).intrinsic_backend;
     let lowered = match backend {
-        IntrinsicBackend::LlvmNvptx if !llvm_inline_ptx => {
+        // [PORT gfx1030] Amdgcn follows the NVPTX intrinsic form: the typed
+        // LLVM intrinsic is target-agnostic IR. (With llvm_inline_ptx set it
+        // falls into the PTX-asm arm below, which llc -march=amdgcn then
+        // rejects explicitly — the Stage-1 capability signal.)
+        IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn if !llvm_inline_ptx => {
             let function_ty =
                 llvm_types::FuncType::get(ctx, result_ty, vec![result_ty; operands.len()], false);
             call_intrinsic(ctx, rewriter, op, intrinsic_name, function_ty, operands)?
         }
-        IntrinsicBackend::LlvmNvptx | IntrinsicBackend::LibNvvm => {
+        IntrinsicBackend::LlvmNvptx | IntrinsicBackend::LibNvvm | IntrinsicBackend::Amdgcn => {
             let constraint = match (is_f64, operands.len()) {
                 (false, 2) => "=f,f,f",
                 (false, 3) => "=f,f,f,f",

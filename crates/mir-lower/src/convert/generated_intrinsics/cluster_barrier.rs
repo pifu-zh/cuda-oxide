@@ -64,7 +64,7 @@ impl MirToLlvmConversion for ClusterBarrierOp {
         let op = self.get_operation();
         let void_ty = llvm_types::VoidType::get(ctx);
         match context::lowering_options(ctx).intrinsic_backend {
-            IntrinsicBackend::LlvmNvptx => {
+            IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => {
                 let function_ty = llvm_types::FuncType::get(ctx, void_ty.into(), vec![], false);
                 call_intrinsic(ctx, rewriter, op, recipe.0, function_ty, vec![])?;
             }
@@ -96,7 +96,7 @@ impl MirToLlvmConversion for ClusterSyncOp {
         let op = self.get_operation();
         let void_ty = llvm_types::VoidType::get(ctx);
         match context::lowering_options(ctx).intrinsic_backend {
-            IntrinsicBackend::LlvmNvptx => {
+            IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => {
                 let function_ty = llvm_types::FuncType::get(ctx, void_ty.into(), vec![], false);
                 call_intrinsic(
                     ctx,

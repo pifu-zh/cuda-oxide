@@ -68,7 +68,11 @@ pub(crate) fn convert_generated_scalar_math(
     }
     let backend = context::lowering_options(ctx).intrinsic_backend;
     let lowered = match backend {
-        IntrinsicBackend::LlvmNvptx if !llvm_inline_ptx => {
+        // [PORT gfx1030] Amdgcn follows the NVPTX intrinsic form: the typed
+        // LLVM intrinsic is target-agnostic IR. (With llvm_inline_ptx set it
+        // falls into the PTX-asm arm below, which llc -march=amdgcn then
+        // rejects explicitly — the Stage-1 capability signal.)
+        IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn if !llvm_inline_ptx => {
             // PTX-native scalar math ops (tanh) have no typed intrinsic and
             // are always generated with llvm_inline_ptx set, so an empty
             // name can only mean a corrupted generated table.
@@ -80,7 +84,7 @@ pub(crate) fn convert_generated_scalar_math(
             let function_ty = llvm_types::FuncType::get(ctx, result_ty, vec![result_ty], false);
             call_intrinsic(ctx, rewriter, op, intrinsic_name, function_ty, operands)?
         }
-        IntrinsicBackend::LlvmNvptx | IntrinsicBackend::LibNvvm => {
+        IntrinsicBackend::LlvmNvptx | IntrinsicBackend::LibNvvm | IntrinsicBackend::Amdgcn => {
             let constraint = if is_f16 {
                 "=h,h"
             } else if is_f64 {

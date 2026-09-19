@@ -28,7 +28,7 @@ impl MirToLlvmConversion for ElectSyncOp {
         operands_info: &OperandsInfo,
     ) -> Result<()> {
         match context::lowering_options(ctx).intrinsic_backend {
-            IntrinsicBackend::LlvmNvptx => convert_elect_sync_typed(
+            IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => convert_elect_sync_typed(
                 ctx,
                 rewriter,
                 self.get_operation(),
