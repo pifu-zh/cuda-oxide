@@ -15,6 +15,8 @@
 #   5. ntid.x → kernarg 新参数 i32 %ntid_x（blockDim 由 host 决定）
 #   6. ntid/nctaid .y|.z → "or i32 0, 1" 常量化（1D launch 语义）
 #   7. 删除已映射 intrinsic 的 nvvm declare（llc 自动声明 amdgcn 目标 intrinsic）
+#   8. alloca → addrspace(5) + use 点 addrspacecast（AMDGPU 本地帧契约，
+#      "alloca on amdgpu must be in addrspace(5)"，批量实证 module verifier 拒绝）
 #
 # 未映射 intrinsic 的 declare 保留——其调用点让 llc 报 Cannot select，
 # 作为"能力未覆盖"的显式失败信号（不静默放弃）。
@@ -79,7 +81,141 @@ def translate_nvvm_to_amdgcn(ll_text: str) -> str:
     )
     text = re.sub(rf"declare [^\n]*{mapped}[^\n]*\n", "", text)
 
+    # 8. alloca → addrspace(5)（AMDGPU module verifier：本地帧必须 scratch）
+    text = _rewrite_allocas(text)
+
     return text
+
+
+# ---------------------------------------------------------------------------
+# Step 8: alloca 地址空间（addrspace(5) 契约）
+# ---------------------------------------------------------------------------
+
+# 已是 addrspace(5) 的 alloca 不再匹配（幂等性的关键：改写产物重跑不变）
+_ALLOCA_DEF_RE = re.compile(r"^(?P<indent>\s*)(?P<name>%[\w.$]+)\s*=\s*alloca\s+(?P<rest>[^->]*\S)\s*$")
+
+# typed-pointer IR（math_tan 类非 opt 形态）不支持：use 点是 `bitcast <ty>*
+# %name to ...`，把 alloca 改 addrspace(5) 后 bitcast 跨地址空间非法
+# （须 addrspacecast 且元素类型语法不同）——显式跳过，llc 对该 module 仍报
+# verifier 错（显式失败信号）。
+_TYPED_IR_RE = re.compile(r"bitcast\s+[^;\n]*\*\s*%")
+
+
+def _split_top_level_commas(s: str):
+    """按括号深度切顶层逗号（<>/[]/() 内的逗号不算）。"""
+    parts, depth, start = [], 0, 0
+    for i, ch in enumerate(s):
+        if ch in "<[(":
+            depth += 1
+        elif ch in ">])":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(s[start:i].strip())
+            start = i + 1
+    parts.append(s[start:].strip())
+    return parts
+
+
+def _rewrite_allocas(text: str) -> str:
+    """generic 地址空间的 alloca → addrspace(5)，use 点经 addrspacecast 降级。
+
+    正确性论证：
+    - alloca 在 entry 块且先于任何 terminator → 其值支配函数内全部 use，
+      因此每个 alloca 只需一条 cast（插在 alloca 定义行之后）；
+    - use 替换是 SSA 名的 token 级替换（load/store/gep/bitcast/phi 等
+      操作数位置统一成立），被调名以外的引用不动；
+    - llvm.lifetime/dbg 类要求与 alloca 同地址空间的 use 在 cuda-oxide
+      产物中不出现（14 例批量 grep 实证）；一旦出现会被留成类型不匹配
+      的 verifier 显式失败信号，不静默出错。
+    """
+    if "= alloca " not in text or _TYPED_IR_RE.search(text):
+        return text
+
+    lines = text.split("\n")
+    out = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        if not (line.startswith("define ") and line.rstrip().endswith("{")):
+            out.append(line)
+            i += 1
+            continue
+
+        # 函数整体收集（define 行到收尾 "}"），函数内可能多个 alloca
+        func_start = i
+        func_end = _find_function_end(lines, i)
+        body = lines[func_start : func_end + 1]
+        out.extend(_rewrite_allocas_in_function(body))
+        i = func_end + 1
+
+    return "\n".join(out)
+
+
+def _rewrite_allocas_in_function(body: list) -> list:
+    """单个函数内的 alloca 改写（body = define 行.."}" 行）。"""
+    allocas = []  # (行号, name, 新定义行)
+    for k, line in enumerate(body):
+        m = _ALLOCA_DEF_RE.match(line)
+        if not m or "addrspace(" in m.group("rest"):
+            continue
+        name = m.group("name")
+        rest = m.group("rest")
+        # 语法顺序（hipcc gfx1030 实产对照）：alloca <ty>[, <count>][, align N],
+        # addrspace(5)
+        align = None
+        ma = re.search(r",\s*align\s+(\d+)\s*$", rest)
+        if ma:
+            align = ma.group(1)
+            rest = rest[: ma.start()]
+        parts = _split_top_level_commas(rest)
+        if len(parts) > 2 or parts[0] == "void":
+            continue  # 不可解析形态：保留原样（llc verifier 显式失败）
+        ty = parts[0]
+        count = parts[1] if len(parts) == 2 else None
+        indent = m.group("indent")
+        new_def = f"{indent}{name} = alloca {ty}"
+        if count is not None:
+            new_def += f", {count}"
+        if align is not None:
+            new_def += f", align {align}"
+        new_def += ", addrspace(5)"
+        allocas.append((k, name, new_def))
+
+    if not allocas:
+        return body
+
+    out = []
+    cast_lines_by_after = {}  # alloca 行号 -> 紧随其后的 cast 定义行
+    replaced_names = {}  # alloca 名 -> cast 名
+    new_def_by_line = {}  # alloca 行号 -> 新定义行
+    for k, name, new_def in allocas:
+        cast_name = f"{name}.ac"
+        replaced_names[name] = cast_name
+        new_def_by_line[k] = new_def
+        cast_lines_by_after[k] = (
+            f"{cast_name} = addrspacecast ptr addrspace(5) {name} to ptr"
+        )
+
+    # def 行替换 + use 行替换（token 级），cast 插在对应 alloca 行后
+    for k, line in enumerate(body):
+        if k in cast_lines_by_after:
+            out.append(new_def_by_line[k])
+            out.append(cast_lines_by_after[k])
+            continue
+        for name, cast in replaced_names.items():
+            line = re.sub(rf"(?<![\w.$]){re.escape(name)}(?![\w.$])", cast, line)
+        out.append(line)
+    return out
+
+
+def _find_function_end(lines, alloca_idx: int) -> int:
+    """alloca 之后第一个列 0 的 "}" 行（文本 IR：BB 无大括号，函数体的
+    "}" 唯一）。兜底返回 len(lines)。"""
+    j = alloca_idx + 1
+    while j < len(lines) and lines[j] != "}":
+        j += 1
+    return j
 
 
 def _append_ntid_kernarg_param(text: str) -> str:

@@ -243,6 +243,62 @@ def test_ir_translate_no_nvvm_residual():
     assert translate_nvvm_to_amdgcn(out) == out, "改写函数不幂等"
 
 
+# Step 8（alloca addrspace(5)）探针 fixture：数组 + count 操作数两种形态
+SAMPLE_ALLOCA_IR = """\
+target datalayout = "e-i64:64-i128:128-v16:16-v32:32-n16:32:64"
+target triple = "nvptx64-nvidia-cuda"
+
+define ptx_kernel void @alloca_probe(ptr %v0, i64 %v1, ptr %v2, i64 %v3) #1 {
+entry:
+  %buf = alloca [64 x float], align 4
+  %slot = alloca float, i32 1, align 4
+  %pa = getelementptr inbounds [4 x i8], ptr %v0, i64 %v1
+  %t = load float, ptr %pa, align 4
+  %pb = getelementptr inbounds [64 x float], ptr %buf, i64 0, i64 %v1
+  store float %t, ptr %pb, align 4
+  %ps = getelementptr inbounds float, ptr %slot, i64 0
+  store float %t, ptr %ps, align 4
+  %u = load float, ptr %ps, align 4
+  %pc = getelementptr inbounds [4 x i8], ptr %v2, i64 %v1
+  store float %u, ptr %pc, align 4
+  ret void
+}
+"""
+
+
+def test_ir_translate_alloca_addrspace():
+    """Step 8：generic alloca → addrspace(5)，use 点插 addrspacecast（GPU 数值
+    已验证的探针契约：c[i] = 2*a[i] 经 scratch 槽往返）。"""
+    out = translate_nvvm_to_amdgcn(SAMPLE_ALLOCA_IR)
+
+    # 定义行：数组与 count 操作数两种形态，align 前置、addrspace(5) 收尾
+    assert "= alloca [64 x float], align 4, addrspace(5)" in out
+    assert "= alloca float, i32 1, align 4, addrspace(5)" in out
+    # 每个 alloca 一条 cast，插在定义行后
+    assert "%buf.ac = addrspacecast ptr addrspace(5) %buf to ptr" in out
+    assert "%slot.ac = addrspacecast ptr addrspace(5) %slot to ptr" in out
+    # 所有 use 点（gep/load/store）换到 cast 名，不再引用 generic 槽
+    assert re.search(r"getelementptr inbounds \[64 x float\], ptr %buf\.ac", out)
+    assert "ptr %slot.ac, i64 0" in out
+    assert not re.search(r", ptr %buf[,)\s]", out), "alloca 仍有未降级的 generic use"
+    # 已在 addrspace(5) 的 alloca 不再被改（幂等前提）
+    assert translate_nvvm_to_amdgcn(out) == out, "alloca 改写不幂等"
+
+    # typed-pointer IR（math_tan 类非 opt 形态）显式跳过：不产生半改写产物
+    typed_ir = (
+        'target triple = "nvptx64-nvidia-cuda"\n'
+        "define void @f(i8* %v0) {\n"
+        "entry:\n"
+        "  %v41 = alloca {  }, align 1\n"
+        "  %v10 = bitcast {  }* %v41 to i8*\n"
+        "  ret void\n"
+        "}\n"
+    )
+    out3 = translate_nvvm_to_amdgcn(typed_ir)
+    assert "= alloca {  }, align 1" in out3, "typed-IR 的 alloca 被半改写"
+    assert "addrspacecast" not in out3
+
+
 # ---------------------------------------------------------------------------
 # 测试 2：cuda-oxide 管线副产物 .ptx 存在性
 # ---------------------------------------------------------------------------
