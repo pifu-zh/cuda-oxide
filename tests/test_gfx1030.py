@@ -467,6 +467,84 @@ def test_ir_translate_redux_add():
     assert translate_nvvm_to_amdgcn(out) == out, "redux 改写不幂等"
 
 
+# Step 12（isspacep/membar/syncscope → AMD 地址域语义）探针 fixture
+SAMPLE_ATOMICS_IR = """\
+target datalayout = "e-i64:64-i128:128-v16:16-v32:32-n16:32:64"
+target triple = "nvptx64-nvidia-cuda"
+
+declare i1 @llvm.nvvm.isspacep.local(ptr captures(none)) #0
+declare void @llvm.nvvm.membar.gl() #2
+declare void @llvm.nvvm.membar.sys() #2
+
+define ptx_kernel void @atom_probe(ptr %buf, ptr %out) #1 {
+entry:
+  %loc = alloca i32, align 4
+  %loc.ac = addrspacecast ptr addrspace(5) %loc to ptr
+  %isp = tail call i1 @llvm.nvvm.isspacep.local(ptr %buf) #8
+  br i1 %isp, label %priv, label %glob
+
+priv:
+  %pp = addrspacecast ptr %buf to ptr addrspace(5)
+  br label %done
+
+glob:
+  %r = atomicrmw add ptr %buf, i32 1 syncscope("device") monotonic, align 4
+  tail call void @llvm.nvvm.membar.gl() #8
+  tail call void @llvm.nvvm.membar.sys() #8
+  br label %done
+
+done:
+  ret void
+}
+
+define ptx_kernel void @atom_asm_probe(ptr %buf, ptr %out) #1 {
+entry:
+  ; Rust core::sync::atomic 的 PTX asm 降级形态（实产抓取）
+  tail call void asm sideeffect "fence.acq_rel.cta;", "~{memory}"() #9
+  tail call void asm sideeffect "fence.acq_rel.gpu;", "~{memory}"() #9
+  tail call void asm sideeffect "fence.acq_rel.sys;", "~{memory}"() #9
+  %la = tail call i32 asm sideeffect "ld.acquire.gpu.b32 $0, [$1];", "=r,l,~{memory}"(ptr %buf) #9
+  %lb = tail call i64 asm sideeffect "ld.acquire.sys.b64 $0, [$1];", "=l,l,~{memory}"(ptr %buf) #9
+  %lc = call ptr asm sideeffect "fence.sc.sys; ld.acquire.sys.b64 $0, [$1];", "=l,l,~{memory}"(ptr %buf) #9
+  tail call void asm sideeffect "st.release.gpu.b32 [$0], $1;", "l,r,~{memory}"(ptr %buf, i32 %la) #9
+  tail call void asm sideeffect "st.release.sys.b64 [$0], $1;", "l,l,~{memory}"(ptr %buf, ptr %out) #9
+  ret void
+}
+"""
+
+
+def test_ir_translate_atomics():
+    """Step 12：isspacep.local → is.private、membar.gl/sys → agent/system fence、
+    NV scope 名（device/block）→ AMD scope 名（agent/workgroup）、PTX asm 原子族
+    （fence/acquire load/seqcst load/release store）→ LLVM 原子指令。
+    （GPU 数值已验证：is.private 判定、generic fetch_add + fence、MP litmus
+    acquire/release 顺序 PASS。）"""
+    out = translate_nvvm_to_amdgcn(SAMPLE_ATOMICS_IR)
+
+    assert "llvm.nvvm" not in out, "isspacep/membar intrinsic 残留"
+    assert "@llvm.amdgcn.is.private(ptr %buf)" in out, "isspacep.local 未映射"
+    assert 'fence syncscope("agent") seq_cst' in out, "membar.gl 未映射"
+    assert "\n  fence seq_cst" in out, "membar.sys 未映射"
+    assert 'atomicrmw add ptr %buf, i32 1 syncscope("agent") monotonic' in out, (
+        "atomic scope 名未换"
+    )
+    # NV scope 名全部换掉
+    assert 'syncscope("device")' not in out
+    assert 'syncscope("block")' not in out
+    # PTX asm 原子族 → LLVM 原子指令（asm 不残留）
+    assert "asm sideeffect" not in out, "PTX asm 原子残留"
+    assert 'fence syncscope("workgroup") acq_rel' in out, "fence.acq_rel.cta 未映射"
+    assert 'fence syncscope("agent") acq_rel' in out, "fence.acq_rel.gpu 未映射"
+    assert "\n  fence acq_rel" in out, "fence.acq_rel.sys 未映射"
+    assert "%la = load atomic i32, ptr %buf syncscope(\"agent\") acquire, align 4" in out
+    assert "%lb = load atomic i64, ptr %buf acquire, align 8" in out
+    # fence.sc 前缀 seqcst load → 单条 seq_cst load
+    assert "%lc = load atomic ptr, ptr %buf seq_cst, align 8" in out
+    assert 'store atomic i32 %la, ptr %buf syncscope("agent") release, align 4' in out
+    assert "store atomic ptr %out, ptr %buf release, align 8" in out
+    assert translate_nvvm_to_amdgcn(out) == out, "atomics 改写不幂等"
+
+
 # ---------------------------------------------------------------------------
 # 测试 2：cuda-oxide 管线副产物 .ptx 存在性
 # ---------------------------------------------------------------------------
