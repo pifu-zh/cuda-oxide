@@ -1323,6 +1323,7 @@ mod tests {
         let state = ModuleExportState::new(
             &ctx,
             true,
+            "ptx_kernel",
             super::super::config::DebugKind::LineTables,
             None,
             super::super::config::FunctionLocalStaticPlacement::CompileUnitGlobals,
@@ -1344,6 +1345,7 @@ mod tests {
         let mut state = ModuleExportState::new(
             &ctx,
             true,
+            "ptx_kernel",
             super::super::config::DebugKind::Full,
             None,
             super::super::config::FunctionLocalStaticPlacement::CompileUnitGlobals,
