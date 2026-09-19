@@ -464,7 +464,8 @@ fn generate_amdgcn_code_object(
 ) -> Result<GeneratedPtx, PipelineError> {
     let mut diagnostics = Vec::new();
 
-    // 1. Prep pass (ntid kernarg / 1-D constant folding / declare cleanup).
+    // 1. Pre-opt prep: alloca → addrspace(5) only (the AMDGPU module
+    //    verifier contract `opt` enforces on amdgcn-layout input).
     let original =
         std::fs::read_to_string(module.llvm_ir).map_err(|error| {
             PipelineError::PtxGeneration(format!(
@@ -472,7 +473,45 @@ fn generate_amdgcn_code_object(
                 module.llvm_ir.display()
             ))
         })?;
-    let rewritten = crate::amdgcn::rewrite_ir_for_amdgcn(&original)
+    let prepped = crate::amdgcn::rewrite_allocas_for_amdgcn(&original)
+        .map_err(PipelineError::PtxGeneration)?;
+    let preopt_ll = module.llvm_ir.with_extension("amdgcn.preopt.ll");
+    std::fs::write(&preopt_ll, &prepped).map_err(|error| {
+        PipelineError::PtxGeneration(format!(
+            "failed to write AMDGPU pre-opt output ({}): {error}",
+            preopt_ll.display()
+        ))
+    })?;
+
+    // 2. Middle-end. Target-agnostic; `optimize_ll` keeps `public_symbols`
+    //    external so kernels survive internalization. Runs BEFORE the
+    //    ntid/nctaid rewrite so `alwaysinline` device helpers fold into
+    //    their kernels first (Phase-1 pipeline order, see
+    //    [`crate::amdgcn::rewrite_allocas_for_amdgcn`]).
+    let opt_output: std::path::PathBuf = if opts.no_opt {
+        preopt_ll.clone()
+    } else {
+        optimize_ll(
+            &preopt_ll,
+            module.public_symbols,
+            toolchain,
+            opts,
+            true,
+            llvm_export::export::DebugKind::Off,
+        )?
+        .0
+        .unwrap_or_else(|| preopt_ll.clone())
+    };
+
+    // 3. Post-opt prep (ntid kernarg / 1-D constant folding / declare
+    //    cleanup) on the exact `llc` input.
+    let optimized_text = std::fs::read_to_string(&opt_output).map_err(|error| {
+        PipelineError::PtxGeneration(format!(
+            "failed to read optimized LLVM IR for the AMDGPU prep pass ({}): {error}",
+            opt_output.display()
+        ))
+    })?;
+    let rewritten = crate::amdgcn::rewrite_ir_for_amdgcn(&optimized_text)
         .map_err(PipelineError::PtxGeneration)?;
     let amdgcn_ll = module.llvm_ir.with_extension("amdgcn.ll");
     std::fs::write(&amdgcn_ll, &rewritten).map_err(|error| {
@@ -485,28 +524,17 @@ fn generate_amdgcn_code_object(
         record_diagnostic(
             &mut diagnostics,
             diagnostic_sink,
-            format!("amdgcn prep pass: {} → {}", module.llvm_ir.display(), amdgcn_ll.display()),
+            format!(
+                "amdgcn prep pass: {} (allocas) → {} (opt) → {} (sregs/ntid)",
+                preopt_ll.display(),
+                opt_output.display(),
+                amdgcn_ll.display()
+            ),
         );
     }
+    let llc_input: std::path::PathBuf = amdgcn_ll;
 
-    // 2. Middle-end. Target-agnostic; `optimize_ll` keeps `public_symbols`
-    //    external so kernels survive internalization.
-    let llc_input: std::path::PathBuf = if opts.no_opt {
-        amdgcn_ll.clone()
-    } else {
-        optimize_ll(
-            &amdgcn_ll,
-            module.public_symbols,
-            toolchain,
-            opts,
-            true,
-            llvm_export::export::DebugKind::Off,
-        )?
-        .0
-        .unwrap_or_else(|| amdgcn_ll.clone())
-    };
-
-    // 3. llc → relocatable ELF.
+    // 4. llc → relocatable ELF.
     let unlinked = module.output.with_extension("unlinked.co");
     let llc_desc = format!("llc ({})", toolchain.llc_path);
     let result = std::process::Command::new(&toolchain.llc_path)
@@ -529,7 +557,7 @@ fn generate_amdgcn_code_object(
         }
     }
 
-    // 4. lld -shared → loadable code object.
+    // 5. lld -shared → loadable code object.
     let lld = discover_amdgcn_lld(toolchain, opts)?;
     let lld_desc = format!("lld ({}, {})", lld.path.display(), lld.provenance);
     let result = std::process::Command::new(&lld.path)
