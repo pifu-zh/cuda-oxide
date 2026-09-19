@@ -299,6 +299,40 @@ def test_ir_translate_alloca_addrspace():
     assert "addrspacecast" not in out3
 
 
+# Step 9（barrier → s.barrier + LDS undef 初始化）探针 fixture
+SAMPLE_BARRIER_IR = """\
+target datalayout = "e-i64:64-i128:128-v16:16-v32:32-n16:32:64"
+target triple = "nvptx64-nvidia-cuda"
+
+@tile = addrspace(3) global [256 x float] zeroinitializer, align 4
+
+declare void @llvm.nvvm.barrier.cta.sync.aligned.all(i32) #2
+
+define ptx_kernel void @shared_test(ptr %v0, i64 %v1, ptr %v2, i64 %v3) #1 {
+entry:
+  %tid = tail call i32 @llvm.nvvm.read.ptx.sreg.tid.x() #3
+  %gep = getelementptr inbounds [256 x float], ptr addrspace(3) @tile, i64 0, i64 0
+  tail call void @llvm.nvvm.barrier.cta.sync.aligned.all(i32 0) #4
+  tail call void @llvm.nvvm.barrier0() #4
+  ret void
+}
+"""
+
+
+def test_ir_translate_barrier():
+    """Step 9：__syncthreads → s.barrier；LDS 全局量 zeroinit → undef
+    （GPU 数值已验证：sharedmem 邻居读 256/256 PASS）。"""
+    out = translate_nvvm_to_amdgcn(SAMPLE_BARRIER_IR)
+
+    assert "call void @llvm.amdgcn.s.barrier()" in out, "barrier.cta 未映射"
+    assert "llvm.nvvm.barrier" not in out, "barrier intrinsic 残留"
+    assert "undef, align 4" in out, "LDS zeroinitializer 未去初始化"
+    assert "zeroinitializer" not in out
+    # s.barrier 的 declare 须被删（llc 自动声明）；幂等
+    assert "declare void @llvm.amdgcn.s.barrier" not in out
+    assert translate_nvvm_to_amdgcn(out) == out, "barrier 改写不幂等"
+
+
 # ---------------------------------------------------------------------------
 # 测试 2：cuda-oxide 管线副产物 .ptx 存在性
 # ---------------------------------------------------------------------------
