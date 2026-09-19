@@ -76,6 +76,8 @@ def translate_nvvm_to_amdgcn(ll_text: str) -> str:
         r"@llvm\.(?:"
         r"nvvm\.read\.ptx\.sreg\.(?:ctaid|tid|ntid)\.x"
         r"|nvvm\.read\.ptx\.sreg\.(?:ntid|nctaid)\.[yz]"
+        r"|nvvm\.barrier\.cta\.sync\.aligned\.all"
+        r"|nvvm\.barrier0"
         r"|amdgcn\.work(?:group|item)\.id\.x"
         r")\("
     )
@@ -83,6 +85,30 @@ def translate_nvvm_to_amdgcn(ll_text: str) -> str:
 
     # 8. alloca → addrspace(5)（AMDGPU module verifier：本地帧必须 scratch）
     text = _rewrite_allocas(text)
+
+    # 9. CTA barrier（__syncthreads 语义）→ llvm.amdgcn.s.barrier
+    #    （编译探针实证：gfx1030 后端存在 convergent 无参 intrinsic）
+    text = re.sub(
+        r"(?:tail )?call void @llvm\.nvvm\.barrier\.cta\.sync\.aligned\.all\([^)]*\)"
+        r"(?:\s*#\d+)?",
+        "call void @llvm.amdgcn.s.barrier()",
+        text,
+    )
+    text = re.sub(
+        r"(?:tail )?call void @llvm\.nvvm\.barrier0\(\)(?:\s*#\d+)?",
+        "call void @llvm.amdgcn.s.barrier()",
+        text,
+    )
+
+    # 9b. LDS 静态初始化契约：addrspace(3) 全局量不能带 zeroinitializer
+    #     （"unsupported initializer for address space"——LDS 无加载时清零
+    #     硬件；hipcc 对 __shared__ 实产 undef。cuda-oxide 的 zeroinit 是
+    #     LLVM 全局量文法产物，非语义承诺：SharedArray::UNINIT 即未初始化）
+    text = re.sub(
+        r"(addrspace\(3\) global\s+[^;\n]+?)\s+zeroinitializer",
+        r"\1 undef",
+        text,
+    )
 
     return text
 
