@@ -887,6 +887,15 @@ fn write_device_artifact_object(
         device_codegen::DeviceCodegenArtifactKind::Cubin => {
             oxide_artifacts::ArtifactPayloadKind::Cubin
         }
+        // [PORT gfx1030] The bundle tag is reused because `oxide-artifacts`
+        // is consumed from crates.io (see scripts/check-oxide-artifacts-parity.sh):
+        // an hsaco is semantically a final driver-loadable device image, which
+        // is the Cubin payload's role. A dedicated `Hsaco` tag would need an
+        // oxide-artifacts release; deferred until the host HIP layer (Stage 2)
+        // needs to distinguish them.
+        device_codegen::DeviceCodegenArtifactKind::Hsaco => {
+            oxide_artifacts::ArtifactPayloadKind::Cubin
+        }
     };
     // Preserve the actual policy even after IR has become a cubin. Consumers
     // and diagnostics must not mistake `--no-fmad` materialization for a
@@ -1032,6 +1041,11 @@ fn materialize_artifact_for_embedding(
             return Err(Box::new(materialize::MaterializeError::PtxInput));
         }
         device_codegen::DeviceCodegenArtifactKind::Cubin => {
+            return Err(Box::new(materialize::MaterializeError::CubinInput));
+        }
+        // [PORT gfx1030] An hsaco is already a final driver-loadable image;
+        // there is nothing to materialize (same rationale as Cubin above).
+        device_codegen::DeviceCodegenArtifactKind::Hsaco => {
             return Err(Box::new(materialize::MaterializeError::CubinInput));
         }
     };
