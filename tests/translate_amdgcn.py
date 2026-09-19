@@ -27,6 +27,10 @@
 #      （LDS 计数器+世代自旋回退，helper 函数 + 入口 init，见 _rewrite_counted_barriers）
 #  15. __nv_<f>f / __nv_<f> → __ocml_<f>_f32 / __ocml_<f>_f64
 #      （libdevice → ocml；符号名经 llvm-nm ocml.bc 实证，llvm-link 链接期解析）
+#  16. mbarrier → 软件状态机（RDNA2 无 mbarrier 硬件）：
+#      init/arrive(.noComplete)/test_wait(PTX asm)/inval → LDS 单字 i64
+#      {pending[31:0], expected[47:32], phase[63:48]} 的原子操作，见
+#      _rewrite_mbarriers
 #
 # 未映射 intrinsic 的 declare 保留——其调用点让 llc 报 Cannot select，
 # 作为"能力未覆盖"的显式失败信号（不静默放弃）。
@@ -94,6 +98,7 @@ def translate_nvvm_to_amdgcn(ll_text: str) -> str:
         r"|nvvm\.read\.ptx\.sreg\.laneid"
         r"|nvvm\.redux\.sync\.add"
         r"|nvvm\.isspacep\.(?:local|shared|global)"
+        r"|nvvm\.mbarrier\.(?:init|arrive|arrive\.noComplete|inval)\.shared"
         r"|nvvm\.membar\.(?:gl|sys|cta)"
         r"|nvvm\.idp4a\.[su]\.[su]"
         r"|nvvm\.idp2a\.[su]\.[su]"
@@ -154,6 +159,10 @@ def translate_nvvm_to_amdgcn(ll_text: str) -> str:
 
     # 15. libdevice __nv_* → ocml __ocml_*（链接期经 llvm-link ocml.bc 解析）
     text = _rewrite_ocml(text)
+
+    # 16. mbarrier → 软件状态机（RDNA2 无硬件等价；aiter 管线实证的
+    #     "异步等待退化为软件同步" 路线，见 _rewrite_mbarriers）
+    text = _rewrite_mbarriers(text)
 
     return text
 
@@ -929,6 +938,217 @@ def _rewrite_ocml(text: str) -> str:
         text = text.replace(f"@__nv_{stem}f(", f"@__ocml_{stem}_f32(")
         text = text.replace(f"@__nv_{stem}(", f"@__ocml_{stem}_f64(")
     return text
+
+
+# ---------------------------------------------------------------------------
+# Step 16: mbarrier → 软件状态机（RDNA2 无 mbarrier 硬件，N/A 清单实证）
+# ---------------------------------------------------------------------------
+#
+# NV 语义（对象化同步原语）：mbarrier 是 LDS 里一个 64 位状态对象，arrive
+# 原子递减计数，计数归零时相位（phase/parity）翻转并重置计数；wait 自旋等
+# 相位变化；.noComplete 表示该次到达不得完成当前相位；inval 是生命周期清理。
+#
+# 软件等价设计（单字 i64 状态机，位域与 cuda-oxide Barrier 的硬件布局注释
+# 同构——单字原子性消除双字 count/phase 分离方案在相位边界的竞态窗口）：
+#   bit [31:0]  pending   当前未完成到达数
+#   bit [47:32] expected  init 设定的期望到达数（≤ 2^16-1；CUDA block ≤ 1024，
+#                         对 PTX 规范上限 2^20 的收窄，如实记录）
+#   bit [63:48] phase     相位计数（16 位；token 即该字段值——比硬件 1 位
+#                         parity 更强的比较，两相位回绕歧义不存在）
+# 映射表（每个 intrinsic 一条；调用形态从 barrier 实产 .opt.ll 抓取）：
+#   init.shared(ptr, n)   → 整字原子写 (n<<32)|n（phase=0）
+#   arrive.shared(ptr)    → workgroup fence（release：先前的普通 LDS 写对
+#                           等待者可见，Step 14/12 同款实证模式）+
+#                           atomicrmw sub 1；唯一观察到 pending==1 的线程
+#                           补一次完成写（重置 pending=expected、phase+1）
+#                           ——valid usage 下完成者唯一（硬件单字 RMW 的
+#                           语义由 atomicrmw 保住）；token=旧相位字段
+#   arrive.noComplete(n)  → atomicrmw sub n（不补完成写；前提 count <
+#                           pending，与 PTX valid usage 一致，越界 = UB 同 NV）
+#   test_wait(PTX asm)    → 自旋 load atomic volatile i64 比较相位字段 ≠
+#                           token，返回 i32 0/1（与 asm 形态结果类型一致，
+#                           下游 trunc-to-i1 与 and-1 两种用法都兼容）
+#   inval.shared(ptr)     → 删除调用行（no-op：软件 init 整字重写，inval 的
+#                           "下轮 init 前失效" 语义由之覆盖）
+# 语义边界（如实记录）：不支持 expect_tx 字节级事务计数（TMA 场景需另行
+# 设计）；RDNA2 无异步拷贝，vmcnt 部分排空（tma-like.md）是事务等待的
+# 正路，mbarrier 在此只承担到达同步。
+# 编译探针（gfx1030 llc 实证）：ds_sub_rtn_u64 / ds_write_b64 / ds_read_b64
+# / s_barrier / fence→s_waitcnt lgkmcnt(0) 全部接受（/tmp/probe_mb 探针）。
+# GPU 数值验证：barrier 例 3 kernel（全组同步 / LDS 邻居读 / noComplete
+# 计数语义）E2E PASS，20 次稳定性全过。
+#
+# 实产调用形态（barrier 例 .opt.ll，逐字抓取）：
+#   tail call void @llvm.nvvm.mbarrier.init.shared(ptr addrspace(3) @SYM, i32 %n) #4
+#   %t = tail call i64 @llvm.nvvm.mbarrier.arrive.shared(ptr addrspace(3) @SYM) #4
+#   %t = tail call i64 @llvm.nvvm.mbarrier.arrive.noComplete.shared(
+#          ptr addrspace(3) @SYM, i32 %n) #4
+#   %r = tail call i32 asm sideeffect "{ .reg .pred %p0;
+#          mbarrier.test_wait.shared.b64 %p0, [$1], $2;
+#          selp.b32 $0, 1, 0, %p0; }", "=r,l,l,~{memory}"(
+#          ptr addrspace(3) @SYM, i64 %t) #3
+#   tail call void @llvm.nvvm.mbarrier.inval.shared(ptr addrspace(3) @SYM) #4
+
+_MB_PTR_OP = r"ptr addrspace\(3\)\s+(?:(?:nonnull|noundef)\s+)*(?P<ptr>[@%][\w.$]+)"
+
+_MB_INIT_RE = re.compile(
+    r"^(?P<indent>\s*)(?:tail )?call\s+void\s+@llvm\.nvvm\.mbarrier\.init\.shared\("
+    r"\s*" + _MB_PTR_OP + r"\s*,\s*i32\s+(?P<count>[^,)]+?)\s*\)\s*(?:#\d+)?\s*$"
+)
+
+_MB_ARRIVE_RE = re.compile(
+    r"^(?P<indent>\s*)(?:(?P<res>%[\w.$]+)\s*=\s*)?(?:tail )?call\s+i64\s+"
+    r"@llvm\.nvvm\.mbarrier\.arrive\.shared\(\s*" + _MB_PTR_OP
+    + r"\s*\)\s*(?:#\d+)?\s*$"
+)
+
+_MB_ARRIVE_NC_RE = re.compile(
+    r"^(?P<indent>\s*)(?:(?P<res>%[\w.$]+)\s*=\s*)?(?:tail )?call\s+i64\s+"
+    r"@llvm\.nvvm\.mbarrier\.arrive\.noComplete\.shared\(\s*" + _MB_PTR_OP
+    + r"\s*,\s*i32\s+(?P<count>[^,)]+?)\s*\)\s*(?:#\d+)?\s*$"
+)
+
+_MB_INVAL_RE = re.compile(
+    r"^(?P<indent>\s*)(?:tail )?call\s+void\s+@llvm\.nvvm\.mbarrier\.inval\.shared\("
+    r"\s*" + _MB_PTR_OP + r"\s*\)\s*(?:#\d+)?\s*$"
+)
+
+# test_wait 不是 intrinsic 而是 PTX 内嵌 asm（cuda-oxide 生成路径实证），
+# 结果 i32 0/1 经 "=r,l,l,~{memory}"
+_MB_TEST_WAIT_ASM_RE = re.compile(
+    r'^(?P<indent>\s*)(?:(?P<res>%[\w.$]+)\s*=\s*)?(?:tail )?call\s+i32\s+asm\s+'
+    r'sideeffect\s+"\{ \.reg \.pred %p0; mbarrier\.test_wait\.shared\.b64 %p0, '
+    r'\[\$1\], \$2; selp\.b32 \$0, 1, 0, %p0; \}",\s*"=r,l,l,~\{memory\}"\('
+    r"\s*" + _MB_PTR_OP + r"\s*,\s*i64\s+(?P<tok>[^,)]+?)\s*\)\s*(?:#\d+)?\s*$"
+)
+
+_MB_HELPERS = """
+
+; [PORT gfx1030] 软件 mbarrier 状态机 helper（状态住对象自身 8 字节，无新增
+; LDS 全局量；位域注释见各函数头。LDS 不可静态初始化 → 对象初始为 undef，
+; 首次 init 整字写入后才有定义——与 NV "init 必须先于任何 arrive/wait 且须
+; 有组内同步发布" 契约一致）
+
+define internal void @__port_mb_init(ptr addrspace(3) %bar, i32 %count) nounwind {
+; state = {pending: count, expected: count, phase: 0}
+entry:
+  %c64 = zext i32 %count to i64
+  %c64.hi = shl i64 %c64, 32
+  %state = or i64 %c64.hi, %c64
+  store atomic i64 %state, ptr addrspace(3) %bar seq_cst, align 8
+  ret void
+}
+
+define internal i64 @__port_mb_arrive(ptr addrspace(3) %bar) nounwind {
+; release 栅栏 + 递减；唯一 pending==1 观察者补完成写；token = 旧相位
+entry:
+  fence syncscope("workgroup") seq_cst
+  %old = atomicrmw sub ptr addrspace(3) %bar, i64 1 seq_cst
+  %pend = and i64 %old, 4294967295
+  %last = icmp eq i64 %pend, 1
+  br i1 %last, label %release, label %out
+
+release:
+  %exp.sh = lshr i64 %old, 32
+  %exp = and i64 %exp.sh, 65535
+  %ph.sh = lshr i64 %old, 48
+  %ph = and i64 %ph.sh, 65535
+  %ph1 = add i64 %ph, 1
+  %ph1.sh = shl i64 %ph1, 48
+  %exp.sh2 = shl i64 %exp, 32
+  %t = or i64 %ph1.sh, %exp.sh2
+  %new = or i64 %t, %exp
+  store atomic i64 %new, ptr addrspace(3) %bar seq_cst, align 8
+  br label %out
+
+out:
+  %tok.sh = lshr i64 %old, 48
+  %tok = and i64 %tok.sh, 65535
+  ret i64 %tok
+}
+
+define internal i64 @__port_mb_arrive_nc(ptr addrspace(3) %bar, i32 %count) nounwind {
+; .noComplete：只递减、永不补完成写（count < pending 为 PTX valid usage）
+entry:
+  fence syncscope("workgroup") seq_cst
+  %c64 = zext i32 %count to i64
+  %old = atomicrmw sub ptr addrspace(3) %bar, i64 %c64 seq_cst
+  %tok.sh = lshr i64 %old, 48
+  %tok = and i64 %tok.sh, 65535
+  ret i64 %tok
+}
+
+define internal i32 @__port_mb_test_wait(ptr addrspace(3) %bar, i64 %token) nounwind {
+; 非阻塞单次测试（PTX mbarrier.test_wait 语义 = 谓词而非等待；阻塞语义由
+; 调用方的 while(!test_wait) 循环承担——Rust mbarrier_wait 的源码形态）。
+; volatile + seq_cst：外提禁令（helper 被内联时防自旋读被提出循环）+ acquire。
+; GPU 实证教训：首版把 helper 写成内部自旋，noComplete 分裂模式
+; （test_wait 期望立即返回 false）死锁——谓词必须非阻塞。
+entry:
+  %cur = load atomic volatile i64, ptr addrspace(3) %bar seq_cst, align 8
+  %cur.sh = lshr i64 %cur, 48
+  %cur.ph = and i64 %cur.sh, 65535
+  %done = icmp ne i64 %cur.ph, %token
+  %done32 = zext i1 %done to i32
+  ret i32 %done32
+}
+"""
+
+
+def _rewrite_mbarriers(text: str) -> str:
+    """mbarrier 五种实产形态 → 软件状态机 helper 调用（映射表见区块注释）。
+
+    inval 调用行直接删除；其余替换为 @__port_mb_* 调用并保持 SSA 结果名
+    不变（下游引用零改动）。幂等：改写产物不含任何被匹配形态。"""
+    if "mbarrier" not in text:
+        return text
+
+    lines = text.split("\n")
+    out = []
+    changed = False
+    for line in lines:
+        m = _MB_TEST_WAIT_ASM_RE.match(line)
+        if m:
+            res = f"{m.group('res')} = " if m.group("res") else ""
+            out.append(
+                f"{m.group('indent')}{res}call i32 @__port_mb_test_wait("
+                f"ptr addrspace(3) {m.group('ptr')}, i64 {m.group('tok')})"
+            )
+            changed = True
+            continue
+        m = _MB_INIT_RE.match(line)
+        if m:
+            out.append(
+                f"{m.group('indent')}call void @__port_mb_init("
+                f"ptr addrspace(3) {m.group('ptr')}, i32 {m.group('count')})"
+            )
+            changed = True
+            continue
+        m = _MB_ARRIVE_NC_RE.match(line)
+        if m:
+            res = f"{m.group('res')} = " if m.group("res") else ""
+            out.append(
+                f"{m.group('indent')}{res}call i64 @__port_mb_arrive_nc("
+                f"ptr addrspace(3) {m.group('ptr')}, i32 {m.group('count')})"
+            )
+            changed = True
+            continue
+        m = _MB_ARRIVE_RE.match(line)
+        if m:
+            res = f"{m.group('res')} = " if m.group("res") else ""
+            out.append(
+                f"{m.group('indent')}{res}call i64 @__port_mb_arrive("
+                f"ptr addrspace(3) {m.group('ptr')})"
+            )
+            changed = True
+            continue
+        if _MB_INVAL_RE.match(line):
+            continue  # no-op：删除调用行（语义论证见区块注释）
+        out.append(line)
+
+    if changed and "@__port_mb_init(ptr addrspace(3)" not in text:
+        out.append(_MB_HELPERS)
+    return "\n".join(out)
 
 
 def _append_ntid_kernarg_param(text: str) -> str:
