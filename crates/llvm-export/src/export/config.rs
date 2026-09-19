@@ -15,6 +15,14 @@ pub(super) const NVPTX_DATALAYOUT_FULL: &str = "e-p:64:64:64-p3:32:32:32-i1:8:8-
     i16:16:16-i32:32:32-i64:64:64-i128:128:128-f32:32:32-f64:64:64-f128:128:128-\
     v16:16:16-v32:32:32-v64:64:64-v128:128:128-n16:32:64-a:8:8";
 
+/// [PORT gfx1030] AMDGPU amdgcn data layout.
+///
+/// Byte-identical to the layout `llc -march=amdgcn` emits for gfx1030 and to
+/// the Phase-1 golden rewrite artifacts (see `tests/translate_amdgcn.py`
+/// `AMD_DATALAYOUT`), so both pipelines produce the same module shape.
+pub(super) const AMDGCN_DATALAYOUT: &str = "e-p:64:64-p1:64:64-p2:32:32-p3:32:32-p4:64:64-p5:32:32\
+    -p6:32:32-p7:160:256:256:32-p8:128:128-i64:64-i128:128-v16:16-v32:32-n16:32:64";
+
 /// The only supported 64-bit data layout for the legacy LLVM 7 NVVM dialect.
 ///
 /// Keep this in sync with NVIDIA's NVVM IR specification. In particular, the
@@ -136,6 +144,19 @@ pub trait ExportBackendConfig {
     /// Whether kernel definitions should use the `ptx_kernel` calling convention.
     fn emit_ptx_kernel_keyword(&self) -> bool;
 
+    /// [PORT gfx1030] Target triple declared in the module header.
+    fn target_triple(&self) -> &'static str {
+        "nvptx64-nvidia-cuda"
+    }
+
+    /// [PORT gfx1030] Calling-convention keyword printed on kernel
+    /// definitions when [`Self::emit_ptx_kernel_keyword`] is true. The AMDGPU
+    /// backend identifies kernels by calling convention alone
+    /// (`amdgpu_kernel`), while NVPTX additionally uses `!nvvm.annotations`.
+    fn kernel_callconv_keyword(&self) -> &'static str {
+        "ptx_kernel"
+    }
+
     /// NVVM input dialect, when this is an NVVM export.
     fn nvvm_ir_dialect(&self) -> Option<NvvmIrDialect> {
         None
@@ -186,6 +207,53 @@ impl ExportBackendConfig for PtxExportConfig {
 
     fn emit_ptx_kernel_keyword(&self) -> bool {
         true
+    }
+}
+
+/// [PORT gfx1030] Export configuration for the AMDGPU (`llc -march=amdgcn`)
+/// backend path.
+///
+/// Differences from [`PtxExportConfig`], each verified by the Phase-1
+/// manual pipeline and its gfx1030 numeric validation:
+/// - `amdgcn-amd-amdhsa` triple and the AMDGPU data layout
+/// - `amdgpu_kernel` calling convention instead of `ptx_kernel` (AMD
+///   identifies kernels by calling convention; `!nvvm.annotations` is NVVM
+///   specific and not emitted here)
+/// - `@llvm.used` rooting is kept so `opt` cannot drop kernels
+#[derive(Clone, Debug, Default)]
+pub struct AmdgcnExportConfig;
+
+impl ExportBackendConfig for AmdgcnExportConfig {
+    fn datalayout(&self) -> &str {
+        AMDGCN_DATALAYOUT
+    }
+
+    fn emit_llvm_used(&self) -> bool {
+        true
+    }
+
+    fn emit_nvvmir_version(&self) -> bool {
+        false
+    }
+
+    fn nvvmir_version(&self) -> [i32; 4] {
+        [0, 0, 0, 0] // Not used in AMDGPU mode
+    }
+
+    fn emit_all_kernel_annotations(&self) -> bool {
+        false
+    }
+
+    fn emit_ptx_kernel_keyword(&self) -> bool {
+        true
+    }
+
+    fn target_triple(&self) -> &'static str {
+        "amdgcn-amd-amdhsa"
+    }
+
+    fn kernel_callconv_keyword(&self) -> &'static str {
+        "amdgpu_kernel"
     }
 }
 

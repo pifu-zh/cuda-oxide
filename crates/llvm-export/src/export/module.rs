@@ -579,6 +579,7 @@ pub(super) fn export_module_with_externs_impl(
     let mut state = ModuleExportState::new(
         ctx,
         emit_ptx_kernel_keyword,
+        config.kernel_callconv_keyword(),
         config.debug_kind(),
         config.nvvm_ir_dialect(),
         config.function_local_static_placement(),
@@ -606,7 +607,7 @@ pub(super) fn export_module_with_externs_impl(
         config.datalayout()
     )
     .unwrap();
-    writeln!(&mut output, "target triple = \"nvptx64-nvidia-cuda\"").unwrap();
+    writeln!(&mut output, "target triple = \"{}\"", config.target_triple()).unwrap();
     writeln!(&mut output).unwrap();
 
     // 2. Device extern declarations (before function definitions)
@@ -770,6 +771,7 @@ pub(super) fn export_module_to_string_with_config(
     let mut state = ModuleExportState::new(
         ctx,
         emit_ptx_kernel_keyword,
+        config.kernel_callconv_keyword(),
         config.debug_kind(),
         config.nvvm_ir_dialect(),
         config.function_local_static_placement(),
@@ -798,7 +800,7 @@ pub(super) fn export_module_to_string_with_config(
         config.datalayout()
     )
     .unwrap();
-    writeln!(&mut output, "target triple = \"nvptx64-nvidia-cuda\"").unwrap();
+    writeln!(&mut output, "target triple = \"{}\"", config.target_triple()).unwrap();
     writeln!(&mut output).unwrap(); // Separate header from body
 
     // 2. Process Globals and Functions (including intrinsic declarations)
