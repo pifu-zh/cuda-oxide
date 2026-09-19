@@ -78,6 +78,8 @@ def translate_nvvm_to_amdgcn(ll_text: str) -> str:
         r"|nvvm\.read\.ptx\.sreg\.(?:ntid|nctaid)\.[yz]"
         r"|nvvm\.barrier\.cta\.sync\.aligned\.all"
         r"|nvvm\.barrier0"
+        r"|nvvm\.shfl\.sync\.(?:idx|bfly|up|down)\.(?:f32|i32)"
+        r"|nvvm\.read\.ptx\.sreg\.laneid"
         r"|amdgcn\.work(?:group|item)\.id\.x"
         r")\("
     )
@@ -109,6 +111,13 @@ def translate_nvvm_to_amdgcn(ll_text: str) -> str:
         r"\1 undef",
         text,
     )
+
+    # 10. warp shuffle → ds_bpermute（段式 32-lane 语义，见 _rewrite_shuffle）
+    text = _rewrite_shuffle(text)
+
+    # 10c. cuda-oxide 的 f64 shuffle 内嵌 PTX asm（64 位拆两个 b32 bfly，
+    #      aiter warp.rs 同款实现）→ 双 ds_bpermute 拆分，见 _rewrite_shfl_asm
+    text = _rewrite_shfl_asm(text)
 
     return text
 
@@ -242,6 +251,181 @@ def _find_function_end(lines, alloca_idx: int) -> int:
     while j < len(lines) and lines[j] != "}":
         j += 1
     return j
+
+
+# ---------------------------------------------------------------------------
+# Step 10: warp shuffle → ds_bpermute（+ laneid）
+# ---------------------------------------------------------------------------
+
+# 语法（warp_reduce 实产对照）：
+#   %r = tail call float @llvm.nvvm.shfl.sync.<mode>.f32
+#        (i32 -1, float %val, i32 <delta>, i32 31)
+# mode ∈ idx(按索引读)/bfly(xor)/up/down；PTX 语义按 width 段内交换，
+# clamp=31 即 width=32（CUDA warp 大小）。
+_SHFL_RE = re.compile(
+    r"^(?P<indent>\s*)(?P<res>%[\w.$]+)\s*=\s*(?:tail )?call\s+"
+    r"(?P<ty>float|i32)\s+@llvm\.nvvm\.shfl\.sync\."
+    r"(?P<mode>idx|bfly|up|down)\.(?P<st>f32|i32)\((?P<args>[^)]*)\)\s*(?:#\d+)?\s*$"
+)
+
+# membermask 非 -1（部分 warp 参与的 shuffle）不支持：exec 语义在 AMD 侧
+# 需要独立处理，保守留下 nvvm 调用让 llc 显式失败
+_SHFL_MASK_RE = re.compile(r"i32\s*(-?\d+)\s*$")
+
+
+def _rewrite_shuffle(text: str) -> str:
+    """NVVM shuffle → AMD ds_bpermute 展开（每调用点一段直线 IR）。
+
+    语义映射（wave64 机器上保持 CUDA 32-lane warp 语义——按 32 对齐段
+    切分，段内交换，段外回自身值）：
+      lane  = mbcnt.lo(-1, 0)                ; 0..63
+      seg   = lane & -32                     ; 段基址
+      idx   : src = seg + (delta & 31)
+      bfly  : src = lane ^ delta             ; delta<32 不跨段
+      down  : t = (lane&31)+delta; src = t<=31 ? seg+t : lane
+      up    : t = (lane&31)-delta; src = 段内 ? seg+t : lane
+      off   = src * 4（ds_bpermute 是字节偏移，NV 是 lane 号——本步的
+              核心差异点）
+      val   : float 经 bitcast 往返，i32 直通
+    结果写回原 SSA 名，下游引用零改动。_laneid 同步映射 mbcnt.lo。
+    """
+    if "shfl.sync." not in text and "sreg.laneid" not in text:
+        return text
+
+    lines = text.split("\n")
+    out = []
+    for line in lines:
+        m = _LANEID_RE.match(line)
+        if m:
+            lhs = f"{m.group('res')} = " if m.group("res") else ""
+            out.append(f"{m.group('indent')}{lhs}call i32 "
+                       "@llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)")
+            continue
+        m = _SHFL_RE.match(line)
+        if not m:
+            out.append(line)
+            continue
+        expansion = _expand_shfl(m)
+        if expansion is None:  # 不支持的形态（mask 非 -1 等）：原样保留
+            out.append(line)
+            continue
+        out.extend(expansion)
+    return "\n".join(out)
+
+
+_LANEID_RE = re.compile(
+    r"^(?P<indent>\s*)(?:(?P<res>%[\w.$]+)\s*=\s*)?(?:tail )?call\s+i32\s+"
+    r"@llvm\.nvvm\.read\.ptx\.sreg\.laneid\(\)\s*(?:#\d+)?\s*$"
+)
+
+
+def _arg_operand(arg: str) -> str:
+    """"i32 16"/"float %v19" → "16"/"%v19"（剥类型前缀）。"""
+    return arg.strip().split(None, 1)[1].strip()
+
+
+def _expand_shfl(m) -> "list[str] | None":
+    res, ty, mode, indent = m.group("res"), m.group("ty"), m.group("mode"), m.group("indent")
+    st = m.group("st")
+    # 类型与 intrinsic 后缀一致性：float ↔ f32 / i32 ↔ i32
+    if (ty == "float") != (st == "f32"):
+        return None
+    args = [a.strip() for a in _split_top_level_commas(m.group("args"))]
+    if len(args) != 4:
+        return None
+    mask_arg, val_arg, delta_arg, clamp_arg = args
+    mm = _SHFL_MASK_RE.match(mask_arg)
+    if not mm or mm.group(1) != "-1":
+        return None
+    cm = _SHFL_MASK_RE.match(clamp_arg)
+    if not cm or cm.group(1) != "31":
+        return None  # width≠32（非标准 warp 尺寸）：显式不支持
+    delta = _arg_operand(delta_arg)
+    val = _arg_operand(val_arg)
+    r = res  # 中间名以 .b_ 标记（NVVM 名不含下划线，避免碰撞）
+    L = indent + f"{r}.b_"
+
+    seq = [f"{indent}{r}.b_ln = call i32 @llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)"]
+    if mode == "bfly":
+        seq.append(f"{L}src = xor i32 {r}.b_ln, {delta}")
+    elif mode == "idx":
+        seq.append(f"{L}seg = and i32 {r}.b_ln, -32")
+        seq.append(f"{L}d = and i32 {delta}, 31")
+        seq.append(f"{L}src = add i32 {L}seg, {L}d")
+    elif mode == "down":
+        seq.append(f"{L}seg = and i32 {r}.b_ln, -32")
+        seq.append(f"{L}lo = and i32 {r}.b_ln, 31")
+        seq.append(f"{L}t = add i32 {L}lo, {delta}")
+        seq.append(f"{L}in = icmp ule i32 {L}t, 31")
+        seq.append(f"{L}s2 = add i32 {L}seg, {L}t")
+        seq.append(f"{L}src = select i1 {L}in, i32 {L}s2, i32 {r}.b_ln")
+    else:  # up
+        seq.append(f"{L}seg = and i32 {r}.b_ln, -32")
+        seq.append(f"{L}lo = and i32 {r}.b_ln, 31")
+        seq.append(f"{L}t = sub i32 {L}lo, {delta}")
+        seq.append(f"{L}in = icmp uge i32 {L}lo, {delta}")
+        seq.append(f"{L}s2 = add i32 {L}seg, {L}t")
+        seq.append(f"{L}src = select i1 {L}in, i32 {L}s2, i32 {r}.b_ln")
+
+    seq.append(f"{L}off = shl i32 {L}src, 2")
+    if ty == "float":
+        seq.append(f"{L}bits = bitcast float {val} to i32")
+        seq.append(f"{L}got = call i32 @llvm.amdgcn.ds.bpermute(i32 {L}off, i32 {L}bits)")
+        seq.append(f"{indent}{res} = bitcast i32 {L}got to float")
+    else:
+        seq.append(f"{indent}{res} = call i32 @llvm.amdgcn.ds.bpermute(i32 {L}off, i32 {val})")
+    return seq
+
+
+# 10c. cuda-oxide 的 f64 shuffle 走内嵌 PTX asm（shfl.sync.bfly.b32 lo/hi 拆分，
+# 与 aiter warp.rs 的 64 位拆分实现同源）。该 asm 是 PTX 目标汇编，AMDGPU 后端
+# 直接拒绝（"could not allocate output register for constraint 'l'"）。
+# 识别其固定调用形态并展开为双 ds_bpermute：
+#   %r = tail call i64 asm sideeffect "... shfl.sync.bfly.b32 lo ... $2, 31, $3 ...",
+#        "=l,l,r,r"(i64 <val>, i32 <delta>, i32 -1) [attrs]
+_SHFL_ASM_RE = re.compile(
+    r'^(?P<indent>\s*)(?P<res>%[\w.$]+)\s*=\s*(?:tail )?call\s+i64\s+'
+    r'asm sideeffect "[^"]*shfl\.sync\.bfly\.b32 lo[^"]*?",\s*'
+    r'"=l,l,r,r"\(i64\s+(?P<val>%[\w.$]+),\s*i32\s+(?P<delta>[^,)]+),\s*'
+    r'i32\s+(?P<mask>[^,)]+)\)\s*(?:#\d+)?\s*$'
+)
+
+
+def _rewrite_shfl_asm(text: str) -> str:
+    if "shfl.sync.bfly.b32" not in text:
+        return text
+    lines = text.split("\n")
+    out = []
+    for line in lines:
+        m = _SHFL_ASM_RE.match(line)
+        if not m:
+            out.append(line)
+            continue
+        mask = m.group("mask").strip()
+        if mask != "-1":
+            out.append(line)  # mask 非 -1：显式不支持，留给 llc 报错
+            continue
+        res, val = m.group("res"), m.group("val")
+        delta = m.group("delta").strip()  # 正则已消耗 "i32 " 前缀
+        ind = m.group("indent")
+        L = ind + f"{res}.b_"
+        out.extend(
+            [
+                f"{ind}{res}.b_ln = call i32 @llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)",
+                f"{L}src = xor i32 {res}.b_ln, {delta}",
+                f"{L}off = shl i32 {L}src, 2",
+                f"{L}lo = trunc i64 {val} to i32",
+                f"{L}hi64 = lshr i64 {val}, 32",
+                f"{L}hi = trunc i64 {L}hi64 to i32",
+                f"{L}glo = call i32 @llvm.amdgcn.ds.bpermute(i32 {L}off, i32 {L}lo)",
+                f"{L}ghi = call i32 @llvm.amdgcn.ds.bpermute(i32 {L}off, i32 {L}hi)",
+                f"{L}ghi64 = zext i32 {L}ghi to i64",
+                f"{L}ghiup = shl i64 {L}ghi64, 32",
+                f"{L}glo64 = zext i32 {L}glo to i64",
+                f"{ind}{res} = or i64 {L}glo64, {L}ghiup",
+            ]
+        )
+    return "\n".join(out)
 
 
 def _append_ntid_kernarg_param(text: str) -> str:
