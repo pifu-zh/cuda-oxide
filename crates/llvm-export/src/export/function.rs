@@ -1036,7 +1036,9 @@ impl<'a> ModuleExportState<'a> {
 
             write!(output, "define ").unwrap();
             if is_kernel && self.emit_ptx_kernel_keyword {
-                write!(output, "ptx_kernel ").unwrap();
+                // [PORT gfx1030] Keyword comes from the export config
+                // (`ptx_kernel`, or `amdgpu_kernel` for the AMDGPU backend).
+                write!(output, "{} ", self.kernel_callconv_keyword).unwrap();
             }
             self.export_type(ret_ty, output)?;
             write!(output, " @{fixed_func_name}(").unwrap();

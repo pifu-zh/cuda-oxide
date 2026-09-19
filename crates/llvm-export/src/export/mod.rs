@@ -49,8 +49,8 @@ mod state;
 mod types;
 
 pub use config::{
-    DebugKind, ExportBackendConfig, FunctionLocalStaticPlacement, NvvmExportConfig, NvvmIrDialect,
-    PtxExportConfig,
+    AmdgcnExportConfig, DebugKind, ExportBackendConfig, FunctionLocalStaticPlacement,
+    NvvmExportConfig, NvvmIrDialect, PtxExportConfig,
 };
 pub use externs::{AsDeviceExtern, DeviceExternAttrs, DeviceExternDecl, DeviceExternType};
 

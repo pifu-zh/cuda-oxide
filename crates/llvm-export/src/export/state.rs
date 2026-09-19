@@ -119,8 +119,11 @@ pub(super) struct ModuleExportState<'a> {
     pub(super) function_abi_alignments: Vec<FunctionAbiAlignment>,
     /// Parameters carrying LLVM `byval` plus NVVM `grid_constant` semantics.
     pub(super) grid_constant_kernels: Vec<KernelGridConstants>,
-    /// Whether to print `ptx_kernel` on kernel definitions.
+    /// Whether to print the kernel calling convention on kernel definitions.
     pub(super) emit_ptx_kernel_keyword: bool,
+    /// [PORT gfx1030] Keyword printed when `emit_ptx_kernel_keyword` is true
+    /// (`ptx_kernel`, or `amdgpu_kernel` for the AMDGPU export config).
+    pub(super) kernel_callconv_keyword: &'static str,
     /// Track device function names for @llvm.used (standalone device fn compilation)
     pub(super) device_functions: Vec<String>,
     /// Defined globals retain external linkage because CUDA host code can
@@ -234,6 +237,7 @@ impl<'a> ModuleExportState<'a> {
     pub(super) fn new(
         ctx: &'a pliron::context::Context,
         emit_ptx_kernel_keyword: bool,
+        kernel_callconv_keyword: &'static str,
         debug_kind: DebugKind,
         nvvm_ir_dialect: Option<NvvmIrDialect>,
         debug_function_local_static_placement: FunctionLocalStaticPlacement,
@@ -247,6 +251,7 @@ impl<'a> ModuleExportState<'a> {
             function_abi_alignments: Vec::new(),
             grid_constant_kernels: Vec::new(),
             emit_ptx_kernel_keyword,
+            kernel_callconv_keyword,
             device_functions: Vec::new(),
             public_globals: Vec::new(),
             retained_globals: Vec::new(),

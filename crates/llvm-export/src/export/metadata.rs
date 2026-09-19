@@ -210,6 +210,7 @@ mod tests {
         ModuleExportState::new(
             ctx,
             false,
+            "ptx_kernel",
             DebugKind::Off,
             None,
             super::super::config::FunctionLocalStaticPlacement::CompileUnitGlobals,
