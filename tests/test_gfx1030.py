@@ -671,6 +671,76 @@ def test_ir_translate_ocml():
     assert translate_nvvm_to_amdgcn(out) == out, "ocml 改写不幂等"
 
 
+# Step 16（mbarrier → 软件状态机）探针 fixture：五种实产形态逐字复刻
+# （init/arrive/arrive.noComplete 是 intrinsic；test_wait 是 PTX 内嵌 asm；
+# inval 是生命周期清理）。自旋循环形态取自 barrier 例 kernel1 的 bb14。
+SAMPLE_MBARRIER_IR = """\
+target datalayout = "e-i64:64-i128:128-v16:16-v32:32-n16:32:64"
+target triple = "nvptx64-nvidia-cuda"
+
+@__shared_mem_0 = addrspace(3) global [1 x i64] zeroinitializer, align 8
+
+declare void @llvm.nvvm.mbarrier.init.shared(ptr addrspace(3), i32) #1
+declare i64 @llvm.nvvm.mbarrier.arrive.shared(ptr addrspace(3)) #1
+declare i64 @llvm.nvvm.mbarrier.arrive.noComplete.shared(ptr addrspace(3), i32) #1
+declare void @llvm.nvvm.mbarrier.inval.shared(ptr addrspace(3) writeonly captures(none)) #2
+
+define ptx_kernel void @mb_probe(ptr %out, i64 %nout) #3 {
+entry:
+  %tid = tail call i32 @llvm.nvvm.read.ptx.sreg.tid.x() #4
+  %nt = tail call i32 @llvm.nvvm.read.ptx.sreg.ntid.x() #4
+  tail call void @llvm.nvvm.mbarrier.init.shared(ptr addrspace(3) @__shared_mem_0, i32 %nt) #4
+  tail call void @llvm.nvvm.barrier.cta.sync.aligned.all(i32 0) #4
+  %tok = tail call i64 @llvm.nvvm.mbarrier.arrive.shared(ptr addrspace(3) @__shared_mem_0) #4
+  br label %spin
+
+spin:
+  %r = tail call i32 asm sideeffect "{ .reg .pred %p0; mbarrier.test_wait.shared.b64 %p0, [$1], $2; selp.b32 $0, 1, 0, %p0; }", "=r,l,l,~{memory}"(ptr addrspace(3) @__shared_mem_0, i64 %tok) #3
+  %done = trunc i32 %r to i1
+  br i1 %done, label %exit, label %spin
+
+exit:
+  %tok2 = tail call i64 @llvm.nvvm.mbarrier.arrive.noComplete.shared(ptr addrspace(3) @__shared_mem_0, i32 %nt) #4
+  tail call void @llvm.nvvm.mbarrier.inval.shared(ptr addrspace(3) @__shared_mem_0) #4
+  ret void
+}
+"""
+
+
+def test_ir_translate_mbarrier():
+    """Step 16：mbarrier 五形态 → 软件状态机 helper（LDS 单字 i64
+    {pending,expected,phase}）；test_wait 谓词必须非阻塞（GPU 实证：阻塞版
+    在 noComplete 分裂模式死锁）；inval 删行。（GPU 数值已验证：barrier 例
+    3 kernel E2E + 20 次稳定性。）"""
+    out = translate_nvvm_to_amdgcn(SAMPLE_MBARRIER_IR)
+
+    # 无 nvvm 残留、无 PTX asm 残留
+    assert "llvm.nvvm" not in out, "mbarrier intrinsic 残留"
+    assert "mbarrier.test_wait.shared.b64" not in out, "test_wait PTX asm 残留"
+    # 映射表逐项：SSA 结果名保持（下游引用零改动）
+    assert ("call void @__port_mb_init(ptr addrspace(3) @__shared_mem_0, i32 %nt)") in out
+    assert "%tok = call i64 @__port_mb_arrive(ptr addrspace(3) @__shared_mem_0)" in out
+    assert "%tok2 = call i64 @__port_mb_arrive_nc(ptr addrspace(3) @__shared_mem_0, i32 %nt)" in out
+    assert ("%r = call i32 @__port_mb_test_wait(ptr addrspace(3) @__shared_mem_0, i64 %tok)") in out
+    # inval 调用行被删除（no-op）
+    assert "mbarrier_inval" not in out
+    # 调用方的自旋循环保持（阻塞语义在调用方，不在 helper）
+    assert "br i1 %done, label %exit, label %spin" in out
+    # helper 定义就位；test_wait 是直线非阻塞谓词（无内部自旋回边）
+    assert "define internal void @__port_mb_init(ptr addrspace(3) %bar, i32 %count)" in out
+    assert "define internal i64 @__port_mb_arrive(ptr addrspace(3) %bar)" in out
+    assert "define internal i64 @__port_mb_arrive_nc(ptr addrspace(3) %bar, i32 %count)" in out
+    assert "define internal i32 @__port_mb_test_wait(ptr addrspace(3) %bar, i64 %token)" in out
+    helper_tail = out[out.index("define internal i32 @__port_mb_test_wait"):]
+    assert "br label" not in helper_tail, "test_wait helper 不得内部自旋（非阻塞谓词）"
+    assert "load atomic volatile i64" in out, "自旋读须 volatile 防外提"
+    # 已映射 mbarrier intrinsic 的 declare 被删（Step 7 扩展）
+    assert "declare i64 @llvm.nvvm.mbarrier.arrive.shared" not in out
+    assert "declare void @llvm.nvvm.mbarrier.init.shared" not in out
+    # 幂等
+    assert translate_nvvm_to_amdgcn(out) == out, "mbarrier 改写不幂等"
+
+
 # ---------------------------------------------------------------------------
 # 测试 2：cuda-oxide 管线副产物 .ptx 存在性
 # ---------------------------------------------------------------------------
@@ -807,6 +877,164 @@ def test_vecadd_end_to_end(built_probe):
         f"--- 关键错误输出 stdout（尾20行）---\n{_tail(proc.stdout)}\n"
         f"--- 环境前提状态 ---\n{_env_diag()}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 测试 4：barrier 例 E2E（Step 16 mbarrier 软件状态机，GPU 数值校验）
+# ---------------------------------------------------------------------------
+
+
+# barrier 例的 device-only 变体构建复用批量脚本的抽取器（单一事实源：
+# tests/batch_gfx1030_examples.py 的 extract_mod_block/extract_use_lines/
+# extract_top_level_items/build_variant）。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import batch_gfx1030_examples as batch  # noqa: E402
+
+
+def test_barrier_mbarrier_software(tmp_path):
+    """[PORT gfx1030] Step 16 端到端：barrier 例（mbarrier 软件等价）
+    .ll → 改写 → llc → ld.lld -shared → hipcc host → GPU 数值校验。
+
+    三个 kernel 对应例源三组校验：
+      barrier_sync_test          → 全组 mbarrier 同步（out 全 1）
+      barrier_shared_data_test   → mbarrier + LDS 邻居读（out[i]=(i+1)%256）
+      barrier_no_complete_test   → noComplete 相位语义（out=[0,1]）
+    """
+    if not _docker_available():
+        pytest.skip(f"docker 容器 {DOCKER_CONTAINER} 不可用")
+    assert _gpu_available(), "rocm-smi 报告 GPU 不可用（GPU down 立即停）"
+
+    crate_dir = tmp_path / "ox-barrier-e2e"
+    ok, err = batch.build_variant("barrier", crate_dir)
+    assert ok, f"[阶段 变体抽取] 失败: {err}"
+    env = dict(os.environ, CUDA_TOOLKIT_PATH=CUDA_TOOLKIT_PATH)
+    proc = _run(["cargo", f"+{NIGHTLY}", "oxide", "build"], cwd=crate_dir, env=env,
+                timeout=600)
+    assert proc.returncode == 0, (
+        f"[阶段 cargo oxide build] 失败 (rc={proc.returncode})\n"
+        f"--- 关键错误输出（尾20行）---\n{_tail(proc.stdout + proc.stderr)}\n"
+        f"--- 环境前提状态 ---\n{_env_diag()}"
+    )
+    src_ll = sorted(crate_dir.glob("*.opt.ll")) or [
+        p for p in crate_dir.glob("*.ll") if not p.name.endswith(".opt.ll")
+    ]
+    assert src_ll, f"未找到 .ll 产物: {list(crate_dir.iterdir())}"
+
+    translated = translate_nvvm_to_amdgcn(src_ll[0].read_text())
+    assert "llvm.nvvm" not in translated, "mbarrier 改写后仍有 nvvm 残留"
+    amdgcn_ll = crate_dir / "barrier_amdgcn.ll"
+    amdgcn_ll.write_text(translated)
+
+    co = crate_dir / "barrier_v5.co"
+    proc = _run([
+        str(LLC), "-march=amdgcn", "-mcpu=gfx1030",
+        "-amdhsa-code-object-version=5", "--filetype=obj",
+        str(amdgcn_ll), "-o", str(co),
+    ])
+    assert proc.returncode == 0, (
+        f"[阶段 llc→code-object] 失败 (rc={proc.returncode})\n"
+        f"--- 关键错误输出（尾20行）---\n{_tail(proc.stderr)}\n"
+        f"--- 环境前提状态 ---\n{_env_diag()}"
+    )
+
+    docker_cp(co, "barrier_v5.co")
+    host_cpp = crate_dir / "host_barrier_test.cpp"
+    host_cpp.write_text(
+        HOST_BARRIER_CPP.replace("@CO_PATH@", f"{CONTAINER_WORKDIR}/barrier_linked.co")
+    )
+    docker_cp(host_cpp, "host_barrier_test.cpp")
+    cmds = (
+        "set -e; cd {wd}; "
+        "ld.lld -shared barrier_v5.co -o barrier_linked.co; "
+        "hipcc -O2 --offload-arch=gfx1030 host_barrier_test.cpp -o host_barrier_test; "
+        "timeout 60 ./host_barrier_test"
+    ).format(wd=CONTAINER_WORKDIR)
+    proc = _run(["docker", "exec", DOCKER_CONTAINER, "bash", "-c", cmds], timeout=300)
+    assert proc.returncode == 0, (
+        f"[阶段 容器内链接/编译/运行] 失败 (rc={proc.returncode})\n"
+        f"--- 关键错误输出 stdout（尾20行）---\n{_tail(proc.stdout)}\n"
+        f"--- 关键错误输出 stderr（尾20行）---\n{_tail(proc.stderr)}\n"
+        f"--- 环境前提状态 ---\n{_env_diag()}"
+    )
+    assert "ALL BARRIER TESTS PASS" in proc.stdout, (
+        f"[阶段 GPU-数值校验] 未 PASS\n--- stdout（尾20行）---\n{_tail(proc.stdout)}"
+    )
+
+
+# barrier 例 host 探针：三 kernel 顺序 launch（1 block × 256 threads），
+# 校验期望值复刻 examples/barrier/main.rs 的三组断言。
+HOST_BARRIER_CPP = """\
+// [PORT gfx1030] generated by tests/test_gfx1030.py (barrier example host logic)
+#include <hip/hip_runtime.h>
+#include <cstdio>
+#include <vector>
+#include <fstream>
+#define CK(x) do { hipError_t e = (x); if (e != hipSuccess) { \\
+    printf("HIP error %s at %s:%d\\n", hipGetErrorString(e), __FILE__, __LINE__); return 1; } } while(0)
+
+static int run_kernel(hipModule_t mod, const char *name, void **kparams, unsigned ntid) {
+    hipFunction_t fn;
+    CK(hipModuleGetFunction(&fn, mod, name));
+    CK(hipModuleLaunchKernel(fn, 1, 1, 1, ntid, 1, 1, 0, nullptr, kparams, nullptr));
+    CK(hipDeviceSynchronize());
+    return 0;
+}
+
+int main() {
+    std::ifstream f("@CO_PATH@", std::ios::binary);
+    std::vector<char> img((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    hipModule_t mod;
+    CK(hipModuleLoadData(&mod, img.data()));
+
+    const unsigned N = 256, ntid = 256;
+    void *ntid_p = (void *)&ntid;
+    long long n = N;
+    int rc = 0;
+
+    {   // Test 1: barrier_sync_test -> all 1
+        unsigned *d; CK(hipMalloc(&d, N * 4)); CK(hipMemset(d, 0, N * 4));
+        void *kp[] = { &d, &n, ntid_p };
+        if (run_kernel(mod, "barrier_sync_test", kp, ntid)) return 1;
+        std::vector<unsigned> h(N);
+        CK(hipMemcpy(h.data(), d, N * 4, hipMemcpyDeviceToHost));
+        int bad = 0;
+        for (unsigned i = 0; i < N; i++) if (h[i] != 1) bad++;
+        printf(bad == 0 ? "PASS: barrier_sync_test all %u ones\\n"
+                        : "FAIL: barrier_sync_test %d mismatches\\n", bad == 0 ? N : bad);
+        if (bad) rc = 1;
+        CK(hipFree(d));
+    }
+    {   // Test 2: barrier_shared_data_test -> out[i] = (i+1) % N
+        unsigned *d; CK(hipMalloc(&d, N * 4)); CK(hipMemset(d, 0, N * 4));
+        void *kp[] = { &d, &n, ntid_p };
+        if (run_kernel(mod, "barrier_shared_data_test", kp, ntid)) return 1;
+        std::vector<unsigned> h(N);
+        CK(hipMemcpy(h.data(), d, N * 4, hipMemcpyDeviceToHost));
+        int bad = 0;
+        for (unsigned i = 0; i < N; i++)
+            if (h[i] != (i + 1) % N) { if (bad < 5) printf("  @%u got %u want %u\\n", i, h[i], (i + 1) % N); bad++; }
+        printf(bad == 0 ? "PASS: barrier_shared_data_test neighbor pattern all %u\\n"
+                        : "FAIL: barrier_shared_data_test %d mismatches\\n", bad == 0 ? N : bad);
+        if (bad) rc = 1;
+        CK(hipFree(d));
+    }
+    {   // Test 3: barrier_no_complete_test -> [0, 1]
+        unsigned *d; CK(hipMalloc(&d, 8)); CK(hipMemset(d, 0xFF, 8));
+        long long n2 = 2;
+        void *kp[] = { &d, &n2, ntid_p };
+        if (run_kernel(mod, "barrier_no_complete_test", kp, ntid)) return 1;
+        std::vector<unsigned> h(2);
+        CK(hipMemcpy(h.data(), d, 8, hipMemcpyDeviceToHost));
+        bool ok = (h[0] == 0 && h[1] == 1);
+        printf(ok ? "PASS: barrier_no_complete_test [0,1]\\n"
+                  : "FAIL: barrier_no_complete_test got [%u, %u]\\n", h[0], h[1]);
+        if (!ok) rc = 1;
+        CK(hipFree(d));
+    }
+    printf(rc == 0 ? "ALL BARRIER TESTS PASS\\n" : "BARRIER TESTS FAILED\\n");
+    return rc;
+}
+"""
 
 
 def _docker_exec(cmd: str, timeout=60):
