@@ -346,7 +346,7 @@ pub(crate) fn convert_reduce_s2g(
     let src_casted = cast_to_shared_addrspace(ctx, rewriter, operands[0]);
 
     match context::lowering_options(ctx).intrinsic_backend {
-        IntrinsicBackend::LlvmNvptx => {
+        IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => {
             let smem_ptr_ty = llvm_types::PointerType::get(ctx, 3);
             let generic_ptr_ty = llvm_types::PointerType::get(ctx, 0);
             let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
@@ -411,7 +411,7 @@ pub(crate) fn convert_prefetch_tensormap(
 
     let void_ty = llvm_types::VoidType::get(ctx);
     match context::lowering_options(ctx).intrinsic_backend {
-        IntrinsicBackend::LlvmNvptx => {
+        IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => {
             let pointer_ty = llvm_types::PointerType::get(ctx, 0);
             let function_ty =
                 llvm_types::FuncType::get(ctx, void_ty.into(), vec![pointer_ty.into()], false);
@@ -480,7 +480,7 @@ pub(crate) fn convert_prefetch_tile(
 
     let void_ty = llvm_types::VoidType::get(ctx);
     match context::lowering_options(ctx).intrinsic_backend {
-        IntrinsicBackend::LlvmNvptx => {
+        IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => {
             let pointer_ty = llvm_types::PointerType::get(ctx, 0);
             let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
             let i64_ty = IntegerType::get(ctx, 64, Signedness::Signless);
@@ -627,7 +627,7 @@ pub(crate) fn convert_tensormap_fence(
 
     let void_ty = llvm_types::VoidType::get(ctx);
     match context::lowering_options(ctx).intrinsic_backend {
-        IntrinsicBackend::LlvmNvptx => {
+        IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => {
             let mut argument_types = Vec::new();
             let mut call_operands = operands;
             if acquire {
@@ -689,7 +689,7 @@ pub(crate) fn convert_control(
 
     let void_ty = llvm_types::VoidType::get(ctx);
     match context::lowering_options(ctx).intrinsic_backend {
-        IntrinsicBackend::LlvmNvptx => {
+        IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => {
             let argument_types = if operands.is_empty() {
                 vec![]
             } else {

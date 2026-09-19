@@ -31,7 +31,7 @@ impl MirToLlvmConversion for ActiveMaskOp {
     ) -> Result<()> {
         let op = self.get_operation();
         match context::lowering_options(ctx).intrinsic_backend {
-            IntrinsicBackend::LlvmNvptx => convert_active_mask(ctx, rewriter, op, operands_info),
+            IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => convert_active_mask(ctx, rewriter, op, operands_info),
             IntrinsicBackend::LibNvvm => {
                 let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
                 let inline_asm = inline_asm_convergent(

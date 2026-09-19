@@ -78,7 +78,7 @@ pub(crate) fn convert_generated_ldmatrix<I: LdmatrixInstructionHead>(
     let shared_address = normalize_shared_address(ctx, rewriter, operands[0], name)?;
     let result_ty = register_result_type(ctx, register_count);
     let producer = match context::lowering_options(ctx).intrinsic_backend {
-        IntrinsicBackend::LlvmNvptx => lower_with_llvm_intrinsic(
+        IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => lower_with_llvm_intrinsic(
             ctx,
             rewriter,
             op,

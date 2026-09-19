@@ -69,7 +69,7 @@ fn test_generated_basic_mbarrier_uses_shared_lowering_on_both_backends() -> Resu
         let (ctx, module_ptr) = lower_basic_mbarrier(backend)?;
         let mut call_counts = [0usize; 3];
         let expected_asm = match backend {
-            mir_lower::IntrinsicBackend::LlvmNvptx => {
+            mir_lower::IntrinsicBackend::LlvmNvptx | mir_lower::IntrinsicBackend::Amdgcn => {
                 vec![(test_wait_template, "=r,l,l,~{memory}", 2)]
             }
             mir_lower::IntrinsicBackend::LibNvvm => vec![
@@ -128,7 +128,7 @@ fn test_generated_basic_mbarrier_uses_shared_lowering_on_both_backends() -> Resu
         }
 
         match backend {
-            mir_lower::IntrinsicBackend::LlvmNvptx => assert_eq!(call_counts, [1; 3]),
+            mir_lower::IntrinsicBackend::LlvmNvptx | mir_lower::IntrinsicBackend::Amdgcn => assert_eq!(call_counts, [1; 3]),
             mir_lower::IntrinsicBackend::LibNvvm => assert_eq!(call_counts, [0; 3]),
         }
         assert_eq!(asm_counts, vec![1; expected_asm.len()]);
@@ -141,7 +141,7 @@ fn test_generated_basic_mbarrier_uses_shared_lowering_on_both_backends() -> Resu
         let ir = llvm_export::export::export_module_to_string(&ctx, &module)
             .map_err(|error| anyhow::anyhow!(error))?;
         match backend {
-            mir_lower::IntrinsicBackend::LlvmNvptx => {
+            mir_lower::IntrinsicBackend::LlvmNvptx | mir_lower::IntrinsicBackend::Amdgcn => {
                 assert!(
                     ir.contains("call void @llvm.nvvm.mbarrier.init.shared(ptr addrspace(3)"),
                     "{ir}"
@@ -276,7 +276,7 @@ fn generated_cluster_barriers_lower_exactly_on_both_backends() -> Result<(), any
             }
         }
         match backend {
-            mir_lower::IntrinsicBackend::LlvmNvptx => {
+            mir_lower::IntrinsicBackend::LlvmNvptx | mir_lower::IntrinsicBackend::Amdgcn => {
                 assert_eq!(calls, [1; 6]);
                 assert_eq!(asm, [0; 6]);
             }
