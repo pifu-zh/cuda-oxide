@@ -23,6 +23,8 @@
 # 12c. syncscope("device"/"block") → ("agent"/"workgroup")（NV scope 名 → AMD）
 #  13. idp4a.s.s/.u.u → llvm.amdgcn.sdot4/udot4（v_dot4_i32_i8 硬件，clamp=false）；
 #      idp2a.* → 乘加展开（a 2×i16 × b 低/高 2 字节 i8，符号按后缀 sext/zext）
+#  14. barrier.cta.sync.count / arrive.count → 软件 counted barrier
+#      （LDS 计数器+世代自旋回退，helper 函数 + 入口 init，见 _rewrite_counted_barriers）
 #
 # 未映射 intrinsic 的 declare 保留——其调用点让 llc 报 Cannot select，
 # 作为"能力未覆盖"的显式失败信号（不静默放弃）。
@@ -83,6 +85,8 @@ def translate_nvvm_to_amdgcn(ll_text: str) -> str:
         r"nvvm\.read\.ptx\.sreg\.(?:ctaid|tid|ntid)\.x"
         r"|nvvm\.read\.ptx\.sreg\.(?:ntid|nctaid)\.[yz]"
         r"|nvvm\.barrier\.cta\.sync\.aligned\.all"
+        r"|nvvm\.barrier\.cta\.sync\.count"
+        r"|nvvm\.barrier\.cta\.arrive\.count"
         r"|nvvm\.barrier0"
         r"|nvvm\.shfl\.sync\.(?:idx|bfly|up|down)\.(?:f32|i32)"
         r"|nvvm\.read\.ptx\.sreg\.laneid"
@@ -142,6 +146,9 @@ def translate_nvvm_to_amdgcn(ll_text: str) -> str:
 
     # 13. 整数点积：idp4a → sdot4/udot4（硬件 v_dot4），idp2a → 乘加展开
     text = _rewrite_dotprod(text)
+
+    # 14. counted barrier → 软件 LDS 计数器+世代自旋回退
+    text = _rewrite_counted_barriers(text)
 
     return text
 
@@ -733,6 +740,151 @@ def _expand_idp2a(m) -> "list[str] | None":
 
 
 # ---------------------------------------------------------------------------
+# Step 14: counted barrier → LDS 计数器 + 世代自旋（软件回退）
+# ---------------------------------------------------------------------------
+#
+# PTX 编号 barrier（bar.sync id, cnt / bar.arrive id, cnt）允许 CTA 子集参与；
+# RDNA2 的 S_BARRIER 是无编号全组 barrier，直接映射会让旁观线程死锁。
+# 回退实现（GPU 数值探针 CBPROBE PASS：producer/consumer + split arrive/sync，
+# 128 线程 wave64）：
+#   cnt[id]：到达计数；gen[id]：世代号。arrive = 计数+1，末到者清零计数并
+#   世代+1 释放等待者；sync = 捕获世代 → arrive → 自旋等世代变化。
+#   全 seq_cst LDS 原子；正确性优先，性能损耗（每 barrier O(1) LDS 原子 +
+#   自旋轮次）如实记录。
+# 前提（文档化假设）：使用 barrier 的 kernel 入口块被 CTA 全部线程一致执行
+#   （CUDA 常规前提）——入口 init 后有一条全组 s.barrier 保证清零可见性。
+
+
+_CB_CALL_RE = re.compile(
+    r"^(?P<indent>\s*)(?:tail )?call\s+void\s+@llvm\.nvvm\.barrier\.cta\."
+    r"(?P<kind>sync|arrive)\.count\(\s*i32\s+(?P<id>-?\d+)\s*,\s*"
+    r"i32\s+(?P<n>\d+)\s*\)\s*(?:#\d+)?\s*$"
+)
+
+_CB_HELPERS = """
+
+; [PORT gfx1030] 软件 counted barrier 状态槽（LDS 不可静态初始化 → undef，
+; 由使用 barrier 的 kernel 入口清零，见各 kernel 的 cb-init 注释块）
+@__port_cb_cnt = addrspace(3) global [16 x i32] undef, align 4
+@__port_cb_gen = addrspace(3) global [16 x i32] undef, align 4
+
+define internal void @__port_cb_arrive(i32 %id, i32 %n) nounwind {
+entry:
+  %cnt.p = getelementptr inbounds [16 x i32], ptr addrspace(3) @__port_cb_cnt, i32 0, i32 %id
+  %old = atomicrmw add ptr addrspace(3) %cnt.p, i32 1 seq_cst
+  %lastn = add i32 %n, -1
+  %last = icmp eq i32 %old, %lastn
+  br i1 %last, label %release, label %out
+
+release:
+  store atomic i32 0, ptr addrspace(3) %cnt.p seq_cst, align 4
+  %gen.p = getelementptr inbounds [16 x i32], ptr addrspace(3) @__port_cb_gen, i32 0, i32 %id
+  %g = load atomic i32, ptr addrspace(3) %gen.p seq_cst, align 4
+  %g1 = add i32 %g, 1
+  store atomic i32 %g1, ptr addrspace(3) %gen.p seq_cst, align 4
+  ret void
+
+out:
+  ret void
+}
+
+define internal void @__port_cb_sync(i32 %id, i32 %n) convergent nounwind {
+entry:
+  %gen.p = getelementptr inbounds [16 x i32], ptr addrspace(3) @__port_cb_gen, i32 0, i32 %id
+  %myg = load atomic i32, ptr addrspace(3) %gen.p seq_cst, align 4
+  call void @__port_cb_arrive(i32 %id, i32 %n)
+  br label %spin
+
+spin:
+  %g = load atomic volatile i32, ptr addrspace(3) %gen.p seq_cst, align 4
+  %done = icmp ne i32 %g, %myg
+  br i1 %done, label %out, label %spin
+
+out:
+  ret void
+}
+"""
+
+_CB_INIT_MARKER = "; [PORT gfx1030] counted-barrier slot init"
+
+
+def _rewrite_counted_barriers(text: str) -> str:
+    """barrier.cta.sync/arrive.count(i32 <id>, i32 <n>) → helper 调用 +
+    使用者 kernel 入口注入槽位清零（仅支持常量 id/n；非字面量保守留残）。"""
+    if "barrier.cta.sync.count" not in text and "barrier.cta.arrive.count" not in text:
+        return text
+
+    lines = text.split("\n")
+    out = []
+    module_uses_cb = False
+    i = 0
+    n_lines = len(lines)
+    while i < n_lines:
+        line = lines[i]
+        if not (line.startswith("define ") and line.rstrip().endswith("{")):
+            out.append(line)
+            i += 1
+            continue
+        func_end = _find_function_end(lines, i)
+        body = lines[i : func_end + 1]
+        body, ids, used = _rewrite_cb_in_function(body)
+        module_uses_cb = module_uses_cb or used
+        out.extend(body)
+        i = func_end + 1
+    if module_uses_cb and "@__port_cb_cnt = addrspace(3) global" not in text:
+        out.append(_CB_HELPERS)
+    return "\n".join(out)
+
+
+def _rewrite_cb_in_function(body: "list[str]") -> "tuple[list[str], set, bool]":
+    """单函数内：改写 counted-barrier 调用点并注入入口 init。
+    返回 (新函数体, 用到的 id 集, 是否有 counted-barrier 调用)。"""
+    ids: "set[int]" = set()
+    changed = False
+    for k, line in enumerate(body):
+        m = _CB_CALL_RE.match(line)
+        if m:
+            ids.add(int(m.group("id")))
+            body[k] = (
+                f"{m.group('indent')}call void "
+                f"@__port_cb_{m.group('kind')}"
+                f"(i32 {m.group('id')}, i32 {m.group('n')})"
+            )
+            changed = True
+    if not ids:
+        return body, ids, changed
+
+    # 幂等：init 注释块已在 → 不重复注入
+    if any(_CB_INIT_MARKER in ln for ln in body):
+        return body, ids, changed
+
+    # 注入点：入口 label（define 行后首个 "xxx:" 行）之后的连续 alloca 之后
+    ins = 1
+    while ins < len(body) and not body[ins].rstrip().endswith(":"):
+        ins += 1
+    ins += 1  # 越过 label 行
+    while ins < len(body) and "= alloca " in body[ins]:
+        ins += 1
+    init = [_CB_INIT_MARKER + f" (ids: {','.join(map(str, sorted(ids)))})"]
+    for cb_id in sorted(ids):
+        init.append(
+            f"  %__port_cb_i{cb_id}c = getelementptr inbounds [16 x i32], "
+            f"ptr addrspace(3) @__port_cb_cnt, i32 0, i32 {cb_id}"
+        )
+        init.append(
+            f"  store atomic i32 0, ptr addrspace(3) %__port_cb_i{cb_id}c seq_cst, align 4"
+        )
+        init.append(
+            f"  %__port_cb_i{cb_id}g = getelementptr inbounds [16 x i32], "
+            f"ptr addrspace(3) @__port_cb_gen, i32 0, i32 {cb_id}"
+        )
+        init.append(
+            f"  store atomic i32 0, ptr addrspace(3) %__port_cb_i{cb_id}g seq_cst, align 4"
+        )
+    init.append("  call void @llvm.amdgcn.s.barrier()")
+    return body[:ins] + init + body[ins:], ids, changed
+
+
 # ---------------------------------------------------------------------------
 def _append_ntid_kernarg_param(text: str) -> str:
     """给调用了 ntid.x 的 kernel 签名末尾追加 `i32 %ntid_x` 参数。"""
