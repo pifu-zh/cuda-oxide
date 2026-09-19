@@ -390,6 +390,40 @@ def test_ir_translate_shuffle():
     assert translate_nvvm_to_amdgcn(out) == out, "shuffle 改写不幂等"
 
 
+# Step 11（redux.sync.add → 蝶形回退）探针 fixture
+SAMPLE_REDUX_IR = """\
+target datalayout = "e-i64:64-i128:128-v16:16-v32:32-n16:32:64"
+target triple = "nvptx64-nvidia-cuda"
+
+declare i32 @llvm.nvvm.redux.sync.add(i32, i32) #3
+
+define ptx_kernel void @redux_probe(ptr %v0, i64 %v1) #1 {
+entry:
+  %v = load i32, ptr %v0, align 4
+  %r1 = tail call i32 @llvm.nvvm.redux.sync.add(i32 %v, i32 -1) #3
+  %r2 = tail call i32 @llvm.nvvm.redux.sync.add(i32 1, i32 -1) #3
+  %s = add i32 %r1, %r2
+  store i32 %s, ptr %v0, align 4
+  ret void
+}
+"""
+
+
+def test_ir_translate_redux_add():
+    """Step 11：redux.sync.add → 5 轮 xor-butterfly ds_bpermute 回退
+    （gfx1030 无硬件 redux；GPU 数值已验证：全 warp 和 496 + 广播语义）。"""
+    out = translate_nvvm_to_amdgcn(SAMPLE_REDUX_IR)
+
+    assert "llvm.nvvm" not in out, "redux intrinsic 残留"
+    # 两处调用点 × 5 轮 ds_bpermute
+    assert out.count("@llvm.amdgcn.ds.bpermute") == 10
+    # xor 蝶形 mask 序列
+    assert "xor i32" in out
+    # 结果写回原 SSA 名（下游 %s 引用不动）
+    assert "%s = add i32 %r1, %r2" in out
+    assert translate_nvvm_to_amdgcn(out) == out, "redux 改写不幂等"
+
+
 # ---------------------------------------------------------------------------
 # 测试 2：cuda-oxide 管线副产物 .ptx 存在性
 # ---------------------------------------------------------------------------

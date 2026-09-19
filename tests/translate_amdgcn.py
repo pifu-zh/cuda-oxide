@@ -80,6 +80,7 @@ def translate_nvvm_to_amdgcn(ll_text: str) -> str:
         r"|nvvm\.barrier0"
         r"|nvvm\.shfl\.sync\.(?:idx|bfly|up|down)\.(?:f32|i32)"
         r"|nvvm\.read\.ptx\.sreg\.laneid"
+        r"|nvvm\.redux\.sync\.add"
         r"|amdgcn\.work(?:group|item)\.id\.x"
         r")\("
     )
@@ -118,6 +119,9 @@ def translate_nvvm_to_amdgcn(ll_text: str) -> str:
     # 10c. cuda-oxide 的 f64 shuffle 内嵌 PTX asm（64 位拆两个 b32 bfly，
     #      aiter warp.rs 同款实现）→ 双 ds_bpermute 拆分，见 _rewrite_shfl_asm
     text = _rewrite_shfl_asm(text)
+
+    # 11. redux.sync.add → 蝶形归约软件回退（gfx1030 无硬件 redux 指令）
+    text = _rewrite_redux_add(text)
 
     return text
 
@@ -425,6 +429,55 @@ def _rewrite_shfl_asm(text: str) -> str:
                 f"{ind}{res} = or i64 {L}glo64, {L}ghiup",
             ]
         )
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Step 11: redux.sync.add → 蝶形归约软件回退
+# ---------------------------------------------------------------------------
+#
+# gfx1030（RDNA2）无硬件 redux 指令（N/A 清单实证）。回退实现：5 轮
+# xor-butterfly（16/8/4/2/1），每轮 ds_bpermute 取对侧值后 i32 相加——
+# 5 轮后每 lane 得到其 32 对齐段（= CUDA warp）的全和，与 redux.sync.add
+# 语义一致（全 warp 参与、广播结果）。wave64 机器上 xor<32 不跨段，段内
+# 自洽。性能为 O(log32)·wave 次 LDS 往返，正确性优先（port 纪律 5）。
+#
+# 语法（redux_sum 实产对照）：
+#   %r = tail call i32 @llvm.nvvm.redux.sync.add(i32 <val>, i32 -1) [attrs]
+_REDUX_RE = re.compile(
+    r"^(?P<indent>\s*)(?P<res>%[\w.$]+)\s*=\s*(?:tail )?call\s+i32\s+"
+    r"@llvm\.nvvm\.redux\.sync\.add\(\s*i32\s+(?P<val>[^,)]+?)\s*,\s*"
+    r"i32\s+(?P<mask>[^,)]+)\)\s*(?:#\d+)?\s*$"
+)
+
+
+def _rewrite_redux_add(text: str) -> str:
+    if "redux.sync.add" not in text:
+        return text
+    lines = text.split("\n")
+    out = []
+    for line in lines:
+        m = _REDUX_RE.match(line)
+        if not m:
+            out.append(line)
+            continue
+        if m.group("mask").strip() != "-1":
+            out.append(line)  # 部分 warp 参与：不支持，留给 llc 显式失败
+            continue
+        res, val, ind = m.group("res"), m.group("val"), m.group("indent")
+        L = ind + f"{res}.b_"
+        seq = [f"{ind}{res}.b_ln = call i32 @llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)"]
+        cur = val
+        for shift in (16, 8, 4, 2, 1):
+            seq.append(f"{L}m{shift} = xor i32 {res}.b_ln, {shift}")
+            seq.append(f"{L}o{shift} = shl i32 {L}m{shift}, 2")
+            seq.append(f"{L}g{shift} = call i32 @llvm.amdgcn.ds.bpermute("
+                       f"i32 {L}o{shift}, i32 {cur})")
+            # 末轮直接写回原 SSA 名，下游引用零改动
+            dst = res if shift == 1 else f"{L}s{shift}"
+            seq.append(f"{ind}{dst} = add i32 {cur}, {L}g{shift}")
+            cur = dst
+        out.extend(seq)
     return "\n".join(out)
 
 
