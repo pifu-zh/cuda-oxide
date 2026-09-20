@@ -388,6 +388,10 @@ impl<C: ExportBackendConfig> ExportBackendConfig for PipelineExportConfig<C> {
         self.inner.nvvm_ir_dialect()
     }
 
+    fn undef_shared_globals(&self) -> bool {
+        self.inner.undef_shared_globals()
+    }
+
     fn debug_kind(&self) -> DebugKind {
         self.debug.kind
     }

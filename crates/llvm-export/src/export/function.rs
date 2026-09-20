@@ -226,7 +226,9 @@ impl<'a> ModuleExportState<'a> {
                 // uninitialized shared storage and is required by both legacy and
                 // modern NVVM IR. Keep the ordinary llc/PTX path's historical zero
                 // initializer for compatibility.
-                let initializer = if self.nvvm_ir_dialect.is_some() && address_space == 3 {
+                let undef_shared = self.nvvm_ir_dialect.is_some()
+                    || self.undef_shared_globals;
+                let initializer = if undef_shared && address_space == 3 {
                     "undef"
                 } else {
                     "zeroinitializer"

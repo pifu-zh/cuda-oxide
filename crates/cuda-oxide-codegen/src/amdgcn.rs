@@ -83,16 +83,22 @@ fn has_typed_pointer_bitcast(ll: &str) -> bool {
     })
 }
 
-/// Splits `s` on top-level commas: `<`, `[`, `(` open a group and `,` inside
-/// a group does not split (port of the script's `_split_top_level_commas`).
+/// Splits `s` on top-level commas: `<`, `[`, `(`, `{` open a group and `,`
+/// inside a group does not split (port of the script's
+/// `_split_top_level_commas`; [PORT gfx1030 Stage3-1] `{}` added — struct
+/// alloca types like `{ i32, i1, [3 x i8] }` otherwise split at their
+/// interior commas and the alloca rewriter silently skipped them, tripping
+/// the `alloca on amdgpu must be in addrspace(5)` verifier (batch
+/// first_error class: layering — only visible once an example used
+/// non-trivial aggregate locals).
 fn split_top_level_commas(s: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0i32;
     let mut start = 0usize;
     for (i, ch) in s.char_indices() {
         match ch {
-            '<' | '[' | '(' => depth += 1,
-            '>' | ']' | ')' => depth -= 1,
+            '<' | '[' | '(' | '{' => depth += 1,
+            '>' | ']' | ')' | '}' => depth -= 1,
             ',' if depth == 0 => {
                 parts.push(s[start..i].trim());
                 start = i + 1;
@@ -194,7 +200,7 @@ fn rewrite_allocas_in_function(body: &[&str]) -> Vec<String> {
             continue;
         }
         let rest = trimmed[eq + " = alloca ".len()..].trim();
-        if rest.contains("addrspace(") || rest.contains('-') || rest.contains('>') {
+        if rest.contains('-') || rest.contains('>') {
             continue;
         }
         // Script order: strip the trailing `, align N` FIRST, then split the
@@ -211,6 +217,17 @@ fn rewrite_allocas_in_function(body: &[&str]) -> Vec<String> {
         let parts = split_top_level_commas(head);
         if parts.len() > 2 || parts.first() == Some(&"void") {
             continue; // unparseable shape: keep as-is, llc verifier fails loudly
+        }
+        // [PORT gfx1030 Stage3-1] Skip only allocas whose OWN address space is
+        // already specified as a trailing parameter. The old whole-string
+        // `rest.contains("addrspace(")` guard also false-positived on allocas
+        // whose ELEMENT type is an addrspace pointer (e.g.
+        // `[2 x ptr addrspace(3)]` — a generic-stack slot holding shared
+        // pointers), leaving them generic and tripping the verifier.
+        if parts.iter().skip(1).any(|part| {
+            part.starts_with("addrspace(") && part.ends_with(')')
+        }) {
+            continue;
         }
         let ty = parts[0];
         let count = parts.get(1).copied();
