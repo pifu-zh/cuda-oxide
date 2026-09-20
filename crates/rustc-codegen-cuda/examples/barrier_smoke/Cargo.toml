@@ -1,19 +1,20 @@
 [package]
-name = "atomics"
+name = "barrier_smoke"
 version = "0.1.0"
 edition = "2024"
-authors = ["Nihal Pasham <nihalp@nvidia.com>"]
 license = "Apache-2.0"
 
 # Mark as standalone crate (not part of parent workspace)
 [workspace]
 
-# This example demonstrates sound atomic operations in unified compilation.
-# Build with:
-#   cargo oxide run atomics
+# [PORT gfx1030 Stage3-1] Minimal shared-memory + sync_threads smoke for the
+# AMDGPU path: barrier0 -> llvm.amdgcn.s.barrier, LDS globals, and the
+# ntid_x kernarg append, exercised end-to-end on gfx1030.
+# Run with:
+#   CUDA_OXIDE_TARGET=gfx1030 cargo oxide run barrier_smoke
 
 [dependencies]
-# Device-side intrinsics (atomics, thread indexing, etc.)
+# Device-side intrinsics (thread indexing, barriers, etc.)
 cuda-device = { path = "../../../cuda-device" }
 
 # Host-side utilities (CudaKernel trait, etc.)
