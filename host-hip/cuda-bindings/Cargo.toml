@@ -1,0 +1,25 @@
+# [PORT gfx1030 Stage2] HIP-backed stand-in for the crates.io `cuda-bindings`
+# package. Same package name/version so `[patch.crates-io]` in the gfx1030
+# examples swaps it in wholesale; see README.md for the design contract.
+[package]
+name = "cuda-bindings"
+version = "0.3.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "[PORT gfx1030] dlopen(libamdhip64) implementation of the cuda-bindings driver surface"
+publish = false
+
+# Standalone: swapped in via [patch.crates-io] from gfx1030 example workspaces,
+# deliberately NOT a member of the repository workspace (the workspace's own
+# cuda-bindings = "0.3.1" registry dependency must stay the upstream crate).
+[workspace]
+
+[lib]
+name = "cuda_bindings"
+path = "src/lib.rs"
+
+[dependencies]
+libloading = "0.8"
+
+[lints.rust]
+unexpected_cfgs = { level = "allow" }

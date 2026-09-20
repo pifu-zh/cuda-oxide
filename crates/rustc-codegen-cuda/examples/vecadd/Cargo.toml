@@ -23,3 +23,10 @@ cuda-host = { path = "../../../cuda-host" }
 
 # Host-side CUDA runtime
 cuda-core = "0.3.1"
+
+# [PORT gfx1030 Stage2] Swap the crates.io cuda-bindings (dlopen libcuda,
+# build-time CUDA SDK headers) for the HIP-backed stand-in at
+# ../../../host-hip/cuda-bindings: all cu* entry points translate to
+# libamdhip64 at runtime. Upstream builds without this table are untouched.
+[patch.crates-io]
+cuda-bindings = { path = "../../../host-hip/cuda-bindings" }
