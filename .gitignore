@@ -69,3 +69,9 @@ crates/rustc-codegen-cuda/examples/gemm_sol_final/bench/cublaslt_bench
 crates/rustc-codegen-cuda/examples/**/*.hsaco
 crates/rustc-codegen-cuda/examples/**/*.unlinked.co
 crates/rustc-codegen-cuda/examples/**/*.co
+
+# gfx1030 build artifacts
+*.hsaco
+*.unlinked.co
+ox_amdgcn_probe.hsaco
+ox_amdgcn_probe.unlinked.co
