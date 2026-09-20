@@ -80,7 +80,8 @@ macro_rules! hip {
     ($field:ident ( $($arg:expr),* $(,)? )) => {
         match hip() {
             Ok(api) => match api.$field {
-                Ok(f) => unsafe { f($($arg),*) },
+                // HIP entry points return C `int` codes; our CUresult is u32.
+                Ok(f) => unsafe { f($($arg),*) as u32 },
                 // Symbol missing from the loaded runtime (older ROCm).
                 Err(_) => cudaError_enum_CUDA_ERROR_NOT_SUPPORTED,
             },
@@ -93,8 +94,9 @@ macro_rules! hip {
 // Types (handles, result, structs)
 // ---------------------------------------------------------------------------
 
-/// Driver result codes are `int` end to end; HIP mirrors the numbering.
-pub type CUresult = i32;
+/// Driver result codes are `u32` end to end (bindgen renders C enums as
+/// unsigned); HIP mirrors the numbering. Handlers cast HIP's `int` codes.
+pub type CUresult = u32;
 
 pub type CUdevice = i32;
 /// CUDA `CUdeviceptr` is an integer device address; `hipDeviceptr_t` is
@@ -154,7 +156,7 @@ pub struct CUuuid {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CUmemLocation_st {
-    pub type_: i32,
+    pub type_: u32,
     pub id: i32,
 }
 pub type CUmemLocation = CUmemLocation_st;
@@ -165,8 +167,8 @@ pub type CUmemLocation = CUmemLocation_st;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CUmemAllocationProp_st {
-    pub type_: i32,
-    pub requestedHandleType: i32,
+    pub type_: u32,
+    pub requestedHandleType: u32,
     pub location: CUmemLocation_st,
     pub alloc: CUmemAllocationProp_alloc,
 }
@@ -183,15 +185,15 @@ pub struct CUmemAllocationProp_alloc {
 #[derive(Clone, Copy)]
 pub struct CUmemAccessDesc_st {
     pub location: CUmemLocation_st,
-    pub flags: i32,
+    pub flags: u32,
 }
 
 /// `CUmemPoolProps` (CUDA shape; translated to `hipMemPoolProps` in-handler).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CUmemPoolProps {
-    pub allocType: i32,
-    pub handleTypes: i32,
+    pub allocType: u32,
+    pub handleTypes: u32,
     pub location: CUmemLocation_st,
     pub usage: CUmemUsage_st,
     pub maxPoolSize: usize,
@@ -249,30 +251,31 @@ const _: () = assert!(
 // $HOME/opt/cuda13/include/cuda.h (CUDA 13) — see repo docs for the
 // extraction commands.
 
-pub type CUctx_flags = i32;
-pub type CUstream_flags = i32;
-pub type CUevent_flags = i32;
-pub type CUevent_wait_flags = i32;
-pub type CUdevice_attribute = i32;
-pub type CUfunction_attribute = i32;
-pub type CUfunction_attribute_enum = i32;
-pub type CUfunc_cache_enum = i32;
-pub type CUlimit = i32;
-pub type CUmemPool_attribute = i32;
-pub type CUmemAllocationType = i32;
-pub type CUmemAllocationHandleType = i32;
-pub type CUmemLocationType = i32;
-pub type CUmemAllocationGranularity_flags = i32;
-pub type CUmemAccess_flags = i32;
-pub type CUmemAttach_flags = i32;
-pub type CUmem_advise = i32;
-pub type CUmulticastGranularity_flags = i32;
-pub type CUstreamCaptureMode = i32;
-pub type CUstreamCaptureStatus = i32;
+pub type CUctx_flags = u32;
+pub type CUctx_flags_enum = u32;
+pub type CUstream_flags = u32;
+pub type CUevent_flags = u32;
+pub type CUevent_wait_flags = u32;
+pub type CUdevice_attribute = u32;
+pub type CUfunction_attribute = u32;
+pub type CUfunction_attribute_enum = u32;
+pub type CUfunc_cache_enum = u32;
+pub type CUlimit = u32;
+pub type CUmemPool_attribute = u32;
+pub type CUmemAllocationType = u32;
+pub type CUmemAllocationHandleType = u32;
+pub type CUmemLocationType = u32;
+pub type CUmemAllocationGranularity_flags = u32;
+pub type CUmemAccess_flags = u32;
+pub type CUmemAttach_flags = u32;
+pub type CUmem_advise = u32;
+pub type CUmulticastGranularity_flags = u32;
+pub type CUstreamCaptureMode = u32;
+pub type CUstreamCaptureStatus = u32;
 
 macro_rules! cuda_consts {
     ($($(#[$doc:meta])* $name:ident = $value:expr;)*) => {
-        $($(#[$doc])* pub const $name: i32 = $value;)*
+        $($(#[$doc])* pub const $name: u32 = $value;)*
     };
 }
 
@@ -297,15 +300,13 @@ cuda_consts! {
     cudaError_enum_CUDA_ERROR_NOT_SUPPORTED = 801;
     cudaError_enum_CUDA_ERROR_INVALID_CLUSTER_SIZE = 912;
 
-    CU_CTX_SCHED_AUTO = 0x00;
-    CU_CTX_SCHED_SPIN = 0x01;
-    CU_CTX_SCHED_YIELD = 0x02;
-    CU_CTX_SCHED_BLOCKING_SYNC = 0x04;
-    CU_CTX_SCHED_MASK = 0x07;
-
+    CUctx_flags_enum_CU_CTX_SCHED_AUTO = 0x00;
+    CUctx_flags_enum_CU_CTX_SCHED_SPIN = 0x01;
+    CUctx_flags_enum_CU_CTX_SCHED_YIELD = 0x02;
+    CUctx_flags_enum_CU_CTX_SCHED_BLOCKING_SYNC = 0x04;
+    CUctx_flags_enum_CU_CTX_SCHED_MASK = 0x07;
     CUstream_flags_enum_CU_STREAM_DEFAULT = 0x0;
     CUstream_flags_enum_CU_STREAM_NON_BLOCKING = 0x1;
-
     CUevent_flags_enum_CU_EVENT_DEFAULT = 0x0;
     CUevent_flags_enum_CU_EVENT_BLOCKING_SYNC = 0x1;
     CUevent_flags_enum_CU_EVENT_DISABLE_TIMING = 0x2;
@@ -322,6 +323,7 @@ cuda_consts! {
     CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z = 7;
     CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK = 8;
     CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT = 16;
+    CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_CLOCK_RATE = 13;
     CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE = 38;
     CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR = 39;
     CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75;
@@ -445,6 +447,7 @@ pub unsafe extern "C" fn cuDeviceGetAttribute(
         6 => 30,  // MAX_GRID_DIM_Y
         7 => 31,  // MAX_GRID_DIM_Z
         8 => 76,  // MAX_SHARED_MEMORY_PER_BLOCK -> MaxSharedMemoryPerBlock
+        13 => 5,  // CLOCK_RATE -> ClockRate (verified: 2720000 kHz on gfx1030)
         16 => 63, // MULTIPROCESSOR_COUNT -> MultiprocessorCount
         38 => 19, // L2_CACHE_SIZE -> L2CacheSize
         39 => 57, // MAX_THREADS_PER_MULTIPROCESSOR -> MaxThreadsPerMultiProcessor
@@ -457,7 +460,7 @@ pub unsafe extern "C" fn cuDeviceGetAttribute(
         120 | 132 => return cudaError_enum_CUDA_ERROR_NOT_SUPPORTED,
         _ => return cudaError_enum_CUDA_ERROR_NOT_SUPPORTED,
     };
-    hip!(hipDeviceGetAttribute(value, hip_attr, dev))
+    hip!(hipDeviceGetAttribute(value, hip_attr as i32, dev))
 }
 
 pub unsafe extern "C" fn cuDevicePrimaryCtxRetain(pctx: *mut CUcontext, dev: CUdevice) -> CUresult {
@@ -591,14 +594,14 @@ pub unsafe extern "C" fn cuStreamIsCapturing(
     hStream: CUstream,
     status: *mut CUstreamCaptureStatus,
 ) -> CUresult {
-    hip!(hipStreamIsCapturing(hStream as HipStream, status))
+    hip!(hipStreamIsCapturing(hStream as HipStream, status as *mut i32))
 }
 
 pub unsafe extern "C" fn cuStreamBeginCapture_v2(
     hStream: CUstream,
     mode: CUstreamCaptureMode,
 ) -> CUresult {
-    hip!(hipStreamBeginCapture(hStream as HipStream, mode))
+    hip!(hipStreamBeginCapture(hStream as HipStream, mode as i32))
 }
 
 pub unsafe extern "C" fn cuStreamEndCapture(hStream: CUstream, pGraph: *mut CUgraph) -> CUresult {
@@ -623,17 +626,20 @@ pub unsafe extern "C" fn cuStreamAttachMemAsync(
 
 pub unsafe extern "C" fn cuLaunchHostFunc(
     hStream: CUstream,
-    fn_: unsafe extern "C" fn(*mut c_void),
+    callback: Option<unsafe extern "C" fn(*mut c_void)>,
     userData: *mut c_void,
 ) -> CUresult {
-    hip!(hipLaunchHostFunc(hStream as HipStream, fn_, userData))
+    let Some(callback) = callback else {
+        return cudaError_enum_CUDA_ERROR_INVALID_VALUE;
+    };
+    hip!(hipLaunchHostFunc(hStream as HipStream, callback, userData))
 }
 
 /// Newer 4-arg host-func variant (stream, callback, data, mode). No HIP
 /// equivalent; unused by the gfx1030 example paths.
 pub unsafe extern "C" fn cu_launch_host_func(
     _hStream: CUstream,
-    _fn_: unsafe extern "C" fn(*mut c_void),
+    _callback: Option<unsafe extern "C" fn(*mut c_void)>,
     _userData: *mut c_void,
     _mode: u32,
 ) -> CUresult {
@@ -668,6 +674,14 @@ pub unsafe extern "C" fn cuEventElapsedTime(
     hEnd: CUevent,
 ) -> CUresult {
     hip!(hipEventElapsedTime(pMilliseconds, hStart as HipEvent, hEnd as HipEvent))
+}
+
+pub unsafe extern "C" fn cuEventElapsedTime_v2(
+    pMilliseconds: *mut f32,
+    hStart: CUevent,
+    hEnd: CUevent,
+) -> CUresult {
+    cuEventElapsedTime(pMilliseconds, hStart, hEnd)
 }
 
 /// Upstream helper wrapper (cuda-core `CudaEvent::elapsed_time`).
@@ -834,26 +848,41 @@ pub unsafe extern "C" fn cuMemsetD8Async(
 pub unsafe extern "C" fn cuMemPrefetchAsync_v2(
     dptr: CUdeviceptr,
     count: usize,
-    dstDevice: CUdevice,
+    location: CUmemLocation_st,
     flags: u32,
     hStream: CUstream,
 ) -> CUresult {
     hip!(hipMemPrefetchAsync(
         dptr as usize as *const c_void,
         count,
-        dstDevice,
+        location_to_device(location),
         flags,
         hStream as HipStream,
     ))
+}
+
+/// CUmemLocation_st{DEVICE, id} -> HIP device ordinal (the byte-identical
+/// struct means id already is the device).
+fn location_to_device(location: CUmemLocation_st) -> i32 {
+    if location.type_ == CUmemLocationType_enum_CU_MEM_LOCATION_TYPE_DEVICE {
+        location.id
+    } else {
+        -1
+    }
 }
 
 pub unsafe extern "C" fn cuMemAdvise_v2(
     dptr: CUdeviceptr,
     count: usize,
     advice: CUmem_advise,
-    device: CUdevice,
+    location: CUmemLocation_st,
 ) -> CUresult {
-    hip!(hipMemAdvise(dptr as usize as *const c_void, count, advice, device))
+    hip!(hipMemAdvise(
+        dptr as usize as *const c_void,
+        count,
+        advice as i32,
+        location_to_device(location),
+    ))
 }
 
 /// Virtual memory management
@@ -881,12 +910,12 @@ pub unsafe extern "C" fn cuMemAddressFree(ptr: CUdeviceptr, size: usize) -> CUre
 fn translate_allocation_prop(src: &CUmemAllocationProp_st) -> hip::HipMemAllocationProp {
     hip::HipMemAllocationProp {
         // CU_MEM_ALLOCATION_TYPE_PINNED == hipMemAllocationTypePinned == 1.
-        type_: src.type_,
+        type_: src.type_ as i32,
         // CU_MEM_HANDLE_TYPE_NONE == hipMemHandleTypeGeneric == 0.
-        requestedHandleType: src.requestedHandleType,
+        requestedHandleType: src.requestedHandleType as i32,
         // Byte-identical layout.
         location: HipMemLocation {
-            type_: src.location.type_,
+            type_: src.location.type_ as i32,
             id: src.location.id,
         },
         win32HandleMetaData: std::ptr::null_mut(),
@@ -960,7 +989,7 @@ pub unsafe extern "C" fn cuMemGetAllocationGranularity(
         return cudaError_enum_CUDA_ERROR_INVALID_VALUE;
     }
     let hip_prop = translate_allocation_prop(&*prop);
-    hip!(hipMemGetAllocationGranularity(granularity, &hip_prop, option))
+    hip!(hipMemGetAllocationGranularity(granularity, &hip_prop, option as i32))
 }
 
 /// Memory pools
@@ -975,10 +1004,10 @@ pub unsafe extern "C" fn cuMemPoolCreate(
     let src = &*poolProps;
     let hip_props = HipMemPoolProps {
         // CU_MEM_ALLOCATION_TYPE_* == hipMemAllocationType_* numbering.
-        allocType: src.allocType,
-        handleTypes: src.handleTypes,
+        allocType: src.allocType as i32,
+        handleTypes: src.handleTypes as i32,
         location: HipMemLocation {
-            type_: src.location.type_,
+            type_: src.location.type_ as i32,
             id: src.location.id,
         },
         win32SecurityAttributes: std::ptr::null_mut(),
@@ -999,7 +1028,7 @@ pub unsafe extern "C" fn cuMemPoolSetAttribute(
     value: *mut c_void,
 ) -> CUresult {
     // CU_MEMPOOL_ATTR_* == hipMemPoolAttr numbering (1..8), value shapes match.
-    hip!(hipMemPoolSetAttribute(pool as HipMemoryPool, attr, value))
+    hip!(hipMemPoolSetAttribute(pool as HipMemoryPool, attr as i32, value))
 }
 
 pub unsafe extern "C" fn cuMemPoolGetAttribute(
@@ -1007,7 +1036,7 @@ pub unsafe extern "C" fn cuMemPoolGetAttribute(
     attr: CUmemPool_attribute,
     value: *mut c_void,
 ) -> CUresult {
-    hip!(hipMemPoolGetAttribute(pool as HipMemoryPool, attr, value))
+    hip!(hipMemPoolGetAttribute(pool as HipMemoryPool, attr as i32, value))
 }
 
 /// Multicast: no HIP surface on ROCm 7.x and no RDNA2 hardware. Explicit
@@ -1041,6 +1070,7 @@ pub unsafe extern "C" fn cuMulticastBindMem(
     _memHandle: CUmemGenericAllocationHandle,
     _memOffset: usize,
     _size: usize,
+    _flags: u64,
 ) -> CUresult {
     cudaError_enum_CUDA_ERROR_NOT_SUPPORTED
 }
@@ -1094,7 +1124,7 @@ pub unsafe extern "C" fn cuModuleGetGlobal_v2(
     let mut global: *mut c_void = std::ptr::null_mut();
     let r = match hip() {
         Ok(api) => match api.hipModuleGetGlobal {
-            Ok(f) => unsafe { f(&mut global, bytes, hmod as HipModule, name) },
+            Ok(f) => unsafe { f(&mut global, bytes, hmod as HipModule, name) as u32 },
             Err(_) => cudaError_enum_CUDA_ERROR_NOT_SUPPORTED,
         },
         Err(code) => code,
@@ -1111,7 +1141,7 @@ pub unsafe extern "C" fn cuFuncSetAttribute(
     value: i32,
 ) -> CUresult {
     // CU_FUNC_ATTRIBUTE_* == hipFuncAttribute numbering for the shared set.
-    hip!(hipFuncSetAttribute(hfunc as HipFunction, attr, value))
+    hip!(hipFuncSetAttribute(hfunc as HipFunction, attr as i32, value))
 }
 
 pub unsafe extern "C" fn cuFuncGetAttribute(
@@ -1119,11 +1149,11 @@ pub unsafe extern "C" fn cuFuncGetAttribute(
     attribute: CUfunction_attribute,
     func: CUfunction,
 ) -> CUresult {
-    hip!(hipFuncGetAttribute(pi, attribute, func as HipFunction))
+    hip!(hipFuncGetAttribute(pi, attribute as i32, func as HipFunction))
 }
 
 pub unsafe extern "C" fn cuFuncSetCacheConfig(hfunc: CUfunction, config: CUfunc_cache_enum) -> CUresult {
-    hip!(hipFuncSetCacheConfig(hfunc as HipFunction, config))
+    hip!(hipFuncSetCacheConfig(hfunc as HipFunction, config as i32))
 }
 
 pub unsafe extern "C" fn cuLaunchKernel(
@@ -1221,7 +1251,7 @@ pub unsafe extern "C" fn cuOccupancyMaxPotentialClusterSize(
 
 /// Error strings
 
-static ERROR_NAMES: &[(i32, &[u8])] = &[
+static ERROR_NAMES: &[(u32, &[u8])] = &[
     (cudaError_enum_CUDA_SUCCESS, b"CUDA_SUCCESS\0"),
     (cudaError_enum_CUDA_ERROR_INVALID_VALUE, b"CUDA_ERROR_INVALID_VALUE\0"),
     (cudaError_enum_CUDA_ERROR_OUT_OF_MEMORY, b"CUDA_ERROR_OUT_OF_MEMORY\0"),
@@ -1280,4 +1310,98 @@ pub unsafe extern "C" fn cuGetErrorName(error: CUresult, pStr: *mut *const c_cha
 
 pub unsafe extern "C" fn cuGetErrorString(error: CUresult, pStr: *mut *const c_char) -> CUresult {
     cuGetErrorName(error, pStr)
+}
+
+// ---------------------------------------------------------------------------
+// cuRAND-named RNG entry points -> hipRAND
+// ---------------------------------------------------------------------------
+
+pub type curandGenerator_t = *mut hip::Opaque;
+/// `curandRngType` enum, flattened bindgen-style. cuRAND/hipRAND number the
+/// pseudo-default as 100.
+pub const curandRngType_CURAND_RNG_PSEUDO_DEFAULT: u32 = 100;
+
+macro_rules! curand {
+    ($field:ident ( $($arg:expr),* $(,)? )) => {
+        match hip::init_hiprand() {
+            Ok(api) => match api.$field {
+                Ok(f) => unsafe { f($($arg),*) as u32 },
+                Err(_) => hip::CURAND_STATUS_NOT_INITIALIZED as u32,
+            },
+            Err(_) => hip::CURAND_STATUS_NOT_INITIALIZED as u32,
+        }
+    };
+}
+
+pub unsafe extern "C" fn curandCreateGenerator(
+    generator: *mut curandGenerator_t,
+    rng_type: u32,
+) -> CUresult {
+    curand!(hiprandCreateGenerator(generator as *mut hip::HipRandGenerator, rng_type as i32))
+}
+
+pub unsafe extern "C" fn curandDestroyGenerator(generator: curandGenerator_t) -> CUresult {
+    curand!(hiprandDestroyGenerator(generator as hip::HipRandGenerator))
+}
+
+pub unsafe extern "C" fn curandSetStream(
+    generator: curandGenerator_t,
+    stream: CUstream,
+) -> CUresult {
+    curand!(hiprandSetStream(generator as hip::HipRandGenerator, stream as HipStream))
+}
+
+pub unsafe extern "C" fn curandSetPseudoRandomGeneratorSeed(
+    generator: curandGenerator_t,
+    seed: u64,
+) -> CUresult {
+    curand!(hiprandSetPseudoRandomGeneratorSeed(generator as hip::HipRandGenerator, seed))
+}
+
+pub unsafe extern "C" fn curandGenerateUniform(
+    generator: curandGenerator_t,
+    output: *mut f32,
+    num: usize,
+) -> CUresult {
+    curand!(hiprandGenerateUniform(generator as hip::HipRandGenerator, output, num))
+}
+
+pub unsafe extern "C" fn curandGenerateUniformDouble(
+    generator: curandGenerator_t,
+    output: *mut f64,
+    num: usize,
+) -> CUresult {
+    curand!(hiprandGenerateUniformDouble(generator as hip::HipRandGenerator, output, num))
+}
+
+pub unsafe extern "C" fn curandGenerateNormal(
+    generator: curandGenerator_t,
+    output: *mut f32,
+    num: usize,
+    mean: f32,
+    stddev: f32,
+) -> CUresult {
+    curand!(hiprandGenerateNormal(
+        generator as hip::HipRandGenerator,
+        output,
+        num,
+        mean,
+        stddev,
+    ))
+}
+
+pub unsafe extern "C" fn curandGenerateNormalDouble(
+    generator: curandGenerator_t,
+    output: *mut f64,
+    num: usize,
+    mean: f64,
+    stddev: f64,
+) -> CUresult {
+    curand!(hiprandGenerateNormalDouble(
+        generator as hip::HipRandGenerator,
+        output,
+        num,
+        mean,
+        stddev,
+    ))
 }

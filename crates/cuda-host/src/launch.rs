@@ -49,10 +49,28 @@ use std::sync::Arc;
 /// }
 /// ```
 ///
-/// Note: the function is renamed internally to `cuda_oxide_kernel_<hash>_vecadd`
-/// for detection by the compiler backend (the prefix is owned by the
-/// workspace-internal `reserved-oxide-symbols` crate), but the PTX entry point
-/// uses the original name.
+/// [PORT gfx1030 Stage2.b] Whether launches target the AMDGPU (amdgcn)
+/// pipeline, decided by the same `CUDA_OXIDE_TARGET=gfx*` variable the
+/// codegen backend dispatches on.
+///
+/// amdgcn kernels cannot read `blockDim` from a hardware register the way
+/// NVPTX kernels do, so the amdgcn prep pass
+/// (`cuda-oxide-codegen/src/amdgcn.rs`, step 5) rewrites `ntid.x` reads into
+/// a trailing `i32 ntid_x` kernel parameter that the host must supply as the
+/// last launch argument. The generated launch methods append it when this
+/// returns true; the HIP runtime consumes only the metadata-defined prefix
+/// of the parameter array, so kernels compiled without the extra parameter
+/// simply ignore the additional slot.
+pub fn amdgcn_ntid_append_active() -> bool {
+    use std::sync::OnceLock;
+    static ACTIVE: OnceLock<bool> = OnceLock::new();
+    *ACTIVE.get_or_init(|| {
+        std::env::var("CUDA_OXIDE_TARGET")
+            .map(|target| target.starts_with("gfx"))
+            .unwrap_or(false)
+    })
+}
+
 pub trait CudaKernel {
     /// The PTX entry point name (e.g., "vecadd" - the original function name)
     const PTX_NAME: &'static str;

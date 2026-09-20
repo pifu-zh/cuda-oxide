@@ -1110,8 +1110,25 @@ fn cuda_module_launch_call(kernel: &CudaModuleKernel) -> TokenStream2 {
     let stream = internal_ident("__cuda_oxide_stream");
     let config = internal_ident("__cuda_oxide_config");
     let args = internal_ident("__cuda_oxide_args");
+    // [PORT gfx1030 Stage2.b] amdgcn kernels get their `blockDim.x` reads
+    // rewritten into a trailing `i32 ntid_x` kernel parameter (AMDGPU has no
+    // blockDim sreg; cuda-oxide-codegen/src/amdgcn.rs prep pass step 5), so
+    // the host must supply it as the last launch argument. Appended before
+    // every generated sync launch; the driver consumes only the
+    // metadata-defined prefix of the parameter array, so kernels compiled
+    // without the extra parameter ignore the slot. Async launch builders are
+    // not covered yet (known Stage 2 leftover).
+    let ntid_x = internal_ident("__cuda_oxide_ntid_x");
+    let ntid_append = quote! {
+        #[allow(unused_mut, unused_variables)]
+        let mut #ntid_x: u32 = 0;
+        if ::cuda_host::launch::amdgcn_ntid_append_active() {
+            #ntid_x = #config.block_dim.0;
+            #args.push(::core::ptr::addr_of_mut!(#ntid_x) as *mut ::std::ffi::c_void);
+        }
+    };
     let cluster_dim = kernel.cluster_dim.map(|(x, y, z)| quote! { (#x, #y, #z) });
-    match (cluster_dim, kernel.cooperative) {
+    let launch = match (cluster_dim, kernel.cooperative) {
         (Some(cluster_dim), true) => quote! {
             unsafe {
                 ::cuda_core::launch_kernel_ex_cooperative_on_stream(
@@ -1162,7 +1179,11 @@ fn cuda_module_launch_call(kernel: &CudaModuleKernel) -> TokenStream2 {
                 )
             }
         },
-    }
+    };
+    quote! {{
+        #ntid_append
+        #launch
+    }}
 }
 
 /// Whether rustc must create distinct code for this generic parameter list.

@@ -109,14 +109,16 @@ unsafe fn get<T: Copy>(lib: &Library, name: &str) -> Result<T, libloading::Error
 
 macro_rules! hip_api {
     (
-        $(
-            $name:ident : fn ( $( $arg:ident : $argty:ty ),* $(,)? ) -> $ret:ty ;
-        )*
+        $apiname:ident {
+            $(
+                $name:ident : fn ( $( $arg:ident : $argty:ty ),* $(,)? ) -> $ret:ty ;
+            )*
+        }
     ) => {
         /// Function-pointer table for the HIP entry points the dispatch
         /// layer forwards to. Each field carries the loader's per-symbol
         /// failure so a missing optional symbol degrades to an error code.
-        pub struct HipApi {
+        pub struct $apiname {
             $(
                 pub $name: Result<
                     unsafe extern "C" fn($($argty),*) -> $ret,
@@ -125,9 +127,9 @@ macro_rules! hip_api {
             )*
         }
 
-        impl HipApi {
-            unsafe fn from_library(lib: &Library) -> HipApi {
-                HipApi {
+        impl $apiname {
+            unsafe fn from_library(lib: &Library) -> $apiname {
+                $apiname {
                     $(
                         $name: unsafe {
                             get(lib, concat!(stringify!($name), "\0"))
@@ -140,6 +142,7 @@ macro_rules! hip_api {
 }
 
 hip_api! {
+    HipApi {
     hipInit: fn(flags: u32) -> i32;
     hipGetDeviceCount: fn(count: *mut i32) -> i32;
     hipDeviceGet: fn(device: *mut HipDevice, ordinal: i32) -> i32;
@@ -232,6 +235,7 @@ hip_api! {
         blockSize: i32,
         dynamicSMemSize: usize,
     ) -> i32;
+    }
 }
 
 /// Load the HIP runtime and resolve every symbol table entry.
@@ -308,3 +312,54 @@ impl std::fmt::Display for DynLoadError {
 }
 
 impl std::error::Error for DynLoadError {}
+
+// ---------------------------------------------------------------------------
+// hipRAND (cuRAND-compatible RNG layer). ROCm ships the generator API as
+// `hiprand*` inside libhiprand; the shim maps cuRAND-named calls onto it.
+// ---------------------------------------------------------------------------
+
+pub type HipRandGenerator = *mut Opaque;
+
+hip_api! {
+    HipRandApi {
+    hiprandCreateGenerator: fn(generator: *mut HipRandGenerator, rng_type: i32) -> i32;
+    hiprandDestroyGenerator: fn(generator: HipRandGenerator) -> i32;
+    hiprandSetStream: fn(generator: HipRandGenerator, stream: HipStream) -> i32;
+    hiprandSetPseudoRandomGeneratorSeed: fn(generator: HipRandGenerator, seed: u64) -> i32;
+    hiprandGenerateUniform: fn(generator: HipRandGenerator, output: *mut f32, num: usize) -> i32;
+    hiprandGenerateUniformDouble: fn(generator: HipRandGenerator, output: *mut f64, num: usize) -> i32;
+    hiprandGenerateNormal: fn(generator: HipRandGenerator, output: *mut f32, num: usize, mean: f32, stddev: f32) -> i32;
+    hiprandGenerateNormalDouble: fn(generator: HipRandGenerator, output: *mut f64, num: usize, mean: f64, stddev: f64) -> i32;
+    }
+}
+
+pub const HIPRAND_LIB_NAMES: &[&str] = &["libhiprand.so.1", "libhiprand.so"];
+
+/// `curandStatus_t`/`hiprandStatus_t` value for "not initialized": what a
+/// caller sees if the RNG library never loaded (any nonzero fails loudly).
+pub const CURAND_STATUS_NOT_INITIALIZED: i32 = 105;
+
+static HIPRAND_API: std::sync::OnceLock<Result<HipRandApi, DynLoadError>> =
+    std::sync::OnceLock::new();
+
+pub(crate) fn init_hiprand() -> &'static Result<HipRandApi, DynLoadError> {
+    HIPRAND_API.get_or_init(|| unsafe { load_hiprand_api() })
+}
+
+unsafe fn load_hiprand_api() -> Result<HipRandApi, DynLoadError> {
+    let mut last_error: Option<libloading::Error> = None;
+    for &name in HIPRAND_LIB_NAMES {
+        match unsafe { Library::new(name) } {
+            Ok(lib) => {
+                let api = unsafe { HipRandApi::from_library(&lib) };
+                std::mem::forget(lib);
+                return Ok(api);
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(DynLoadError::LoadFailed {
+        names: HIPRAND_LIB_NAMES,
+        source: last_error.expect("hipRAND candidate list is non-empty"),
+    })
+}
