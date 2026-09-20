@@ -35,7 +35,7 @@ impl MirToLlvmConversion for Barrier0Op {
         let op = self.get_operation();
         let void_ty = llvm_types::VoidType::get(ctx);
         match context::lowering_options(ctx).intrinsic_backend {
-            IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => {
+            IntrinsicBackend::LlvmNvptx => {
                 let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
                 let barrier_id = create_i32_const(ctx, rewriter, 0);
                 let function_ty =
@@ -47,6 +47,21 @@ impl MirToLlvmConversion for Barrier0Op {
                     "llvm_nvvm_barrier_cta_sync_aligned_all",
                     function_ty,
                     vec![barrier_id],
+                )?;
+            }
+            // [PORT gfx1030 Stage3-1] `llvm.amdgcn.s.barrier()` (no operands in
+            // current LLVM) is the AMDGPU workgroup barrier; the AMDGPU backend
+            // cannot select the NVVM barrier intrinsics. Convergent marking is
+            // handled by llvm-export's convergent-intrinsic list.
+            IntrinsicBackend::Amdgcn => {
+                let function_ty = llvm_types::FuncType::get(ctx, void_ty.into(), vec![], false);
+                call_intrinsic(
+                    ctx,
+                    rewriter,
+                    op,
+                    "llvm_amdgcn_s_barrier",
+                    function_ty,
+                    vec![],
                 )?;
             }
             IntrinsicBackend::LibNvvm => {

@@ -11,3 +11,8 @@ license = "Apache-2.0"
 cuda-device = { path = "../../../cuda-device" }
 cuda-host = { path = "../../../cuda-host" }
 cuda-core = "0.3.1"
+
+# [PORT gfx1030 Stage2] HIP-backed cuda-bindings stand-in; see
+# ../../../host-hip/cuda-bindings/README.md.
+[patch.crates-io]
+cuda-bindings = { path = "../../../../host-hip/cuda-bindings" }

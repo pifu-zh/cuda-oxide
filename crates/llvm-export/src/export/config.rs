@@ -149,6 +149,17 @@ pub trait ExportBackendConfig {
         "nvptx64-nvidia-cuda"
     }
 
+    /// [PORT gfx1030] Whether static shared globals (address space 3) must be
+    /// emitted with `undef` instead of `zeroinitializer`.
+    ///
+    /// AMDGPU rejects statically initialized LDS: `unsupported initializer
+    /// for address space` — shared storage starts uninitialized. The NVVM
+    /// dialect path already required this; the plain llc/PTX path keeps its
+    /// historical zero initializer.
+    fn undef_shared_globals(&self) -> bool {
+        false
+    }
+
     /// [PORT gfx1030] Calling-convention keyword printed on kernel
     /// definitions when [`Self::emit_ptx_kernel_keyword`] is true. The AMDGPU
     /// backend identifies kernels by calling convention alone
@@ -250,6 +261,10 @@ impl ExportBackendConfig for AmdgcnExportConfig {
 
     fn target_triple(&self) -> &'static str {
         "amdgcn-amd-amdhsa"
+    }
+
+    fn undef_shared_globals(&self) -> bool {
+        true
     }
 
     fn kernel_callconv_keyword(&self) -> &'static str {

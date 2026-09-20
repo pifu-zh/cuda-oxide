@@ -563,6 +563,7 @@ pub(super) fn export_module_with_externs_impl(
         config.debug_kind(),
         config.nvvm_ir_dialect(),
         config.function_local_static_placement(),
+        config.undef_shared_globals(),
     );
     index_module_symbols(&mut state, module)?;
     prepare_debug_shared_function_scopes(&mut state, module)?;
@@ -755,6 +756,7 @@ pub(super) fn export_module_to_string_with_config(
         config.debug_kind(),
         config.nvvm_ir_dialect(),
         config.function_local_static_placement(),
+        config.undef_shared_globals(),
     );
     index_module_symbols(&mut state, module)?;
     prepare_debug_shared_function_scopes(&mut state, module)?;
