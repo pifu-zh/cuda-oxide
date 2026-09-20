@@ -63,3 +63,9 @@ crates/rustc-codegen-cuda/examples/gemm_sol_final/bench/cublaslt_bench
 
 # cargo-oxide layered build cache (large, externally configured target dir)
 /.layer-target/
+
+# [PORT gfx1030] amdgcn code-object build artifacts (Stage 1/2, regenerated
+# by the codegen; never source).
+crates/rustc-codegen-cuda/examples/**/*.hsaco
+crates/rustc-codegen-cuda/examples/**/*.unlinked.co
+crates/rustc-codegen-cuda/examples/**/*.co
