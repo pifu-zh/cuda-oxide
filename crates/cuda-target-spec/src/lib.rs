@@ -33,6 +33,12 @@ use std::str::FromStr;
 pub struct CudaArch {
     capability: u32,
     suffix: Option<char>,
+    /// [PORT gfx1030] AMDGPU (`gfx…`) family flag. AMDGPU targets reuse the
+    /// `capability`/`suffix` fields for their own numbering (`gfx90a` stores
+    /// capability `90`, suffix `a`), so equality with an NVIDIA target of the
+    /// same numbers is prevented by this flag, and every floor/PTX lookup
+    /// must reject AMDGPU targets explicitly.
+    amdgcn: bool,
 }
 
 impl CudaArch {
@@ -41,6 +47,9 @@ impl CudaArch {
     /// This enforces the same capability-width and suffix grammar as
     /// [`FromStr`]: capabilities have at least two digits, and the only
     /// architecture-family suffixes are `a` and `f`.
+    ///
+    /// This is the NVIDIA constructor; AMDGPU (`gfx…`) targets are built
+    /// through [`CudaArch::new_gfx`].
     pub fn new(capability: u32, suffix: Option<char>) -> Result<Self, CudaArchParseError> {
         let target = render_parts("sm_", capability, suffix);
         if capability < 10 {
@@ -55,10 +64,43 @@ impl CudaArch {
                 "the only supported architecture suffixes are `a` and `f`",
             ));
         }
-        Ok(Self { capability, suffix })
+        Ok(Self {
+            capability,
+            suffix,
+            amdgcn: false,
+        })
+    }
+
+    /// [PORT gfx1030] Construct an AMDGPU architecture (`gfx1030`, `gfx90a`).
+    ///
+    /// Grammar mirrors the empirical parser in cuda-oxide-codegen's `amdgcn`
+    /// prep pass: the literal prefix `gfx`, ASCII digits, and an optional
+    /// single lowercase-letter product suffix (`gfx90a`). Deliberately
+    /// permissive about the number itself — the authoritative check is
+    /// `llc -mcpu=<gfx>` rejecting unknown chips with a clear error.
+    pub fn new_gfx(gfx_number: u32, suffix: Option<char>) -> Result<Self, CudaArchParseError> {
+        let target = render_parts("gfx", gfx_number, suffix);
+        let suffix_ok = match suffix {
+            None => true,
+            Some(c) => c.is_ascii_lowercase(),
+        };
+        if !suffix_ok {
+            return Err(CudaArchParseError::new(
+                &target,
+                "the AMDGPU suffix must be a single lowercase letter",
+            ));
+        }
+        Ok(Self {
+            capability: gfx_number,
+            suffix,
+            amdgcn: true,
+        })
     }
 
     /// Numeric CUDA capability (`86`, `90`, `100`, `120`, ...).
+    ///
+    /// [PORT gfx1030] For AMDGPU targets this is the `gfx` number
+    /// (`gfx1030` → `1030`, `gfx90a` → `90`).
     pub fn capability(&self) -> u32 {
         self.capability
     }
@@ -66,23 +108,55 @@ impl CudaArch {
     /// Optional architecture-family suffix (`a` or `f`).
     ///
     /// Targets such as `sm_90a` enable architecture-specific instructions and
-    /// cannot be forwarded to a different compute capability.
+    /// cannot be forwarded to a different compute capability. AMDGPU targets
+    /// carry their product suffix here instead (`gfx90a` → `a`).
     pub fn suffix(&self) -> Option<char> {
         self.suffix
     }
 
+    /// [PORT gfx1030] Whether this target names the AMDGPU (`gfx…`) family.
+    ///
+    /// AMDGPU targets never enter the libNVVM/PTX consumers below (the
+    /// cuda-oxide pipeline gates the amdgcn branch off before any PTX floor
+    /// or NVVM dialect decision), so the NVIDIA-specific predicates answer
+    /// conservatively for them.
+    pub fn is_amdgcn(&self) -> bool {
+        self.amdgcn
+    }
+
     /// Whether libNVVM selects its legacy LLVM 7 input dialect.
+    ///
+    /// [PORT gfx1030] AMDGPU targets have no libNVVM input dialect in this
+    /// codebase; they always answer `false` (modern), which is inert because
+    /// the amdgcn pipeline never reaches the NVVM dialect decision.
     pub fn uses_legacy_llvm(&self) -> bool {
+        if self.amdgcn {
+            return false;
+        }
         self.capability < 100
     }
 
     /// Render the target for cubin-producing tools such as nvJitLink.
+    ///
+    /// [PORT gfx1030] For AMDGPU targets this is the canonical `gfx…`
+    /// spelling (`gfx1030`), which is what `llc -mcpu=` consumes.
     pub fn sm(&self) -> String {
+        if self.amdgcn {
+            return render_parts("gfx", self.capability, self.suffix);
+        }
         self.render("sm_")
     }
 
     /// Render the target for libNVVM.
+    ///
+    /// [PORT gfx1030] libNVVM has no `gfx…` vocabulary and the amdgcn
+    /// pipeline never consumes this spelling; the conservative answer is the
+    /// canonical `gfx…` identity (so a stray `-arch=gfx1030` reaching
+    /// libNVVM fails loudly there instead of being silently rewritten).
     pub fn compute(&self) -> String {
+        if self.amdgcn {
+            return render_parts("gfx", self.capability, self.suffix);
+        }
         self.render("compute_")
     }
     fn render(&self, prefix: &str) -> String {
@@ -100,10 +174,42 @@ fn render_parts(prefix: &str, capability: u32, suffix: Option<char>) -> String {
 impl FromStr for CudaArch {
     type Err = CudaArchParseError;
     fn from_str(target: &str) -> Result<Self, Self::Err> {
+        // [PORT gfx1030] `gfx<digits><suffix>` — same grammar the amdgcn prep
+        // pass validated end-to-end (cuda-oxide-codegen/src/amdgcn.rs):
+        // digits, then an optional single lowercase product suffix. Parsed
+        // first so `gfx…` never has to share the NVIDIA error vocabulary.
+        if let Some(rest) = target.strip_prefix("gfx") {
+            let digit_count = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+            if digit_count == 0 {
+                return Err(CudaArchParseError::new(
+                    target,
+                    "expected `gfx<digits>` with at least one digit",
+                ));
+            }
+            let (digits, suffix_text) = rest.split_at(digit_count);
+            let suffix = match suffix_text {
+                "" => None,
+                text if text.len() == 1 && text.as_bytes()[0].is_ascii_lowercase() => {
+                    Some(text.as_bytes()[0] as char)
+                }
+                _ => {
+                    return Err(CudaArchParseError::new(
+                        target,
+                        "the AMDGPU suffix must be a single lowercase letter",
+                    ));
+                }
+            };
+            let number = digits.parse::<u32>().map_err(|_| {
+                CudaArchParseError::new(target, "AMDGPU target number is not a valid integer")
+            })?;
+            return Self::new_gfx(number, suffix);
+        }
         let rest = target
             .strip_prefix("sm_")
             .or_else(|| target.strip_prefix("compute_"))
-            .ok_or_else(|| CudaArchParseError::new(target, "expected `sm_XX` or `compute_XX`"))?;
+            .ok_or_else(|| {
+                CudaArchParseError::new(target, "expected `sm_XX`, `compute_XX`, or `gfx<digits>`")
+            })?;
         let digit_count = rest.chars().take_while(|c| c.is_ascii_digit()).count();
         let (digits, suffix_text) = rest.split_at(digit_count);
         let suffix = match suffix_text {
@@ -333,7 +439,17 @@ impl std::error::Error for UnsupportedTargetError {}
 ///
 /// Suffixed targets require their own entry; this lookup never falls back to
 /// the unsuffixed capability or another architecture-family suffix.
+///
+/// [PORT gfx1030] AMDGPU targets have no recorded PTX floor (the catalog is
+/// NVPTX-only) and answer `UnsupportedTargetError`. That is inert for the
+/// amdgcn pipeline — it gates the amdgcn branch off before any PTX-floor
+/// consumption — and fail-closed for any accidental PTX-path consumer.
 pub fn recorded_ptx_floor(arch: &CudaArch) -> Result<u16, UnsupportedTargetError> {
+    if arch.amdgcn {
+        return Err(UnsupportedTargetError {
+            target: arch.to_string(),
+        });
+    }
     RECORDED_PTX_FLOORS
         .iter()
         .find(|entry| entry.capability == arch.capability && entry.suffix == arch.suffix)
@@ -441,10 +557,46 @@ mod tests {
     #[test]
     fn cuda_arch_rejects_ambiguous_or_malformed_targets() {
         for input in [
-            "", "86", "sm_", "sm_9", "sm_90x", "sm_90aa", "SM_90", "gfx90a",
+            "", "86", "sm_", "sm_9", "sm_90x", "sm_90aa", "SM_90",
+            // [PORT gfx1030] malformed gfx spellings (the valid `gfx90a` moved
+            // to the acceptance test below)
+            "gfx", "gfxX", "gfx_1030", "gfx1030X", "gfx1030ab",
         ] {
             assert!(input.parse::<CudaArch>().is_err(), "{input}");
         }
+    }
+
+    /// [PORT gfx1030] AMDGPU targets parse into the same struct with the
+    /// `gfx` numbering; NVIDIA and AMDGPU targets with equal numbers stay
+    /// distinct, and the NVIDIA-specific predicates answer conservatively.
+    #[test]
+    fn gfx_targets_parse_with_amdgcn_family_semantics() {
+        for (input, number, suffix, rendered) in [
+            ("gfx1030", 1030, None, "gfx1030"),
+            ("gfx90a", 90, Some('a'), "gfx90a"),
+            ("gfx1101", 1101, None, "gfx1101"),
+        ] {
+            let arch: CudaArch = input.parse().unwrap();
+            assert_eq!((arch.capability(), arch.suffix()), (number, suffix));
+            assert!(arch.is_amdgcn());
+            // `sm()` and `compute()` both render the canonical gfx identity:
+            // `sm()` is what `llc -mcpu=` consumes, and `compute()` must not
+            // invent an `sm_`-family spelling libNVVM never asked for.
+            assert_eq!(
+                (arch.sm(), arch.compute()),
+                (rendered.to_string(), rendered.to_string())
+            );
+            assert_eq!(arch.uses_legacy_llvm(), false);
+            // No PTX floor: the catalog is NVPTX-only, and `gfx90a` in
+            // particular must not collide with the recorded `sm_90a` floor.
+            assert!(recorded_ptx_floor(&arch).is_err(), "{input}");
+        }
+        // Family equality: same numbers, different family → not equal.
+        assert_ne!("gfx90a".parse::<CudaArch>().unwrap(), CudaArch::new(90, Some('a')).unwrap());
+        // Round-trip through the explicit gfx constructor.
+        let from_parts = CudaArch::new_gfx(1030, None).unwrap();
+        assert_eq!(from_parts.sm().parse::<CudaArch>(), Ok(from_parts));
+        assert!(CudaArch::new_gfx(1030, Some('X')).is_err());
     }
 
     /// Entry order in [`RECORDED_PTX_FLOORS`] is load-bearing: target
