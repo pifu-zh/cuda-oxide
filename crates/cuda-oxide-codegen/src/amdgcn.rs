@@ -269,6 +269,274 @@ fn rewrite_allocas_in_function(body: &[&str]) -> Vec<String> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// [PORT gfx1030 PhaseB.2] warp shuffle → ds_bpermute (Step 10) + the f64
+// PTX-asm shuffle split (Step 10c), ported from tests/translate_amdgcn.py
+// (GPU-verified on gfx1030: four modes × f32/i32 + f64, wave64 32 warps).
+//
+// Semantics (wave64 machines keep CUDA's 32-lane warp semantics via 32-aligned
+// segmentation): lane = mbcnt.lo(-1, 0); seg = lane & -32;
+//   idx : src = seg + (delta & 31)
+//   bfly: src = lane ^ delta            (delta < 32 never crosses a segment)
+//   down: t = (lane&31)+delta; src = t <= 31 ? seg+t : lane
+//   up  : t = (lane&31)-delta; src = in-segment ? seg+t : lane
+//   off = src * 4  ← the core cross-arch difference: ds_bpermute takes a BYTE
+//                    offset (lane*4) where NVVM shfl takes a lane number.
+// Conservative boundary (port discipline 5): membermask != -1 (partial warp)
+// and clamp != 31 (width != 32) stay as the nvvm call so llc fails with an
+// explicit `Cannot select` instead of silently mis-shuffling.
+// ---------------------------------------------------------------------------
+
+/// One parsed `@llvm.nvvm.shfl.sync.<mode>.<st>` call line.
+struct ShflLine<'a> {
+    indent: &'a str,
+    res: &'a str,
+    ty: &'a str,
+    mode: &'a str,
+    delta: &'a str,
+    val: &'a str,
+    mask: &'a str,
+    clamp: &'a str,
+}
+
+fn match_shfl_line(line: &str) -> Option<ShflLine<'_>> {
+    let (indent, res, rhs) = split_assign(line)?;
+    let call = strip_call_prefix(rhs)?;
+    let (ty, rest) = match call.split_once(' ')? {
+        ("float", rest) => ("float", rest),
+        ("i32", rest) => ("i32", rest),
+        _ => return None,
+    };
+    let callee = rest.strip_prefix("@llvm.nvvm.shfl.sync.")?;
+    let (mode, rest) = callee.split_once('.')?;
+    if !matches!(mode, "idx" | "bfly" | "up" | "down") {
+        return None;
+    }
+    let (st, args_text) = rest.split_once('(')?;
+    if !matches!(st, "f32" | "i32") {
+        return None;
+    }
+    // The script's `[^)]*`: shfl arguments never contain a nested `)`.
+    let close = args_text.find(')')?;
+    if !is_attrs_tail(&args_text[close + 1..]) {
+        return None;
+    }
+    let args = split_top_level_commas(&args_text[..close]);
+    if args.len() != 4 {
+        return None;
+    }
+    // (ty, st) type consistency: float ↔ f32, i32 ↔ i32.
+    if (ty == "float") != (st == "f32") {
+        return None;
+    }
+    Some(ShflLine {
+        indent,
+        res,
+        ty,
+        mode,
+        delta: arg_operand(args[2])?,
+        val: arg_operand(args[1])?,
+        mask: arg_operand(args[0])?,
+        clamp: arg_operand(args[3])?,
+    })
+}
+
+/// The Step-10 driver: rewrite every shfl call line whose mask/clamp pair is
+/// in the supported envelope; other shapes pass through untouched.
+fn rewrite_shuffle(ll: &str) -> String {
+    if !ll.contains("shfl.sync.") {
+        return ll.to_string();
+    }
+    let mut out = Vec::with_capacity(ll.lines().count());
+    for line in ll.lines() {
+        let expanded = match_shfl_line(line)
+            .filter(|shfl| shfl.mask == "-1" && shfl.clamp == "31")
+            .map(expand_shfl);
+        match expanded {
+            Some(lines) => out.extend(lines),
+            None => out.push(line.to_string()),
+        }
+    }
+    let mut text = out.join("\n");
+    if ll.ends_with('\n') && !text.is_empty() {
+        text.push('\n');
+    }
+    text
+}
+
+/// The straight-line ds_bpermute expansion for one shfl call (script's
+/// `_expand_shfl`); the result keeps the original SSA name so every
+/// downstream use is untouched.
+fn expand_shfl(shfl: ShflLine<'_>) -> Vec<String> {
+    let ShflLine {
+        indent,
+        res,
+        ty,
+        mode,
+        delta,
+        val,
+        ..
+    } = shfl;
+    let base = format!("{res}.b_");
+    let mut seq = Vec::with_capacity(11);
+    let mut def = |suffix: &str, rhs: String| {
+        seq.push(format!("{indent}{base}{suffix} = {rhs}"));
+    };
+    def(
+        "ln",
+        "call i32 @llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)".to_string(),
+    );
+    match mode {
+        "bfly" => def("src", format!("xor i32 {base}ln, {delta}")),
+        "idx" => {
+            def("seg", format!("and i32 {base}ln, -32"));
+            def("d", format!("and i32 {delta}, 31"));
+            def("src", format!("add i32 {base}seg, {base}d"));
+        }
+        "down" => {
+            def("seg", format!("and i32 {base}ln, -32"));
+            def("lo", format!("and i32 {base}ln, 31"));
+            def("t", format!("add i32 {base}lo, {delta}"));
+            def("in", format!("icmp ule i32 {base}t, 31"));
+            def("s2", format!("add i32 {base}seg, {base}t"));
+            def(
+                "src",
+                format!("select i1 {base}in, i32 {base}s2, i32 {base}ln"),
+            );
+        }
+        _ => {
+            // "up"
+            def("seg", format!("and i32 {base}ln, -32"));
+            def("lo", format!("and i32 {base}ln, 31"));
+            def("t", format!("sub i32 {base}lo, {delta}"));
+            def("in", format!("icmp uge i32 {base}lo, {delta}"));
+            def("s2", format!("add i32 {base}seg, {base}t"));
+            def(
+                "src",
+                format!("select i1 {base}in, i32 {base}s2, i32 {base}ln"),
+            );
+        }
+    }
+    def("off", format!("shl i32 {base}src, 2"));
+    if ty == "float" {
+        def("bits", format!("bitcast float {val} to i32"));
+        def(
+            "got",
+            format!("call i32 @llvm.amdgcn.ds.bpermute(i32 {base}off, i32 {base}bits)"),
+        );
+        seq.push(format!("{indent}{res} = bitcast i32 {base}got to float"));
+    } else {
+        seq.push(format!(
+            "{indent}{res} = call i32 @llvm.amdgcn.ds.bpermute(i32 {base}off, i32 {val})"
+        ));
+    }
+    seq
+}
+
+/// Step 10c: cuda-oxide's f64 shuffle emits an embedded PTX asm block
+/// (`shfl.sync.bfly.b32` lo/hi split, same lineage as aiter's warp.rs). The
+/// AMDGPU backend rejects the PTX asm outright, so the recognized call shape
+/// expands into two ds_bpermute round trips plus an i64 recombine.
+fn rewrite_shfl_asm(ll: &str) -> String {
+    if !ll.contains("shfl.sync.bfly.b32") {
+        return ll.to_string();
+    }
+    let mut out = Vec::with_capacity(ll.lines().count());
+    for line in ll.lines() {
+        let expanded = match_shfl_asm_line(line).filter(|parts| parts.mask == "-1");
+        match expanded {
+            Some(parts) => out.extend(expand_shfl_asm(parts)),
+            None => out.push(line.to_string()),
+        }
+    }
+    let mut text = out.join("\n");
+    if ll.ends_with('\n') && !text.is_empty() {
+        text.push('\n');
+    }
+    text
+}
+
+/// One parsed f64 asm shuffle line (script's `_SHFL_ASM_RE`).
+struct ShflAsmLine<'a> {
+    indent: &'a str,
+    res: &'a str,
+    val: &'a str,
+    delta: &'a str,
+    mask: &'a str,
+}
+
+fn match_shfl_asm_line(line: &str) -> Option<ShflAsmLine<'_>> {
+    let (indent, res, rhs) = split_assign(line)?;
+    let call = strip_call_prefix(rhs)?;
+    let rest = call.strip_prefix("i64 asm sideeffect \"")?;
+    // These generated blobs contain no escaped quotes; the script's `[^"]*`
+    // anchor is preserved by finding the first closing quote.
+    let close = rest.find('"')?;
+    if !rest[..close].contains("shfl.sync.bfly.b32 lo") {
+        return None;
+    }
+    let after = rest[close + 1..].trim_start();
+    let after = after.strip_prefix(',')?.trim_start();
+    let after = after.strip_prefix("\"=l,l,r,r\"(")?;
+    let close_paren = after.rfind(')')?;
+    if !is_attrs_tail(&after[close_paren + 1..]) {
+        return None;
+    }
+    let args = split_top_level_commas(&after[..close_paren]);
+    if args.len() != 3 {
+        return None;
+    }
+    // (i64 <val>, i32 <delta>, i32 <mask>)
+    let val = arg_operand(args[0])?;
+    if !args[0].trim().starts_with("i64 ") {
+        return None;
+    }
+    Some(ShflAsmLine {
+        indent,
+        res,
+        val,
+        delta: arg_operand(args[1])?,
+        mask: arg_operand(args[2])?,
+    })
+}
+
+fn expand_shfl_asm(parts: ShflAsmLine<'_>) -> Vec<String> {
+    let ShflAsmLine {
+        indent,
+        res,
+        val,
+        delta,
+        ..
+    } = parts;
+    let base = format!("{res}.b_");
+    let mut seq = Vec::with_capacity(12);
+    let mut def = |suffix: &str, rhs: String| {
+        seq.push(format!("{indent}{base}{suffix} = {rhs}"));
+    };
+    def(
+        "ln",
+        "call i32 @llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)".to_string(),
+    );
+    def("src", format!("xor i32 {base}ln, {delta}"));
+    def("off", format!("shl i32 {base}src, 2"));
+    def("lo", format!("trunc i64 {val} to i32"));
+    def("hi64", format!("lshr i64 {val}, 32"));
+    def("hi", format!("trunc i64 {base}hi64 to i32"));
+    def(
+        "glo",
+        format!("call i32 @llvm.amdgcn.ds.bpermute(i32 {base}off, i32 {base}lo)"),
+    );
+    def(
+        "ghi",
+        format!("call i32 @llvm.amdgcn.ds.bpermute(i32 {base}off, i32 {base}hi)"),
+    );
+    def("ghi64", format!("zext i32 {base}ghi to i64"));
+    def("ghiup", format!("shl i64 {base}ghi64, 32"));
+    def("glo64", format!("zext i32 {base}glo to i64"));
+    seq.push(format!("{indent}{res} = or i64 {base}glo64, {base}ghiup"));
+    seq
+}
+
 /// Removes a `declare` line for one fully-qualified intrinsic name.
 fn strip_declares(ll: &str, callee: &str) -> String {
     let needle = format!("@{callee}(");
@@ -436,13 +704,81 @@ pub fn rewrite_ir_for_amdgcn(ll: &str) -> Result<String, String> {
         "llvm.nvvm.read.ptx.sreg.nctaid.z",
         "llvm.nvvm.read.ptx.sreg.ctaid.x",
         "llvm.nvvm.read.ptx.sreg.tid.x",
+        // [PORT gfx1030 PhaseB.2] laneid + the shuffle family
+        "llvm.nvvm.read.ptx.sreg.laneid",
+        "llvm.nvvm.shfl.sync.idx.f32",
+        "llvm.nvvm.shfl.sync.idx.i32",
+        "llvm.nvvm.shfl.sync.bfly.f32",
+        "llvm.nvvm.shfl.sync.bfly.i32",
+        "llvm.nvvm.shfl.sync.up.f32",
+        "llvm.nvvm.shfl.sync.up.i32",
+        "llvm.nvvm.shfl.sync.down.f32",
+        "llvm.nvvm.shfl.sync.down.i32",
     ] {
         text = strip_declares(&text, callee);
     }
     // 8. generic allocas → addrspace(5) + per-alloca addrspacecast at the use
     //    sites (AMDGPU module verifier contract; batch-verified).
     text = rewrite_allocas(&text);
+    // 10. [PORT gfx1030 PhaseB.2] laneid → mbcnt.lo(-1, 0) and the four shfl
+    //     modes → segmented ds_bpermute expansions (byte offset = lane * 4),
+    //     then 10c: the f64 PTX-asm shuffle → double ds_bpermute. Shapes
+    //     outside the supported envelope keep their nvvm call for llc to
+    //     reject explicitly.
+    text = rewrite_calls(&text, "llvm.nvvm.read.ptx.sreg.laneid", "call i32 @llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)").0;
+    text = rewrite_shuffle(&text);
+    text = rewrite_shfl_asm(&text);
     Ok(text)
+}
+
+/// Matches a leading `%[\w.$]+` SSA name and returns `(name, rest)`.
+fn parse_ssa_name(s: &str) -> Option<(&str, &str)> {
+    if !s.starts_with('%') {
+        return None;
+    }
+    let mut end = 1;
+    for (i, c) in s.char_indices().skip(1) {
+        if !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '$')) {
+            break;
+        }
+        end = i + c.len_utf8();
+    }
+    if end == 1 {
+        return None;
+    }
+    Some((&s[..end], &s[end..]))
+}
+
+/// Decomposes `%name = ...` into `(indent, name, rest-of-line)`.
+fn split_assign(line: &str) -> Option<(&str, &str, &str)> {
+    let indent = &line[..line.len() - line.trim_start().len()];
+    let rest = &line[indent.len()..];
+    let (name, after) = parse_ssa_name(rest)?;
+    let after = after.strip_prefix(" = ")?;
+    Some((indent, name, after))
+}
+
+/// Strips the `(tail )call ` prefix.
+fn strip_call_prefix(rhs: &str) -> Option<&str> {
+    rhs.strip_prefix("tail call ").or_else(|| rhs.strip_prefix("call "))
+}
+
+/// Whether a call's tail after `)` is only whitespace and `#N` attribute
+/// groups — the shapes this pass rewrites (same contract as `rewrite_calls`;
+/// anything else is left for llc to reject explicitly).
+fn is_attrs_tail(tail: &str) -> bool {
+    tail.split_whitespace().all(|token| {
+        let digits = token.strip_prefix('#').unwrap_or("x");
+        !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+    })
+}
+
+/// `"i32 16"`/`"float %v19"` → `"16"`/`"%v19"` (strips the type prefix;
+/// a missing operand is a conservative parse failure, like the script).
+fn arg_operand(arg: &str) -> Option<&str> {
+    let mut parts = arg.trim().splitn(2, char::is_whitespace);
+    let _ty = parts.next()?;
+    parts.next().map(str::trim)
 }
 
 /// The pre-`opt` half of the prep pass: only the alloca → `addrspace(5)`
@@ -634,5 +970,110 @@ entry:
         // Typed-pointer IR is rejected upstream anyway; the pass must not
         // produce an illegal cross-address-space bitcast.
         assert!(rewrite_ir_for_amdgcn(ll).unwrap().contains("alloca i8, align 1\n"));
+    }
+
+    // ---- [PORT gfx1030 PhaseB.2] shuffle (Step 10/10c) ------------------
+
+    /// Shape of the warp_reduce shuffle family in post-`opt` output (the
+    /// same fixture shape tests/test_gfx1030.py::test_ir_translate_shuffle
+    /// GPU-verified four modes + i32 + f64 on gfx1030).
+    const SAMPLE_SHFL_LL: &str = "\
+declare float @llvm.nvvm.shfl.sync.bfly.f32(i32, float, i32, i32) #3
+declare float @llvm.nvvm.shfl.sync.down.f32(i32, float, i32, i32) #3
+declare float @llvm.nvvm.shfl.sync.idx.f32(i32, float, i32, i32) #3
+declare float @llvm.nvvm.shfl.sync.up.f32(i32, float, i32, i32) #3
+declare i32 @llvm.nvvm.read.ptx.sreg.laneid() #2
+
+define amdgpu_kernel void @warp_probe(ptr %v0, i64 %v1) #1 {
+entry:
+  %lane = tail call i32 @llvm.nvvm.read.ptx.sreg.laneid() #3
+  %val = load float, ptr %v0, align 4
+  %bf = tail call float @llvm.nvvm.shfl.sync.bfly.f32(i32 -1, float %val, i32 1, i32 31) #3
+  %dn = tail call float @llvm.nvvm.shfl.sync.down.f32(i32 -1, float %val, i32 2, i32 31) #3
+  %ix = tail call float @llvm.nvvm.shfl.sync.idx.f32(i32 -1, float %val, i32 0, i32 31) #3
+  %up = tail call float @llvm.nvvm.shfl.sync.up.f32(i32 -1, float %val, i32 1, i32 31) #3
+  %s = fadd float %bf, %dn
+  %s2 = fadd float %s, %ix
+  %s3 = fadd float %s2, %up
+  store float %s3, ptr %v0, align 4
+  ret void
+}
+
+define amdgpu_kernel void @f64_probe(ptr %v0, i64 %v1) #1 {
+entry:
+  %v = load i64, ptr %v0, align 8
+  %bf64 = tail call i64 asm sideeffect \"{ .reg .b32 lo; .reg .b32 hi; mov.b64 {lo, hi}, $1; shfl.sync.bfly.b32 lo, lo, $2, 31, $3; shfl.sync.bfly.b32 hi, hi, $2, 31, $3; mov.b64 $0, {lo, hi}; }\", \"=l,l,r,r\"(i64 %v, i32 1, i32 -1) #3
+  store i64 %bf64, ptr %v0, align 8
+  ret void
+}
+";
+
+    #[test]
+    fn shfl_expands_to_segmented_ds_bpermute() {
+        let out = rewrite_ir_for_amdgcn(SAMPLE_SHFL_LL).unwrap();
+        // no nvvm residue at all (declares and calls)
+        assert!(!out.contains("llvm.nvvm"), "shfl/laneid residue");
+        // laneid → mbcnt.lo with the SSA name kept
+        assert!(out.contains("%lane = call i32 @llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)"));
+        // four f32 shuffles → four bitcast round trips; f64 split → two
+        // bpermutes per call
+        assert_eq!(out.matches("@llvm.amdgcn.ds.bpermute").count(), 4 + 2);
+        // the NV lane number becomes a byte offset (shl src, 2) per call
+        assert_eq!(out.matches("= shl i32 ").count(), 4 + 1);
+        // down's out-of-segment self-fallback: select + icmp ule
+        assert!(out.contains("icmp ule i32"));
+        assert!(out.contains("select i1"));
+        // f64: lo/hi channels + recombine
+        assert!(out.contains("trunc i64 %v to i32"));
+        assert!(out.contains("or i64"));
+        // results keep their SSA names and downstream uses are untouched
+        for name in ["%bf", "%dn", "%ix", "%up", "%bf64"] {
+            assert!(out.contains(&format!("{name} = ")), "{name} result missing");
+        }
+        assert!(out.contains("fadd float %bf, %dn"));
+        assert!(out.contains("fadd float %s, %ix"));
+        assert!(out.contains("fadd float %s2, %up"));
+        assert!(out.contains("store i64 %bf64, ptr %v0, align 8"));
+    }
+
+    #[test]
+    fn shfl_rewrite_is_idempotent() {
+        let once = rewrite_ir_for_amdgcn(SAMPLE_SHFL_LL).unwrap();
+        let twice = rewrite_ir_for_amdgcn(&once).unwrap();
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn partial_warp_and_nonstandard_width_shuffles_stay_for_llc_to_reject() {
+        let ll = "\
+define amdgpu_kernel void @k(ptr %v0) #1 {
+entry:
+  %a = tail call float @llvm.nvvm.shfl.sync.bfly.f32(i32 7, float %m, i32 1, i32 31) #3
+  %b = tail call float @llvm.nvvm.shfl.sync.bfly.f32(i32 -1, float %m, i32 1, i32 15) #3
+  store float %a, ptr %v0, align 4
+  store float %b, ptr %v0, align 4
+  ret void
+}
+";
+        // mask 7 (partial warp) and clamp 15 (width 32≠) are out of envelope
+        assert!(rewrite_ir_for_amdgcn(ll).is_ok());
+        let out = rewrite_ir_for_amdgcn(ll).unwrap();
+        assert_eq!(out.matches("llvm.nvvm.shfl.sync.bfly.f32(").count(), 2);
+        assert!(!out.contains("ds.bpermute"));
+    }
+
+    #[test]
+    fn f64_asm_with_non_full_mask_is_left_alone() {
+        let ll = "\
+define amdgpu_kernel void @k(ptr %v0) #1 {
+entry:
+  %bf64 = tail call i64 asm sideeffect \"{ shfl.sync.bfly.b32 lo, lo, $2, 31, $3; }\", \"=l,l,r,r\"(i64 %v, i32 1, i32 5) #3
+  store i64 %bf64, ptr %v0, align 8
+  ret void
+}
+";
+        assert!(rewrite_ir_for_amdgcn(ll)
+            .unwrap()
+            .contains("shfl.sync.bfly.b32"));
     }
 }
