@@ -122,6 +122,9 @@ pub fn codegen_run(
     println!();
 
     touch_main_rs(&example_dir);
+    // [PORT gfx1030 PhaseA.2] gfx targets need the HIP cuda-bindings stand-in
+    // patched into the example manifest; idempotent, manual tables win.
+    ensure_hip_patch(&example_dir, target_arch);
 
     let mut cmd = Command::new("cargo");
     cmd.args(["run", "--release"]).current_dir(&example_dir);
@@ -267,6 +270,8 @@ pub fn codegen_sanitize(
     println!();
 
     touch_main_rs(&example_dir);
+    // [PORT gfx1030 PhaseA.2] see codegen_run.
+    ensure_hip_patch(&example_dir, target_arch);
     let binary = codegen_build_host_binary(
         ctx,
         example,
@@ -388,6 +393,8 @@ pub fn codegen_build(
     println!();
 
     touch_main_rs(&example_dir);
+    // [PORT gfx1030 PhaseA.2] see codegen_run.
+    ensure_hip_patch(&example_dir, target_arch);
 
     let mut cmd = Command::new("cargo");
     cmd.args(["build", "--release"]).current_dir(&example_dir);
