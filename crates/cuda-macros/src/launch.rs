@@ -675,6 +675,20 @@ pub(crate) fn expand_cuda_launch_async(input: CudaLaunchAsyncInput) -> TokenStre
         })
         .collect();
 
+    // [PORT gfx1030 PhaseB.1] amdgcn kernels get their `blockDim.x` reads
+    // rewritten into a trailing `i32 ntid_x` kernel parameter (AMDGPU has no
+    // blockDim sreg; cuda-oxide-codegen/src/amdgcn.rs prep pass step 5), so
+    // the async builder must supply it as the last launch argument, after
+    // every kernel argument. Appended only when the gfx routing is active;
+    // the driver consumes only the metadata-defined prefix of the parameter
+    // array, so kernels compiled without the extra parameter ignore the
+    // slot. Mirrors the generated sync launchers (Stage 2.b).
+    let ntid_append = quote! {
+        if ::cuda_host::launch::amdgcn_ntid_append_active() {
+            #launch_ident.push_scalar_arg(#config.block_dim.0);
+        }
+    };
+
     if has_closure {
         let closure_expr = closure_expr.expect("has_closure but no closure expression");
         quote! {
@@ -698,6 +712,7 @@ pub(crate) fn expand_cuda_launch_async(input: CudaLaunchAsyncInput) -> TokenStre
                     std::sync::Arc::new(#function_ident),
                 );
                 #(#arg_code)*
+                #ntid_append
                 #launch_ident.finalize_unchecked(#config)
             }
         }
@@ -719,6 +734,7 @@ pub(crate) fn expand_cuda_launch_async(input: CudaLaunchAsyncInput) -> TokenStre
                     std::sync::Arc::new(#function_ident),
                 );
                 #(#arg_code)*
+                #ntid_append
                 #launch_ident.finalize_unchecked(#config)
             }
         }
@@ -739,6 +755,7 @@ pub(crate) fn expand_cuda_launch_async(input: CudaLaunchAsyncInput) -> TokenStre
                     std::sync::Arc::new(#function_ident),
                 );
                 #(#arg_code)*
+                #ntid_append
                 #launch_ident.finalize_unchecked(#config)
             }
         }
