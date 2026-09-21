@@ -79,6 +79,11 @@ pub(super) fn codegen_build_host_binary(
     device_debug: DeviceDebug,
     materialization: &MaterializationMode,
 ) -> PathBuf {
+    // [PORT gfx1030 PhaseA.2] The sanitize route builds the example binary
+    // here without going through codegen_run/codegen_build; cover it with
+    // the same HIP patch-table guarantee (`arch` is the already-resolved
+    // configured target, as everywhere else).
+    ensure_hip_patch(example_dir, arch);
     let mut cmd = Command::new("cargo");
     cmd.args(["build", "--release"]).current_dir(example_dir);
 
