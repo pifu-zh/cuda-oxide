@@ -822,6 +822,256 @@ fn expand_ptx_atomic_store(line: &str) -> Option<String> {
     ))
 }
 
+// ---------------------------------------------------------------------------
+// [PORT gfx1030 PhaseB.4] counted barrier → software LDS counter + generation
+// spin (Step 14), ported from tests/translate_amdgcn.py (GPU-verified:
+// producer/consumer + split arrive/sync on a 128-thread wave64 block,
+// including bystander warps).
+//
+// RDNA2's S_BARRIER is the unnumbered whole-workgroup barrier; a direct
+// mapping of numbered barriers deadlocks the bystander warps the source
+// deliberately tests. Fallback design (Python v3, kept): per-barrier-id
+// {count, generation} slots in LDS; arrive increments (the last arriver
+// resets the count and bumps the generation to release waiters); sync
+// captures the generation, arrives, then volatile-spins until it changes.
+// All seq_cst LDS atomics. Using kernels get an entry-block slot-zeroing
+// prologue + one whole-group s.barrier (LDS cannot be statically
+// initialized; the group barrier makes the zeroing visible before any
+// atomic lands). Documented assumption: the entry block is executed
+// uniformly by the whole CTA (the CUDA norm). Constant ids/counts only —
+// anything else keeps its nvvm call for llc to reject explicitly.
+// ---------------------------------------------------------------------------
+
+/// One parsed counted-barrier call line: constant `id` and `n` only.
+struct CountedBarrierLine<'a> {
+    indent: &'a str,
+    kind: &'a str,
+    id: i32,
+    n: u32,
+}
+
+fn match_counted_barrier_line(line: &str) -> Option<CountedBarrierLine<'_>> {
+    let indent = &line[..line.len() - line.trim_start().len()];
+    let call = strip_call_prefix(line[indent.len()..].trim_start())?;
+    let rest = call.strip_prefix("void @llvm.nvvm.barrier.cta.")?;
+    let (kind, rest) = rest.split_once('.')?;
+    if !matches!(kind, "sync" | "arrive") {
+        return None;
+    }
+    let rest = rest.strip_prefix("count(")?;
+    let rest = rest.strip_prefix("i32 ")?;
+    let (id_text, rest) = rest.split_once(',')?;
+    let id: i32 = id_text.trim().parse().ok()?;
+    let rest = rest.trim().strip_prefix("i32 ")?.trim();
+    let (n_text, tail) = rest.split_once(')')?;
+    let n: u32 = n_text.trim().parse().ok()?;
+    if !is_attrs_tail(tail) {
+        return None;
+    }
+    Some(CountedBarrierLine { indent, kind, id, n })
+}
+
+/// The helper module text appended when any counted barrier is rewritten.
+/// Byte-parity with the Python `_CB_HELPERS` (batch-verified IR).
+const COUNTED_BARRIER_HELPERS: &str = r#"
+
+; [PORT gfx1030] 软件 counted barrier 状态槽（LDS 不可静态初始化 → undef，
+; 由使用 barrier 的 kernel 入口清零，见各 kernel 的 cb-init 注释块）
+@__port_cb_cnt = addrspace(3) global [16 x i32] undef, align 4
+@__port_cb_gen = addrspace(3) global [16 x i32] undef, align 4
+
+define internal void @__port_cb_arrive(i32 %id, i32 %n) nounwind {
+entry:
+  %cnt.p = getelementptr inbounds [16 x i32], ptr addrspace(3) @__port_cb_cnt, i32 0, i32 %id
+  %old = atomicrmw add ptr addrspace(3) %cnt.p, i32 1 seq_cst
+  %lastn = add i32 %n, -1
+  %last = icmp eq i32 %old, %lastn
+  br i1 %last, label %release, label %out
+
+release:
+  store atomic i32 0, ptr addrspace(3) %cnt.p seq_cst, align 4
+  %gen.p = getelementptr inbounds [16 x i32], ptr addrspace(3) @__port_cb_gen, i32 0, i32 %id
+  %g = load atomic i32, ptr addrspace(3) %gen.p seq_cst, align 4
+  %g1 = add i32 %g, 1
+  store atomic i32 %g1, ptr addrspace(3) %gen.p seq_cst, align 4
+  ret void
+
+out:
+  ret void
+}
+
+define internal void @__port_cb_sync(i32 %id, i32 %n) convergent nounwind {
+entry:
+  %gen.p = getelementptr inbounds [16 x i32], ptr addrspace(3) @__port_cb_gen, i32 0, i32 %id
+  %myg = load atomic i32, ptr addrspace(3) %gen.p seq_cst, align 4
+  call void @__port_cb_arrive(i32 %id, i32 %n)
+  br label %spin
+
+spin:
+  %g = load atomic volatile i32, ptr addrspace(3) %gen.p seq_cst, align 4
+  %done = icmp ne i32 %g, %myg
+  br i1 %done, label %out, label %spin
+
+out:
+  ret void
+}
+"#;
+
+const CB_INIT_MARKER: &str = "; [PORT gfx1030] counted-barrier slot init";
+
+/// Step 14 driver: rewrite counted-barrier call sites, inject the entry
+/// prologue into each using function, append the helpers once per module.
+fn rewrite_counted_barriers(ll: &str) -> String {
+    if !ll.contains("barrier.cta.sync.count") && !ll.contains("barrier.cta.arrive.count") {
+        return ll.to_string();
+    }
+    let lines: Vec<&str> = ll.lines().collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut module_uses_cb = false;
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if !(line.starts_with("define ") && line.trim_end().ends_with('{')) {
+            out.push(line.to_string());
+            i += 1;
+            continue;
+        }
+        let func_end = find_function_end(&lines, i);
+        let body = &lines[i..=func_end.min(lines.len() - 1)];
+        let (new_body, used) = rewrite_counted_barriers_in_function(body);
+        module_uses_cb |= used;
+        out.extend(new_body);
+        i = func_end + 1;
+    }
+    let mut text = out.join("\n");
+    if module_uses_cb && !text.contains("@__port_cb_cnt = addrspace(3) global") {
+        text.push_str(COUNTED_BARRIER_HELPERS);
+    }
+    if ll.ends_with('\n') && !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text
+}
+
+/// Per-function: replace call sites and inject the slot-zeroing prologue.
+/// Returns (new body lines, whether any counted barrier was rewritten).
+fn rewrite_counted_barriers_in_function(body: &[&str]) -> (Vec<String>, bool) {
+    let mut ids: Vec<i32> = Vec::new();
+    let mut changed = false;
+    let mut new_body: Vec<String> = Vec::with_capacity(body.len());
+    for line in body {
+        match match_counted_barrier_line(line) {
+            Some(cb) => {
+                if !ids.contains(&cb.id) {
+                    ids.push(cb.id);
+                }
+                changed = true;
+                new_body.push(format!(
+                    "{}call void @__port_cb_{}(i32 {}, i32 {})",
+                    cb.indent, cb.kind, cb.id, cb.n
+                ));
+            }
+            None => new_body.push((*line).to_string()),
+        }
+    }
+    if !changed {
+        return (new_body, false);
+    }
+    // Idempotence: the prologue comment block is already in place.
+    if new_body.iter().any(|l| l.contains(CB_INIT_MARKER)) {
+        return (new_body, true);
+    }
+    ids.sort_unstable();
+    // Injection point: after the entry label line and any entry allocas.
+    let mut ins = 1;
+    while ins < new_body.len() && !new_body[ins].trim_end().ends_with(':') {
+        ins += 1;
+    }
+    ins += 1; // past the label line
+    while ins < new_body.len() && new_body[ins].contains("= alloca ") {
+        ins += 1;
+    }
+    let mut init = vec![format!(
+        "{CB_INIT_MARKER} (ids: {})",
+        ids.iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    )];
+    for id in &ids {
+        init.push(format!(
+            "  %__port_cb_i{id}c = getelementptr inbounds [16 x i32], ptr addrspace(3) @__port_cb_cnt, i32 0, i32 {id}"
+        ));
+        init.push(format!(
+            "  store atomic i32 0, ptr addrspace(3) %__port_cb_i{id}c seq_cst, align 4"
+        ));
+        init.push(format!(
+            "  %__port_cb_i{id}g = getelementptr inbounds [16 x i32], ptr addrspace(3) @__port_cb_gen, i32 0, i32 {id}"
+        ));
+        init.push(format!(
+            "  store atomic i32 0, ptr addrspace(3) %__port_cb_i{id}g seq_cst, align 4"
+        ));
+    }
+    init.push("  call void @llvm.amdgcn.s.barrier()".to_string());
+    new_body.splice(ins..ins, init);
+    (new_body, true)
+}
+
+// ---------------------------------------------------------------------------
+// [PORT gfx1030 PhaseB.4] libdevice __nv_* → ocml __ocml_* (Step 15), ported
+// from tests/translate_amdgcn.py (llvm-nm-verified exports in the ROCm
+// container's ocml.bc; TANPROBE f32/f64 ≤ 2 ULP vs host libm on gfx1030).
+//
+// NV libdevice names math f32 variants as `__nv_<stem>f(` and f64 as
+// `__nv_<stem>(`; ocml spells them `__ocml_<stem>_f32/f64(`. The `(` suffix
+// terminates the stem so `__nv_tanf(` can never be mangled by the `tan`
+// replacement. The table keeps exactly the stems whose NV and ocml names map
+// one-to-one AND that ocml.bc exports; anything else keeps its `__nv_*`
+// symbol and fails the code-object link as an explicit, legible signal.
+// Linking happens at the code-object link (clang -c pulls ocml, or
+// llvm-link with ocml.bc + the oclc_*.bc configuration blobs).
+// ---------------------------------------------------------------------------
+
+/// The shared stem set (identical to the Python `_OCML_STEM_SET`).
+const OCML_STEMS: &[&str] = &[
+    "acos", "acosh", "asin", "asinh", "atan", "atan2", "atanh", "cabs", "cacos", "cacosh",
+    "casin", "casinh", "catan", "catanh", "cbrt", "ccos", "ccosh", "ceil", "cexp", "clog",
+    "copysign", "cos", "cosh", "csin", "csinh", "csqrt", "ctan", "ctanh", "erf", "erfc",
+    "erfcinv", "erfcx", "erfinv", "exp", "exp10", "exp2", "expm1", "fabs", "fdim", "floor",
+    "fma", "fmax", "fmin", "fmod", "frexp", "hypot", "i0", "i1", "ilogb", "isfinite", "isinf",
+    "isnan", "j0", "j1", "ldexp", "lgamma", "log", "log10", "log1p", "log2", "modf",
+    "nearbyint", "nextafter", "pow", "remainder", "remquo", "rint", "round", "rsqrt",
+    "scalbn", "signbit", "sin", "sincos", "sinh", "sqrt", "tan", "tanh", "tgamma", "trunc",
+    "y0", "y1",
+];
+
+/// Step 15 driver: swap the `__nv_` symbol spellings for their ocml ones.
+fn rewrite_ocml(ll: &str) -> String {
+    if !ll.contains("__nv_") {
+        return ll.to_string();
+    }
+    let mut text = ll.to_string();
+    for stem in OCML_STEMS {
+        // f32 variant first; the `(` terminator keeps the pairs unambiguous.
+        text = text.replace(
+            &format!("@__nv_{stem}f("),
+            &format!("@__ocml_{stem}_f32("),
+        );
+        text = text.replace(&format!("@__nv_{stem}("), &format!("@__ocml_{stem}_f64("));
+    }
+    text
+}
+
+/// First column-0 `}` line after `start` (the function body's closing brace;
+/// basic blocks never open a column). Falls back to the last line.
+fn find_function_end(lines: &[&str], start: usize) -> usize {
+    let mut end = start + 1;
+    while end < lines.len() && lines[end] != "}" {
+        end += 1;
+    }
+    end
+}
+
 /// Removes a `declare` line for one fully-qualified intrinsic name.
 fn strip_declares(ll: &str, callee: &str) -> String {
     let needle = format!("@{callee}(");
@@ -1006,6 +1256,9 @@ pub fn rewrite_ir_for_amdgcn(ll: &str) -> Result<String, String> {
         "llvm.nvvm.membar.gl",
         "llvm.nvvm.membar.cta",
         "llvm.nvvm.membar.sys",
+        // [PORT gfx1030 PhaseB.4] numbered barriers (software fallback)
+        "llvm.nvvm.barrier.cta.sync.count",
+        "llvm.nvvm.barrier.cta.arrive.count",
     ] {
         text = strip_declares(&text, callee);
     }
@@ -1026,6 +1279,11 @@ pub fn rewrite_ir_for_amdgcn(ll: &str) -> Result<String, String> {
     //     the PTX-asm atomic family → LLVM atomic instructions.
     text = rewrite_atomics(&text);
     text = rewrite_ptx_atomic_asm(&text);
+    // 14. [PORT gfx1030 PhaseB.4] counted barrier → LDS counter + generation
+    //     spin software fallback (a direct S_BARRIER mapping would deadlock
+    //     bystander warps), then 15: libdevice __nv_* → ocml __ocml_*.
+    text = rewrite_counted_barriers(&text);
+    text = rewrite_ocml(&text);
     Ok(text)
 }
 
@@ -1471,5 +1729,110 @@ entry:
         assert!(rewrite_ir_for_amdgcn(ll)
             .unwrap()
             .contains("fence syncscope(\"workgroup\") seq_cst"));
+    }
+
+    // ---- [PORT gfx1030 PhaseB.4] counted barrier + ocml (Step 14/15) ------
+
+    /// Shape of the counted_barrier example in post-`opt` output (the fixture
+    /// shape tests/test_gfx1030.py::test_ir_translate_counted_barrier
+    /// GPU-verified: producer/consumer + split arrive/sync, 128 threads,
+    /// wave64, including bystander warps).
+    const SAMPLE_COUNTED_BARRIER_LL: &str = "\
+declare void @llvm.nvvm.barrier.cta.sync.count(i32, i32) #1
+declare void @llvm.nvvm.barrier.cta.arrive.count(i32, i32) #1
+
+define amdgpu_kernel void @cb_probe(ptr %out, i64 %nout) #1 {
+entry:
+  tail call void @llvm.nvvm.barrier.cta.sync.count(i32 1, i32 64) #3
+  tail call void @llvm.nvvm.barrier.cta.arrive.count(i32 2, i32 64) #3
+  ret void
+}
+";
+
+    #[test]
+    fn counted_barriers_map_to_software_fallback() {
+        let out = rewrite_ir_for_amdgcn(SAMPLE_COUNTED_BARRIER_LL).unwrap();
+        assert!(!out.contains("llvm.nvvm.barrier"), "barrier residue");
+        assert!(out.contains("call void @__port_cb_sync(i32 1, i32 64)"));
+        assert!(out.contains("call void @__port_cb_arrive(i32 2, i32 64)"));
+        // slot state + helper definitions
+        assert!(out.contains("@__port_cb_cnt = addrspace(3) global [16 x i32] undef, align 4"));
+        assert!(out.contains("@__port_cb_gen = addrspace(3) global [16 x i32] undef, align 4"));
+        assert!(out.contains("define internal void @__port_cb_arrive(i32 %id, i32 %n)"));
+        assert!(out.contains("define internal void @__port_cb_sync(i32 %id, i32 %n) convergent"));
+        // entry init: both slots zeroed + one whole-group barrier
+        assert!(out.contains("counted-barrier slot init (ids: 1,2)"));
+        assert_eq!(
+            out.matches("store atomic i32 0, ptr addrspace(3) %__port_cb_i").count(),
+            4
+        );
+        assert!(out.contains("call void @llvm.amdgcn.s.barrier()"));
+        // generation spin must be volatile to survive the optimizer
+        assert!(out.contains("load atomic volatile i32"));
+    }
+
+    #[test]
+    fn counted_barrier_rewrite_is_idempotent() {
+        let once = rewrite_ir_for_amdgcn(SAMPLE_COUNTED_BARRIER_LL).unwrap();
+        let twice = rewrite_ir_for_amdgcn(&once).unwrap();
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn non_constant_counted_barriers_stay_for_llc_to_reject() {
+        let ll = "\
+define amdgpu_kernel void @k(i32 %bid) #1 {
+entry:
+  tail call void @llvm.nvvm.barrier.cta.sync.count(i32 %bid, i32 64) #3
+  ret void
+}
+";
+        let out = rewrite_ir_for_amdgcn(ll).unwrap();
+        // dynamic id: no rewrite, no helpers, llc fails with a legible name
+        assert!(out.contains("llvm.nvvm.barrier.cta.sync.count"));
+        assert!(!out.contains("__port_cb_cnt"));
+    }
+
+    #[test]
+    fn ocml_swaps_known_stems_and_keeps_unknown_ones() {
+        let ll = "\
+declare double @__nv_tan(double)
+declare float @__nv_tanf(float)
+declare double @__nv_nonstandard_weird(double)
+
+define amdgpu_kernel void @tan_probe(ptr %out, double %x, float %y) #1 {
+entry:
+  %t64 = call double @__nv_tan(double %x) #0
+  %t32 = call float @__nv_tanf(float %y) #0
+  %w = call double @__nv_nonstandard_weird(double %x) #0
+  %s = fadd double %t64, %w
+  store float %t32, ptr %out, align 4
+  ret void
+}
+";
+        let out = rewrite_ir_for_amdgcn(ll).unwrap();
+        // call sites AND declares swap; the `(` terminator protects the stem
+        assert!(out.contains("@__ocml_tan_f64(double %x)"));
+        assert!(out.contains("@__ocml_tan_f32(float %y)"));
+        assert!(out.contains("declare double @__ocml_tan_f64(double)"));
+        // stems outside the table keep failing loudly at the link
+        assert!(out.contains("@__nv_nonstandard_weird("));
+        assert!(!out.contains("@__nv_tan"));
+    }
+
+    #[test]
+    fn ocml_rewrite_is_idempotent() {
+        let ll = "\
+declare float @__nv_tanf(float)
+
+define amdgpu_kernel void @k(float %y) #1 {
+entry:
+  %t32 = call float @__nv_tanf(float %y) #0
+  ret void
+}
+";
+        let once = rewrite_ir_for_amdgcn(ll).unwrap();
+        let twice = rewrite_ir_for_amdgcn(&once).unwrap();
+        assert_eq!(once, twice);
     }
 }
