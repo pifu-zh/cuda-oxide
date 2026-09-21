@@ -21,3 +21,10 @@ cuda-host = { path = "../../../cuda-host" }
 
 # Host-side CUDA runtime
 cuda-core = "0.3.1"
+
+# [PORT gfx1030] auto-injected by cargo-oxide (ensure_hip_patch)
+# Swaps the crates.io cuda-bindings (dlopen libcuda, build-time CUDA
+# SDK headers) for the HIP-backed stand-in; see
+# host-hip/cuda-bindings/README.md.
+[patch.crates-io]
+cuda-bindings = { path = "../../../../host-hip/cuda-bindings" }
