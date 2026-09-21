@@ -131,6 +131,11 @@ pub struct CUmemoryPool_st {
 pub struct CUgraph_st {
     _unused: [u8; 0],
 }
+// [PORT gfx1030 PhaseB.1] CUDA graph exec handle (opaque, HIP 1:1)
+#[repr(C)]
+pub struct CUgraphExec_st {
+    _unused: [u8; 0],
+}
 #[repr(C)]
 pub struct CUmemGenericAllocationHandle_st {
     _unused: [u8; 0],
@@ -143,6 +148,16 @@ pub type CUfunction = *mut CUfunc_st;
 pub type CUevent = *mut CUevent_st;
 pub type CUmemoryPool = *mut CUmemoryPool_st;
 pub type CUgraph = *mut CUgraph_st;
+// [PORT gfx1030 PhaseB.1] CUDA graph exec handle (opaque, HIP 1:1)
+pub type CUgraphExec = *mut CUgraphExec_st;
+
+// [PORT gfx1030 PhaseB.1] constants the cuda-async reactor references
+// (values from cuda.h 13.x; HIP mirrors the pinned-memory flag numbering)
+pub const CU_HOST_TASK_BLOCKING: u32 = 0x0;
+pub const CU_HOST_TASK_SPINWAIT: u32 = 0x1;
+pub const CUstreamCaptureStatus_enum_CU_STREAM_CAPTURE_STATUS_NONE: u32 = 0;
+pub const CU_MEMHOSTALLOC_PORTABLE: u32 = 0x01;
+pub const CU_MEMHOSTALLOC_DEVICEMAP: u32 = 0x02;
 pub type CUmemGenericAllocationHandle = *mut CUmemGenericAllocationHandle_st;
 
 /// `CUuuid`.
@@ -1100,6 +1115,72 @@ pub unsafe extern "C" fn cuModuleLoadData(module: *mut CUmodule, image: *const c
         let _ = hip!(hipDeviceSynchronize());
     }
     r
+}
+
+// [PORT gfx1030 PhaseB.1] pinned-host device alias + stream write (the
+// cuda-async reactor's slot-table path)
+pub unsafe extern "C" fn cuMemHostGetDevicePointer_v2(
+    dptr: *mut CUdeviceptr,
+    host: *mut c_void,
+    flags: u32,
+) -> CUresult {
+    hip!(hipHostGetDevicePointer(
+        dptr as *mut *mut c_void,
+        host,
+        flags,
+    ))
+}
+
+pub unsafe extern "C" fn cuStreamWriteValue32_v2(
+    stream: CUstream,
+    addr: CUdeviceptr,
+    value: u32,
+    flags: u32,
+) -> CUresult {
+    hip!(hipStreamWriteValue32(
+        stream as hip::HipStream,
+        addr as *mut c_void,
+        value as i32,
+        flags,
+    ))
+}
+
+// [PORT gfx1030 PhaseB.1] CUDA graph surface for cuda-async (cuda_graph.rs
+// calls exactly these five; hipGraph* maps 1:1 in ROCm 7.x). The async
+// example surface compiles and runs; graph capture/replay semantics mirror
+// CUDA where HIP implements them and fail loudly where it does not.
+pub unsafe extern "C" fn cuGraphInstantiateWithFlags(
+    exec: *mut CUgraphExec,
+    graph: CUgraph,
+    flags: u64,
+) -> CUresult {
+    hip!(hipGraphInstantiateWithFlags(
+        exec as *mut hip::HipGraphExec,
+        graph as hip::HipGraph,
+        flags,
+    ))
+}
+
+pub unsafe extern "C" fn cuGraphLaunch(exec: CUgraphExec, stream: CUstream) -> CUresult {
+    hip!(hipGraphLaunch(
+        exec as hip::HipGraphExec,
+        stream as hip::HipStream,
+    ))
+}
+
+pub unsafe extern "C" fn cuGraphUpload(exec: CUgraphExec, stream: CUstream) -> CUresult {
+    hip!(hipGraphUpload(
+        exec as hip::HipGraphExec,
+        stream as hip::HipStream,
+    ))
+}
+
+pub unsafe extern "C" fn cuGraphDestroy(graph: CUgraph) -> CUresult {
+    hip!(hipGraphDestroy(graph as hip::HipGraph))
+}
+
+pub unsafe extern "C" fn cuGraphExecDestroy(exec: CUgraphExec) -> CUresult {
+    hip!(hipGraphExecDestroy(exec as hip::HipGraphExec))
 }
 
 pub unsafe extern "C" fn cuModuleUnload(hmod: CUmodule) -> CUresult {

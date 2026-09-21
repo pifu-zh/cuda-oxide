@@ -18,3 +18,10 @@ cuda-host = { path = "../../../cuda-host", features = ["async"] }
 cuda-core = "0.3.1"
 cuda-async = "0.3.1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+
+# [PORT gfx1030] auto-injected by cargo-oxide (ensure_hip_patch)
+# Swaps the crates.io cuda-bindings (dlopen libcuda, build-time CUDA
+# SDK headers) for the HIP-backed stand-in; see
+# host-hip/cuda-bindings/README.md.
+[patch.crates-io]
+cuda-bindings = { path = "../../../../host-hip/cuda-bindings" }
