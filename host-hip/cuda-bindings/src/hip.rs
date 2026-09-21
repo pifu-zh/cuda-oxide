@@ -33,6 +33,10 @@ pub type HipDevice = i32;
 /// `hipMemGenericAllocationHandle_t` is also an opaque pointer.
 pub type HipMemGenericAllocationHandle = *mut Opaque;
 pub type HipMemoryPool = *mut Opaque;
+// [PORT gfx1030 PhaseB.1] CUDA graph surface for cuda-async: HIP graphs are
+// a 1:1 match (hipGraph* exists in ROCm 7.x); handles are opaque pointers.
+pub type HipGraph = *mut Opaque;
+pub type HipGraphExec = *mut Opaque;
 
 /// `hipUUID` (`driver_types.h`).
 #[repr(C)]
@@ -171,6 +175,12 @@ hip_api! {
     hipStreamGetPriority: fn(stream: HipStream, priority: *mut i32) -> i32;
     hipStreamQuery: fn(stream: HipStream) -> i32;
     hipStreamSynchronize: fn(stream: HipStream) -> i32;
+    // [PORT gfx1030 PhaseB.1] graph entry points (hipGraph*, ROCm 7.x)
+    hipGraphDestroy: fn(graph: HipGraph) -> i32;
+    hipGraphExecDestroy: fn(exec: HipGraphExec) -> i32;
+    hipGraphInstantiateWithFlags: fn(exec: *mut HipGraphExec, graph: HipGraph, flags: u64) -> i32;
+    hipGraphLaunch: fn(exec: HipGraphExec, stream: HipStream) -> i32;
+    hipGraphUpload: fn(exec: HipGraphExec, stream: HipStream) -> i32;
     hipStreamDestroy: fn(stream: HipStream) -> i32;
     hipStreamWaitEvent: fn(stream: HipStream, event: HipEvent, flags: u32) -> i32;
     hipStreamIsCapturing: fn(stream: HipStream, pCaptureStatus: *mut i32) -> i32;
@@ -192,6 +202,9 @@ hip_api! {
     hipMallocFromPoolAsync: fn(ptr: *mut *mut c_void, size: usize, pool: HipMemoryPool, stream: HipStream) -> i32;
     hipMallocManaged: fn(ptr: *mut *mut c_void, size: usize, flags: u32) -> i32;
     hipHostAlloc: fn(ptr: *mut *mut c_void, size: usize, flags: u32) -> i32;
+    // [PORT gfx1030 PhaseB.1] pinned-host device alias + stream write
+    hipHostGetDevicePointer: fn(dptr: *mut *mut c_void, host: *mut c_void, flags: u32) -> i32;
+    hipStreamWriteValue32: fn(stream: HipStream, ptr: *mut c_void, value: i32, flags: u32) -> i32;
     hipHostFree: fn(ptr: *mut c_void) -> i32;
     hipMemGetInfo: fn(free: *mut usize, total: *mut usize) -> i32;
     hipMemcpy: fn(dst: *mut c_void, src: *const c_void, sizeBytes: usize, kind: i32) -> i32;
