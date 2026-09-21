@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
-# [PORT gfx1030] batch v2: examples 批量重跑脚本（v1 的 /tmp/batch-report 已按
+# [PORT gfx1030] batch: examples 批量重跑脚本（v1 的 /tmp/batch-report 已按
 # 纪律清理，本脚本按 examples-report.md 方法节重建，改写函数 import 共享模块
 # tests/translate_amdgcn.py —— 单一事实源）。
 #
 # 用法: python3 tests/batch_gfx1030_examples.py [--skip-build] [--only NAME]
+#            [--integrated]
 # 产物: /tmp/batch_gfx1030/<example>/（device-only 变体 crate + .ll）
 #       /tmp/batch_gfx1030/report.json（逐例机器可读结果）
+#
+# v4 新增 --integrated：在 Python 改写管线（默认测量，产物 .amdgcn.ll 之上跑
+# llc）之外，追加测量"集成化管线"——CUDA_OXIDE_TARGET=gfx1030 直接走
+# cargo-oxide 的 amdgcn 后端（mir-lower sreg + prep pass + llc + lld →
+# hsaco）。该维度量化 B2–B4 Rust 化后集成管线的新增覆盖（v3 之前仅 vecadd/
+# sharedmem 级形状可用）。Python 维度的测量与产物不受影响（integrated 构建在
+# 全部例子测量完之后运行）。
 
 import argparse
 import json
@@ -170,10 +178,26 @@ def run(cmd, cwd=None, timeout=600, env=None):
                           timeout=timeout, env=env)
 
 
+def integrated_build(name: str, d: Path, env: dict):
+    """[PORT gfx1030 PhaseB.5] 集成化管线测量：CUDA_OXIDE_TARGET=gfx1030 下
+    cargo-oxide 直接产出链接后的 hsaco（mir-lower Amdgcn sreg + amdgcn prep
+    pass + llc + lld）。成功 = 退出码 0 且 *.hsaco 存在。"""
+    # touch_main_rs 语义：确保后端重跑（集成构建会清理并重建产物）
+    src = d / "src" / "main.rs"
+    if src.exists():
+        os.utime(src, None)
+    env_int = dict(env, CUDA_OXIDE_TARGET="gfx1030")
+    proc = run(["cargo", f"+{NIGHTLY}", "oxide", "build"], cwd=d, env=env_int)
+    hsacos = list(d.glob("*.hsaco"))
+    return proc, hsacos
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--skip-build", action="store_true")
     ap.add_argument("--only", default=None)
+    ap.add_argument("--integrated", action="store_true",
+                    help="追加集成化管线（CUDA_OXIDE_TARGET=gfx1030 直出 hsaco）测量")
     args = ap.parse_args()
 
     env = dict(os.environ, CUDA_TOOLKIT_PATH=os.path.expanduser("~/opt/cuda13"))
@@ -241,11 +265,40 @@ def main():
             print(f"[llc-fail] {name}: {fails[0] if fails else err[-200:]}")
         results[name] = rec
 
-    Path("/tmp/batch_gfx1030/report.json").write_text(json.dumps(results, indent=2))
+    # --- 集成化管线维度（Python 管线全部测量完之后，避免产物互相覆盖）---
+    if args.integrated:
+        print("\n=== integrated pipeline (CUDA_OXIDE_TARGET=gfx1030 -> hsaco) ===")
+        for name in EXAMPLES:
+            if args.only and name != args.only:
+                continue
+            if name in V1_EXCLUDED:
+                results[name]["integrated"] = "excluded"
+                continue
+            d = Path("/tmp/batch_gfx1030") / name
+            if not (d / "src/main.rs").exists():
+                results[name]["integrated"] = "no_variant"
+                continue
+            proc, hsacos = integrated_build(name, d, env)
+            if proc.returncode == 0 and hsacos:
+                results[name]["integrated"] = "pass"
+                print(f"[INTEGRATED PASS] {name}: {hsacos[0].name}")
+            else:
+                fails = re.findall(r"error[^\n]*", proc.stdout + proc.stderr)
+                results[name]["integrated"] = "fail"
+                results[name]["integrated_error"] = (
+                    fails[0] if fails else (proc.stdout + proc.stderr)[-300:]
+                )
+                print(f"[INTEGRATED FAIL] {name}: {results[name]['integrated_error']}")
+
+    Path("/tmp/batch_gfx1030/report.json").write_text(json.dumps(results, indent=2, ensure_ascii=False))
     ok = sum(1 for r in results.values() if r.get("status") == "pass")
     ll_ct = sum(1 for r in results.values()
                 if r.get("status") in ("pass", "llc_fail") or r.get("residual"))
-    print(f"\nSUMMARY: llc-pass {ok} / 17; ll-produced {ll_ct} / 17")
+    summary = f"\nSUMMARY: llc-pass {ok} / 17; ll-produced {ll_ct} / 17"
+    if args.integrated:
+        ipass = sum(1 for r in results.values() if r.get("integrated") == "pass")
+        summary += f"; integrated hsaco-pass {ipass} / 17"
+    print(summary)
 
 
 if __name__ == "__main__":
