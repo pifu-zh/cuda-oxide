@@ -537,6 +537,291 @@ fn expand_shfl_asm(parts: ShflAsmLine<'_>) -> Vec<String> {
     seq
 }
 
+// ---------------------------------------------------------------------------
+// [PORT gfx1030 PhaseB.3] atomics family (Step 12/12d), ported from
+// tests/translate_amdgcn.py (GPU-verified: is.* classification, generic
+// fetch_add + fences, MP litmus release→acquire 200 rounds).
+//
+// 12  isspacep.local/shared/global → llvm.amdgcn.is.private/shared/global
+//     (HIP semantics: NV thread-local scratch = AMD private AS(5)); same-name
+//     replacement keeps every SSA use. membar.gl/cta/sys → fence in the
+//     agent/workgroup/system domain. NV scope names are not accepted by the
+//     AMDGPU backend ("Unsupported atomic synchronization scope") → device→
+//     agent, block→workgroup. Layering matters (v3 lesson 4): isspacep must
+//     clear before the membar/scope rewrites, or later passes crash into the
+//     leftovers.
+// 12d Rust core::sync::atomic's embedded PTX-asm fallbacks (fence.acq_rel/,
+//     ld.acquire., fence.sc+ld.acquire., st.release.) → LLVM atomic
+//     instructions; the seqcst asm pair folds into a single load atomic
+//     seq_cst (the stronger single-instruction equivalent).
+// ---------------------------------------------------------------------------
+
+/// NV scope → AMD syncscope text ("" = system domain, default scope).
+fn amd_scope(scope: &str) -> Option<&'static str> {
+    match scope {
+        "cta" | "block" => Some("syncscope(\"workgroup\")"),
+        // `gl` is membar.gl's grid-level (= device/agent) scope; `device`/
+        // `block` are the atomicrmw/cmpxchg spellings.
+        "gl" | "gpu" | "device" => Some("syncscope(\"agent\")"),
+        "sys" => Some(""),
+        _ => None,
+    }
+}
+
+/// Strips one leading `nonnull ` parameter attribute (the script's capture
+/// of the same optional group).
+fn strip_nonnull(operand: &str) -> &str {
+    operand
+        .trim()
+        .strip_prefix("nonnull ")
+        .map(str::trim_start)
+        .unwrap_or_else(|| operand.trim())
+}
+
+/// Strips one leading `nonnull `/`noundef` parameter attribute (the script's
+/// `_strip_param_attrs`).
+fn strip_param_attrs(operand: &str) -> &str {
+    let trimmed = operand.trim();
+    if let Some(rest) = trimmed.strip_prefix("nonnull ") {
+        rest.trim_start()
+    } else if let Some(rest) = trimmed.strip_prefix("noundef ") {
+        rest.trim_start()
+    } else {
+        trimmed
+    }
+}
+
+/// `fence.acq_rel.cta;`-style asm body → its (order, scope) pair.
+fn match_ptx_fence_asm(body: &str) -> Option<(&str, &str)> {
+    let rest = body.strip_prefix("fence.")?;
+    let (ord, scope) = rest.split_once('.')?;
+    if !matches!(ord, "acq_rel" | "sc") {
+        return None;
+    }
+    let scope = scope.strip_suffix(';')?;
+    amd_scope(scope)?;
+    Some((ord, scope))
+}
+
+/// Statement-line matcher: `(tail )call void asm sideeffect "<body>",
+/// "~{memory}"()` with attribute tail. Returns (indent, body).
+fn match_void_asm_line(line: &str) -> Option<(&str, &str)> {
+    let indent = &line[..line.len() - line.trim_start().len()];
+    let call = strip_call_prefix(line[indent.len()..].trim_start())?;
+    let rest = call.strip_prefix("void asm sideeffect \"")?;
+    let close = rest.find('"')?;
+    let body = &rest[..close];
+    let tail = rest[close + 1..].trim_start();
+    let tail = tail.strip_prefix(',')?.trim_start();
+    let tail = tail.strip_prefix("\"~{memory}\"()")?;
+    if !is_attrs_tail(tail) {
+        return None;
+    }
+    Some((indent, body))
+}
+
+/// Value-call matcher for `{ty} asm sideeffect "<body>", "<constraint>"(<args>)`.
+/// Returns (ty, body, constraint, args-text).
+fn match_typed_asm_call<'a>(call: &'a str) -> Option<(&'a str, &'a str, &'a str, &'a str)> {
+    let (ty, rest) = call.split_once(' ')?;
+    let rest = rest.strip_prefix("asm sideeffect \"")?;
+    let close = rest.find('"')?;
+    let body = &rest[..close];
+    let tail = rest[close + 1..].trim_start();
+    let tail = tail.strip_prefix(',')?.trim_start();
+    let open = tail.find('(')?;
+    let constraint = &tail[..open];
+    let constraint = constraint.strip_prefix('"')?.strip_suffix('"')?;
+    let args = &tail[open + 1..];
+    let close_paren = args.rfind(')')?;
+    if !is_attrs_tail(&args[close_paren + 1..]) {
+        return None;
+    }
+    Some((ty, body, constraint, &args[..close_paren]))
+}
+
+/// Step 12: address classification, memory fences, scope renames.
+fn rewrite_atomics(ll: &str) -> String {
+    let mut text = ll.to_string();
+    if text.contains("isspacep") {
+        text = text.replace("@llvm.nvvm.isspacep.local(", "@llvm.amdgcn.is.private(");
+        text = text.replace("@llvm.nvvm.isspacep.shared(", "@llvm.amdgcn.is.shared(");
+        text = text.replace("@llvm.nvvm.isspacep.global(", "@llvm.amdgcn.is.global(");
+    }
+    // membar.gl/cta/sys → fence. Statement lines, so a small line pass.
+    if text.contains("membar") {
+        let mut out = Vec::with_capacity(text.lines().count());
+        for line in text.lines() {
+            let replaced = match_membar_line(line);
+            match replaced {
+                Some(replacement) => out.push(replacement),
+                None => out.push(line.to_string()),
+            }
+        }
+        text = out.join("\n");
+        if ll.ends_with('\n') && !text.is_empty() {
+            text.push('\n');
+        }
+    }
+    // NV and AMD scope names differ (batch residue: device, block).
+    text = text.replace("syncscope(\"device\")", "syncscope(\"agent\")");
+    text = text.replace("syncscope(\"block\")", "syncscope(\"workgroup\")");
+    text
+}
+
+/// `(tail )call void @llvm.nvvm.membar.<gl|cta|sys>()` → fence statement.
+fn match_membar_line(line: &str) -> Option<String> {
+    let indent = &line[..line.len() - line.trim_start().len()];
+    let call = strip_call_prefix(line[indent.len()..].trim_start())?;
+    let rest = call.strip_prefix("void @llvm.nvvm.membar.")?;
+    let (scope, tail) = rest.split_once('(')?;
+    let tail = tail.strip_prefix(")")?;
+    if !is_attrs_tail(tail) {
+        return None;
+    }
+    amd_scope(scope)?;
+    Some(match scope {
+        "gl" => format!("{indent}fence syncscope(\"agent\") seq_cst"),
+        "cta" => format!("{indent}fence syncscope(\"workgroup\") seq_cst"),
+        _ => format!("{indent}fence seq_cst"),
+    })
+}
+
+/// Step 12d: the PTX-asm atomic family → LLVM atomic instructions.
+fn rewrite_ptx_atomic_asm(ll: &str) -> String {
+    if !ll.contains("fence.") && !ll.contains("ld.acquire.") && !ll.contains("st.release.") {
+        return ll.to_string();
+    }
+    let mut out = Vec::with_capacity(ll.lines().count());
+    for line in ll.lines() {
+        // fence.acq_rel.{cta,gpu,sys}; → fence
+        if let Some((indent, body)) = match_void_asm_line(line) {
+            if let Some((ord, scope)) = match_ptx_fence_asm(body) {
+                let syncscope = amd_scope(scope).unwrap_or_default();
+                let scope_s = if syncscope.is_empty() {
+                    String::new()
+                } else {
+                    format!("{syncscope} ")
+                };
+                let order = if ord == "sc" { "seq_cst" } else { "acq_rel" };
+                out.push(format!("{indent}fence {scope_s}{order}"));
+                continue;
+            }
+        }
+        // ld.acquire.{gpu,sys}.b{32,64} (optionally behind fence.sc.sys) →
+        // load atomic acquire/seq_cst
+        if let Some(expanded) = expand_ptx_atomic_load(line) {
+            out.push(expanded);
+            continue;
+        }
+        // st.release.{gpu,sys}.b{32,64} → store atomic release
+        if let Some(expanded) = expand_ptx_atomic_store(line) {
+            out.push(expanded);
+            continue;
+        }
+        out.push(line.to_string());
+    }
+    let mut text = out.join("\n");
+    if ll.ends_with('\n') && !text.is_empty() {
+        text.push('\n');
+    }
+    text
+}
+
+fn expand_ptx_atomic_load(line: &str) -> Option<String> {
+    let (indent, res, rhs) = split_assign(line)?;
+    let call = strip_call_prefix(rhs)?;
+    let (ty, body, constraint, args) = match_typed_asm_call(call)?;
+    // A used result is required; anything else keeps the line (conservative).
+    if !matches!(ty, "i32" | "i64" | "ptr") {
+        return None;
+    }
+    let (seqcst, body) = match body.strip_prefix("fence.sc.sys; ") {
+        Some(rest) => (true, rest),
+        None => (false, body),
+    };
+    let rest = body.strip_prefix("ld.acquire.")?;
+    let (scope, rest) = rest.split_once('.')?;
+    if !matches!(scope, "gpu" | "sys") {
+        return None;
+    }
+    let (bits, rest) = match rest.strip_prefix("b32 ") {
+        Some(rest) => ("32", rest),
+        None => match rest.strip_prefix("b64 ") {
+            Some(rest) => ("64", rest),
+            None => return None,
+        },
+    };
+    if rest.trim() != "$0, [$1];" {
+        return None;
+    }
+    if constraint != "=r,l,~{memory}" && constraint != "=l,l,~{memory}" {
+        return None;
+    }
+    // (ptr <operand>)
+    let operand = args.trim().strip_prefix("ptr ")?;
+    if operand.contains(',') {
+        return None;
+    }
+    let ptr = strip_nonnull(operand);
+    let syncscope = amd_scope(scope)?;
+    let order = if seqcst { "seq_cst" } else { "acquire" };
+    let scope_s = if syncscope.is_empty() {
+        String::new()
+    } else {
+        format!(" {syncscope}")
+    };
+    let align = if bits == "32" { 4 } else { 8 };
+    Some(format!(
+        "{indent}{res} = load atomic {ty}, ptr {ptr}{scope_s} {order}, align {align}"
+    ))
+}
+
+fn expand_ptx_atomic_store(line: &str) -> Option<String> {
+    let indent = &line[..line.len() - line.trim_start().len()];
+    let call = strip_call_prefix(line[indent.len()..].trim_start())?;
+    let (_ty, body, constraint, args) = match_typed_asm_call(call)?;
+    let rest = body.strip_prefix("st.release.")?;
+    let (scope, rest) = rest.split_once('.')?;
+    if !matches!(scope, "gpu" | "sys") {
+        return None;
+    }
+    let (bits, rest) = match rest.strip_prefix("b32 ") {
+        Some(rest) => ("32", rest),
+        None => match rest.strip_prefix("b64 ") {
+            Some(rest) => ("64", rest),
+            None => return None,
+        },
+    };
+    if rest.trim() != "[$0], $1;" {
+        return None;
+    }
+    if constraint != "l,r,~{memory}" && constraint != "l,l,~{memory}" {
+        return None;
+    }
+    let parts = split_top_level_commas(args);
+    if parts.len() != 2 {
+        return None;
+    }
+    let ptr_arg = parts[0].trim().strip_prefix("ptr ")?;
+    let ptr = strip_nonnull(ptr_arg);
+    let (vty, val_operand) = parts[1].trim().split_once(char::is_whitespace)?;
+    if !matches!(vty, "i32" | "i64" | "ptr") {
+        return None;
+    }
+    let val = strip_param_attrs(val_operand);
+    let syncscope = amd_scope(scope)?;
+    let scope_s = if syncscope.is_empty() {
+        String::new()
+    } else {
+        format!(" {syncscope}")
+    };
+    let align = if bits == "32" { 4 } else { 8 };
+    Some(format!(
+        "{indent}store atomic {vty} {val}, ptr {ptr}{scope_s} release, align {align}"
+    ))
+}
+
 /// Removes a `declare` line for one fully-qualified intrinsic name.
 fn strip_declares(ll: &str, callee: &str) -> String {
     let needle = format!("@{callee}(");
@@ -714,6 +999,13 @@ pub fn rewrite_ir_for_amdgcn(ll: &str) -> Result<String, String> {
         "llvm.nvvm.shfl.sync.up.i32",
         "llvm.nvvm.shfl.sync.down.f32",
         "llvm.nvvm.shfl.sync.down.i32",
+        // [PORT gfx1030 PhaseB.3] address classification + memory fences
+        "llvm.nvvm.isspacep.local",
+        "llvm.nvvm.isspacep.shared",
+        "llvm.nvvm.isspacep.global",
+        "llvm.nvvm.membar.gl",
+        "llvm.nvvm.membar.cta",
+        "llvm.nvvm.membar.sys",
     ] {
         text = strip_declares(&text, callee);
     }
@@ -728,6 +1020,12 @@ pub fn rewrite_ir_for_amdgcn(ll: &str) -> Result<String, String> {
     text = rewrite_calls(&text, "llvm.nvvm.read.ptx.sreg.laneid", "call i32 @llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)").0;
     text = rewrite_shuffle(&text);
     text = rewrite_shfl_asm(&text);
+    // 12. [PORT gfx1030 PhaseB.3] atomics: isspacep clears FIRST (the v3
+    //     layering lesson — membar/scope rewrites crash into leftovers
+    //     otherwise), then membar → fence, then NV scope renames, then 12d
+    //     the PTX-asm atomic family → LLVM atomic instructions.
+    text = rewrite_atomics(&text);
+    text = rewrite_ptx_atomic_asm(&text);
     Ok(text)
 }
 
@@ -1075,5 +1373,103 @@ entry:
         assert!(rewrite_ir_for_amdgcn(ll)
             .unwrap()
             .contains("shfl.sync.bfly.b32"));
+    }
+
+    // ---- [PORT gfx1030 PhaseB.3] atomics (Step 12/12d) -------------------
+
+    /// Shape of the atomics example in post-`opt` output (the fixture shape
+    /// tests/test_gfx1030.py::test_ir_translate_atomics GPU-verified:
+    /// is.* classification, generic fetch_add + fence, MP litmus).
+    const SAMPLE_ATOMICS_LL: &str = "\
+declare i1 @llvm.nvvm.isspacep.local(ptr captures(none)) #0
+declare void @llvm.nvvm.membar.gl() #2
+declare void @llvm.nvvm.membar.sys() #2
+
+define amdgpu_kernel void @atom_probe(ptr %buf, ptr %out) #1 {
+entry:
+  %isp = tail call i1 @llvm.nvvm.isspacep.local(ptr %buf) #8
+  br i1 %isp, label %priv, label %glob
+
+priv:
+  %pp = addrspacecast ptr %buf to ptr addrspace(5)
+  br label %done
+
+glob:
+  %r = atomicrmw add ptr %buf, i32 1 syncscope(\"device\") monotonic, align 4
+  tail call void @llvm.nvvm.membar.gl() #8
+  tail call void @llvm.nvvm.membar.sys() #8
+  br label %done
+
+done:
+  ret void
+}
+
+define amdgpu_kernel void @atom_asm_probe(ptr %buf, ptr %out) #1 {
+entry:
+  ; Rust core::sync::atomic's PTX-asm fallback shapes (real output)
+  tail call void asm sideeffect \"fence.acq_rel.cta;\", \"~{memory}\"() #9
+  tail call void asm sideeffect \"fence.acq_rel.gpu;\", \"~{memory}\"() #9
+  tail call void asm sideeffect \"fence.acq_rel.sys;\", \"~{memory}\"() #9
+  %la = tail call i32 asm sideeffect \"ld.acquire.gpu.b32 $0, [$1];\", \"=r,l,~{memory}\"(ptr %buf) #9
+  %lb = tail call i64 asm sideeffect \"ld.acquire.sys.b64 $0, [$1];\", \"=l,l,~{memory}\"(ptr %buf) #9
+  %lc = call ptr asm sideeffect \"fence.sc.sys; ld.acquire.sys.b64 $0, [$1];\", \"=l,l,~{memory}\"(ptr %buf) #9
+  tail call void asm sideeffect \"st.release.gpu.b32 [$0], $1;\", \"l,r,~{memory}\"(ptr %buf, i32 %la) #9
+  tail call void asm sideeffect \"st.release.sys.b64 [$0], $1;\", \"l,l,~{memory}\"(ptr %buf, ptr %out) #9
+  ret void
+}
+";
+
+    #[test]
+    fn atomics_map_to_amdgcn_is_fences_and_scopes() {
+        let out = rewrite_ir_for_amdgcn(SAMPLE_ATOMICS_LL).unwrap();
+        assert!(!out.contains("llvm.nvvm"), "isspacep/membar residue");
+        assert!(out.contains("@llvm.amdgcn.is.private(ptr %buf)"));
+        assert!(out.contains("fence syncscope(\"agent\") seq_cst"));
+        assert!(out.contains("\n  fence seq_cst"));
+        assert!(out.contains(
+            "atomicrmw add ptr %buf, i32 1 syncscope(\"agent\") monotonic, align 4"
+        ));
+        assert!(!out.contains("syncscope(\"device\")"));
+        assert!(!out.contains("syncscope(\"block\")"));
+    }
+
+    #[test]
+    fn ptx_atomic_asm_maps_to_llvm_atomic_instructions() {
+        let out = rewrite_ir_for_amdgcn(SAMPLE_ATOMICS_LL).unwrap();
+        assert!(!out.contains("asm sideeffect"), "PTX asm residue");
+        assert!(out.contains("fence syncscope(\"workgroup\") acq_rel"));
+        assert!(out.contains("fence syncscope(\"agent\") acq_rel"));
+        assert!(out.contains("\n  fence acq_rel"));
+        assert!(out.contains(
+            "%la = load atomic i32, ptr %buf syncscope(\"agent\") acquire, align 4"
+        ));
+        assert!(out.contains("%lb = load atomic i64, ptr %buf acquire, align 8"));
+        // the fence.sc + ld.acquire asm pair folds into one seq_cst load
+        assert!(out.contains("%lc = load atomic ptr, ptr %buf seq_cst, align 8"));
+        assert!(out.contains(
+            "store atomic i32 %la, ptr %buf syncscope(\"agent\") release, align 4"
+        ));
+        assert!(out.contains("store atomic ptr %out, ptr %buf release, align 8"));
+    }
+
+    #[test]
+    fn atomics_rewrite_is_idempotent() {
+        let once = rewrite_ir_for_amdgcn(SAMPLE_ATOMICS_LL).unwrap();
+        let twice = rewrite_ir_for_amdgcn(&once).unwrap();
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn membar_cta_maps_to_workgroup_fence() {
+        let ll = "\
+define amdgpu_kernel void @k() #1 {
+entry:
+  tail call void @llvm.nvvm.membar.cta() #8
+  ret void
+}
+";
+        assert!(rewrite_ir_for_amdgcn(ll)
+            .unwrap()
+            .contains("fence syncscope(\"workgroup\") seq_cst"));
     }
 }
