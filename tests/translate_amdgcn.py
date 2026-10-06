@@ -62,11 +62,15 @@ def translate_nvvm_to_amdgcn(ll_text: str) -> str:
     # 3. 调用约定：ptx_kernel → amdgpu_kernel（AMD 靠 CC 认 kernel）
     text = text.replace("ptx_kernel", "amdgpu_kernel")
 
-    # 4. sreg 同名替换（只换被调名，SSA 引用不动；declare 随后删除，llc 自动声明目标 intrinsic）
+    # 4. sreg 同名替换（只换被调名，SSA 引用不动；declare 随后删除，llc 自动声明目标 intrinsic）。
+    #    tid.y/tid.z（上游 #1311 起部分 warp 集体操作经 3-D 坐标算块内秩，1-D launch
+    #    下 NV tid.y/z=0、AMD workitem.id.y/z=0，语义逐位等价）
     text = text.replace(
         "@llvm.nvvm.read.ptx.sreg.ctaid.x()", "@llvm.amdgcn.workgroup.id.x()"
     )
     text = text.replace("@llvm.nvvm.read.ptx.sreg.tid.x()", "@llvm.amdgcn.workitem.id.x()")
+    text = text.replace("@llvm.nvvm.read.ptx.sreg.tid.y()", "@llvm.amdgcn.workitem.id.y()")
+    text = text.replace("@llvm.nvvm.read.ptx.sreg.tid.z()", "@llvm.amdgcn.workitem.id.z()")
 
     # 5. ntid.x → kernarg 参数 %ntid_x（blockDim 由 host 决定）：
     #    调用点替换为恒等 or，签名追加参数（见 _append_ntid_kernarg_param）
@@ -89,6 +93,7 @@ def translate_nvvm_to_amdgcn(ll_text: str) -> str:
     mapped = (
         r"@llvm\.(?:"
         r"nvvm\.read\.ptx\.sreg\.(?:ctaid|tid|ntid)\.x"
+        r"|nvvm\.read\.ptx\.sreg\.tid\.[yz]"
         r"|nvvm\.read\.ptx\.sreg\.(?:ntid|nctaid)\.[yz]"
         r"|nvvm\.barrier\.cta\.sync\.aligned\.all"
         r"|nvvm\.barrier\.cta\.sync\.count"
@@ -150,6 +155,16 @@ def translate_nvvm_to_amdgcn(ll_text: str) -> str:
     # 12d. Rust core atomics 的内嵌 PTX asm（fence/acquire load/release store/
     #      seqcst load）→ LLVM 原子指令（层叠契约：isspacep 清零后才暴露）
     text = _rewrite_ptx_atomic_asm(text)
+
+    # 12e. panic trap：上游 inline-asm 语义重构（#1309）起，panic 路径实产
+    #      `call void asm sideeffect "trap;", ""()`——PTX 助记符，AMDGPU 后端
+    #      直接拒绝（"invalid instruction, did you mean: s_trap?"）。映射到
+    #      llvm.trap()（llc 对其产 s_trap，语义等价：线程停机）。
+    text = re.sub(
+        r'(?:tail )?call void asm sideeffect "trap;", ""\(\)(?:\s*#\d+)?',
+        "call void @llvm.trap()",
+        text,
+    )
 
     # 13. 整数点积：idp4a → sdot4/udot4（硬件 v_dot4），idp2a → 乘加展开
     text = _rewrite_dotprod(text)
@@ -313,8 +328,10 @@ _SHFL_RE = re.compile(
     r"(?P<mode>idx|bfly|up|down)\.(?P<st>f32|i32)\((?P<args>[^)]*)\)\s*(?:#\d+)?\s*$"
 )
 
-# membermask 非 -1（部分 warp 参与的 shuffle）不支持：exec 语义在 AMD 侧
-# 需要独立处理，保守留下 nvvm 调用让 llc 显式失败
+# membermask/clamp 的支持包络（见 _expand_shfl 内注释）：字面量 mask 仅接受
+# -1（其它字面量=显式部分 warp 语义，无从核对，保留 nvvm 调用让 llc 显式失败）；
+# 动态 mask 接受（#1311 起部分 warp 集体操作的实产形态）；clamp 字面量按模式
+# 接受（.up ∈ {0,31}，其余 =31）。
 _SHFL_MASK_RE = re.compile(r"i32\s*(-?\d+)\s*$")
 
 
@@ -379,12 +396,25 @@ def _expand_shfl(m) -> "list[str] | None":
     if len(args) != 4:
         return None
     mask_arg, val_arg, delta_arg, clamp_arg = args
+    # membermask 门（上游 #1311 起出现动态 mask：部分 warp 集体操作传
+    # (1<<live)-1）。ds_bpermute 的数据搬运不依赖 mask（只做段内读），convergent
+    # 标记已随调用保留；NV shfl.sync 的合法前提"mask ⊆ 活跃lane"与 AMD 侧
+    # "全 wavefront 执行 bpermute"一致——故字面量 -1 与动态值都接受，仅拒绝
+    # 其它字面量（显式部分 warp 语义无从核对）。
     mm = _SHFL_MASK_RE.match(mask_arg)
-    if not mm or mm.group(1) != "-1":
+    if mm and mm.group(1) != "-1":
         return None
     cm = _SHFL_MASK_RE.match(clamp_arg)
-    if not cm or cm.group(1) != "31":
-        return None  # width≠32（非标准 warp 尺寸）：显式不支持
+    if cm:
+        # clamp 语义按模式不同（PTX c 操作数）：.up 的 clamp 是最低源 lane
+        # 边界（0=全 warp 下界，上游 #1311 起 .up 实产 0；旧产物/其余模式为
+        # width-1=31）。本改写器实现 CUDA width-32 语义（段内回自身），两种
+        # 字面量下的调用点意图一致；动态 clamp 无从核对 → 保守拒绝。
+        clamp_ok = cm.group(1) in ("0", "31") if mode == "up" else cm.group(1) == "31"
+        if not clamp_ok:
+            return None
+    else:
+        return None  # 动态 clamp：显式不支持
     delta = _arg_operand(delta_arg)
     val = _arg_operand(val_arg)
     r = res  # 中间名以 .b_ 标记（NVVM 名不含下划线，避免碰撞）
@@ -585,19 +615,22 @@ _PTXX_ASM_FENCE_RE = re.compile(
     r'"~\{memory\}"\(\)\s*(?:#\d+)?\s*$'
 )
 
+# 操作数解析（#1327 packed-as3 起，asm 实参可为常量表达式
+# `ptr addrspacecast (ptr addrspace(3) @sym to ptr)`——含逗号与括号，[^,)] 类
+# 捕获吃不下；改抓整个实参串再用 _split_top_level_commas 切顶层逗号，与 Rust
+# prep pass 的 match_typed_asm_call 同构）。
 _PTXX_ASM_LOAD_RE = re.compile(
     r'^(?P<indent>\s*)(?:(?P<res>%[\w.$]+)\s*=\s*)?(?:tail )?call\s+'
     r'(?P<ty>i32|i64|ptr)\s+asm\s+sideeffect\s+'
     r'"(?:(?P<sc>fence\.sc\.sys); )?ld\.acquire\.(?P<scope>gpu|sys)\.'
-    r'b(?P<bits>32|64)\s+\$0,\s*\[\$1\];",\s*"=[rl],l,~\{memory\}"\(\s*ptr\s+'
-    r'(?P<attrsq>(?:nonnull\s+)?)?(?P<ptr>[^,)]+?)\s*\)\s*(?:#\d+)?\s*$'
+    r'b(?P<bits>32|64)\s+\$0,\s*\[\$1\];",\s*"=[rl],l,~\{memory\}"\('
+    r'(?P<args>.*)\)\s*(?:#\d+)?\s*$'
 )
 
 _PTXX_ASM_STORE_RE = re.compile(
     r'^(?P<indent>\s*)(?:tail )?call\s+void\s+asm\s+sideeffect\s+'
     r'"st\.release\.(?P<scope>gpu|sys)\.b(?P<bits>32|64)\s+\[\$0\], \$1;",\s*'
-    r'"l,[rl],~\{memory\}"\(\s*ptr\s+(?P<attrsq>(?:nonnull\s+)?)?'
-    r'(?P<ptr>[^,]+?),\s*(?P<vty>i32|i64|ptr)\s+(?P<val>[^,)]+?)\s*\)\s*(?:#\d+)?\s*$'
+    r'"l,[rl],~\{memory\}"\((?P<args>.*)\)\s*(?:#\d+)?\s*$'
 )
 
 _SCOPE_MAP = {"cta": 'syncscope("workgroup")', "gpu": 'syncscope("agent")', "sys": ""}
@@ -628,24 +661,42 @@ def _rewrite_ptx_atomic_asm(text: str) -> str:
             if not m.group("res"):
                 out.append(line)  # 结果未使用：保守留残
                 continue
+            # 单实参：`ptr <操作数>`（操作数可为常量表达式；顶层逗号即多实参
+            # → 不支持）
+            parts = _split_top_level_commas(m.group("args"))
+            if len(parts) != 1 or not parts[0].startswith("ptr "):
+                out.append(line)
+                continue
+            ptr = _strip_param_attrs(parts[0][len("ptr "):])
             scope = _SCOPE_MAP[m.group("scope")]
             scope_s = f" {scope}" if scope else ""
             order = "seq_cst" if m.group("sc") else "acquire"
             align = 4 if m.group("bits") == "32" else 8
             out.append(
                 f"{m.group('indent')}{m.group('res')} = load atomic "
-                f"{m.group('ty')}, ptr {m.group('ptr')}{scope_s} {order}, "
+                f"{m.group('ty')}, ptr {ptr}{scope_s} {order}, "
                 f"align {align}"
             )
             continue
         m = _PTXX_ASM_STORE_RE.match(line)
         if m:
+            # 双实参：`ptr <目标>, <vty> <值>`（值可为常量表达式）
+            parts = _split_top_level_commas(m.group("args"))
+            if len(parts) != 2 or not parts[0].startswith("ptr "):
+                out.append(line)
+                continue
+            ptr = _strip_param_attrs(parts[0][len("ptr "):])
+            vsplit = parts[1].split(None, 1)
+            if len(vsplit) != 2 or vsplit[0] not in ("i32", "i64", "ptr"):
+                out.append(line)
+                continue
+            vty, val = vsplit[0], _strip_param_attrs(vsplit[1])
             scope = _SCOPE_MAP[m.group("scope")]
             scope_s = f" {scope}" if scope else ""
             align = 4 if m.group("bits") == "32" else 8
             out.append(
-                f"{m.group('indent')}store atomic {m.group('vty')} "
-                f"{_strip_param_attrs(m.group('val'))}, ptr {m.group('ptr')}"
+                f"{m.group('indent')}store atomic {vty} "
+                f"{val}, ptr {ptr}"
                 f"{scope_s} release, align {align}"
             )
             continue
