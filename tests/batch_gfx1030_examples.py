@@ -230,15 +230,19 @@ def main():
                 print(f"[build-fail] {name}")
                 continue
 
-        lls = sorted(d.glob("*.opt.ll")) or sorted(
-            p for p in d.glob("*.ll") if not p.name.endswith(".opt.ll")
-        )
-        if not lls:
+        # [PORT gfx1030] 精确产物名选择：目录里可能残留上一轮 --integrated 的
+        # *.amdgcn*.ll（集成管线产物）；旧 glob "*.opt.ll" 会把它们一并匹配且
+        # 排序靠前（"amdgcn" < "opt"），Python 维度吃错产物形成双重改写——
+        # rebase 后回归数字失真的真实根因之一。这里只认 Python 管线自己的
+        # 两个产物名。
+        opt_ll = d / f"ox_batch_{name}.opt.ll"
+        plain_ll = d / f"ox_batch_{name}.ll"
+        src_ll = opt_ll if opt_ll.exists() else plain_ll
+        if not src_ll.exists():
             rec.update(status="no_ll", reason="cargo oxide 成功但无 .ll 产物")
             results[name] = rec
             print(f"[no-ll] {name}")
             continue
-        src_ll = lls[0]
         rec["ll"] = str(src_ll)
 
         # --- 改写阶段 ---
