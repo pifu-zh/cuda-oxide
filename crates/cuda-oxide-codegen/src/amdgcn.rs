@@ -569,6 +569,108 @@ fn expand_shfl_asm(parts: ShflAsmLine<'_>) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
+// [PORT gfx1030 Stage3-2] redux.sync.add → xor-butterfly software fallback
+// (Step 11), ported from tests/translate_amdgcn.py (GPU-verified: redux_sum
+// example, full-warp sum broadcast on gfx1030).
+//
+// gfx1030 (RDNA2) has no hardware redux instruction. Fallback: five
+// xor-butterfly rounds (16/8/4/2/1), each fetching the counterpart lane's
+// running sum via ds_bpermute; after five rounds every lane holds its
+// 32-aligned segment's (= CUDA warp's) total — the redux.sync.add contract
+// (whole warp participates, result broadcast). On wave64 machines xor < 32
+// never crosses a segment, so segments stay self-consistent. Cost is
+// O(log32)·wave LDS round trips; correctness first (port discipline 5).
+//
+// Envelope: literal mask -1 only (partial-warp redux keeps its nvvm call for
+// llc to reject explicitly — no production shape emits a dynamic one).
+// ---------------------------------------------------------------------------
+
+/// One parsed `@llvm.nvvm.redux.sync.add` call line.
+struct ReduxLine<'a> {
+    indent: &'a str,
+    res: &'a str,
+    val: &'a str,
+    mask: &'a str,
+}
+
+fn match_redux_line(line: &str) -> Option<ReduxLine<'_>> {
+    let (indent, res, rhs) = split_assign(line)?;
+    let call = strip_call_prefix(rhs)?;
+    let rest = call.strip_prefix("i32 @llvm.nvvm.redux.sync.add(")?;
+    let close = rest.rfind(')')?;
+    if !is_attrs_tail(&rest[close + 1..]) {
+        return None;
+    }
+    let args = split_top_level_commas(&rest[..close]);
+    if args.len() != 2 || !args.iter().all(|a| a.starts_with("i32 ")) {
+        return None;
+    }
+    Some(ReduxLine {
+        indent,
+        res,
+        val: arg_operand(args[0])?,
+        mask: arg_operand(args[1])?,
+    })
+}
+
+/// The Step-11 driver: expand full-warp redux adds; other shapes untouched.
+fn rewrite_redux_add(ll: &str) -> String {
+    if !ll.contains("redux.sync.add") {
+        return ll.to_string();
+    }
+    let mut out = Vec::with_capacity(ll.lines().count());
+    for line in ll.lines() {
+        let expanded = match_redux_line(line)
+            .filter(|rd| rd.mask == "-1")
+            .map(expand_redux_add);
+        match expanded {
+            Some(lines) => out.extend(lines),
+            None => out.push(line.to_string()),
+        }
+    }
+    let mut text = out.join("\n");
+    if ll.ends_with('\n') && !text.is_empty() {
+        text.push('\n');
+    }
+    text
+}
+
+/// The straight-line butterfly expansion for one redux call (the script's
+/// `_rewrite_redux_add`): the final round writes the original SSA name so
+/// every downstream use is untouched.
+fn expand_redux_add(rd: ReduxLine<'_>) -> Vec<String> {
+    let ReduxLine {
+        indent,
+        res,
+        val,
+        ..
+    } = rd;
+    let base = format!("{res}.b_");
+    let mut seq = Vec::with_capacity(17);
+    seq.push(format!(
+        "{indent}{base}ln = call i32 @llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)"
+    ));
+    let mut cur = val.to_string();
+    for shift in [16usize, 8, 4, 2, 1] {
+        seq.push(format!("{indent}{base}m{shift} = xor i32 {base}ln, {shift}"));
+        seq.push(format!("{indent}{base}o{shift} = shl i32 {base}m{shift}, 2"));
+        seq.push(format!(
+            "{indent}{base}g{shift} = call i32 @llvm.amdgcn.ds.bpermute(i32 {base}o{shift}, i32 {cur})"
+        ));
+        // The last round writes the original SSA name; intermediates use the
+        // NVVM-marker-free `.b_` namespace (NVVM names contain no underscore).
+        let dst = if shift == 1 {
+            res.to_string()
+        } else {
+            format!("{base}s{shift}")
+        };
+        seq.push(format!("{indent}{dst} = add i32 {cur}, {base}g{shift}"));
+        cur = dst;
+    }
+    seq
+}
+
+// ---------------------------------------------------------------------------
 // [PORT gfx1030 PhaseB.3] atomics family (Step 12/12d), ported from
 // tests/translate_amdgcn.py (GPU-verified: is.* classification, generic
 // fetch_add + fences, MP litmus release→acquire 200 rounds).
@@ -1313,6 +1415,8 @@ pub fn rewrite_ir_for_amdgcn(ll: &str) -> Result<String, String> {
         "llvm.nvvm.shfl.sync.up.i32",
         "llvm.nvvm.shfl.sync.down.f32",
         "llvm.nvvm.shfl.sync.down.i32",
+        // [PORT gfx1030 Stage3-2] redux (butterfly fallback)
+        "llvm.nvvm.redux.sync.add",
         // [PORT gfx1030 PhaseB.3] address classification + memory fences
         "llvm.nvvm.isspacep.local",
         "llvm.nvvm.isspacep.shared",
@@ -1337,6 +1441,10 @@ pub fn rewrite_ir_for_amdgcn(ll: &str) -> Result<String, String> {
     text = rewrite_calls(&text, "llvm.nvvm.read.ptx.sreg.laneid", "call i32 @llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)").0;
     text = rewrite_shuffle(&text);
     text = rewrite_shfl_asm(&text);
+    // 11. [PORT gfx1030 Stage3-2] redux.sync.add → 5-round xor-butterfly
+    //     ds_bpermute fallback (gfx1030 has no hardware redux; result stays
+    //     broadcast under the original SSA name).
+    text = rewrite_redux_add(&text);
     // 12. [PORT gfx1030 PhaseB.3] atomics: isspacep clears FIRST (the v3
     //     layering lesson — membar/scope rewrites crash into leftovers
     //     otherwise), then membar → fence, then NV scope renames, then 12d
@@ -1774,6 +1882,62 @@ entry:
         assert!(once.contains("call void @llvm.trap()"));
         let twice = rewrite_ir_for_amdgcn(&once).unwrap();
         assert_eq!(once, twice);
+    }
+
+    // ---- [PORT gfx1030 Stage3-2] redux (Step 11) ------------------------
+
+    /// Shape of the redux_sum example in post-`opt` output (the fixture shape
+    /// tests/test_gfx1030.py::test_ir_translate_redux GPU-verified: full-warp
+    /// sum broadcast on gfx1030).
+    const SAMPLE_REDUX_LL: &str = "\
+declare i32 @llvm.nvvm.redux.sync.add(i32, i32) #1
+
+define amdgpu_kernel void @redux_probe(ptr %v0, i64 %v1) #1 {
+entry:
+  %lane = tail call i32 @llvm.nvvm.read.ptx.sreg.laneid() #3
+  %v = add i32 1, %lane
+  %r = tail call i32 @llvm.nvvm.redux.sync.add(i32 %v, i32 -1) #5
+  store i32 %r, ptr %v0, align 4
+  ret void
+}
+";
+
+    #[test]
+    fn redux_add_expands_to_xor_butterfly() {
+        let out = rewrite_ir_for_amdgcn(SAMPLE_REDUX_LL).unwrap();
+        assert!(!out.contains("llvm.nvvm"), "redux/laneid residue");
+        // 5 butterfly rounds, each one ds_bpermute with a byte offset
+        assert_eq!(out.matches("@llvm.amdgcn.ds.bpermute").count(), 5);
+        assert_eq!(out.matches("= shl i32 ").count(), 5);
+        for shift in [16usize, 8, 4, 2, 1] {
+            assert!(out.contains(&format!("xor i32 %r.b_ln, {shift}")));
+        }
+        assert!(out.contains("= add i32 "), "add round missing");
+        // the last round writes the original SSA name; uses untouched
+        assert!(out.contains("%r = add i32 %r.b_s2, %r.b_g1"));
+        assert!(out.contains("store i32 %r, ptr %v0, align 4"));
+    }
+
+    #[test]
+    fn redux_rewrite_is_idempotent() {
+        let once = rewrite_ir_for_amdgcn(SAMPLE_REDUX_LL).unwrap();
+        let twice = rewrite_ir_for_amdgcn(&once).unwrap();
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn partial_warp_redux_stays_for_llc_to_reject() {
+        let ll = "\
+define amdgpu_kernel void @k(ptr %v0, i32 %live) #1 {
+entry:
+  %r = tail call i32 @llvm.nvvm.redux.sync.add(i32 1, i32 %live) #5
+  store i32 %r, ptr %v0, align 4
+  ret void
+}
+";
+        let out = rewrite_ir_for_amdgcn(ll).unwrap();
+        assert!(out.contains("llvm.nvvm.redux.sync.add"));
+        assert!(!out.contains("ds.bpermute"));
     }
 
     // ---- [PORT gfx1030 PhaseB.3] atomics (Step 12/12d) -------------------
