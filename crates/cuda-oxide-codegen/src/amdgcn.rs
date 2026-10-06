@@ -671,6 +671,160 @@ fn expand_redux_add(rd: ReduxLine<'_>) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
+// [PORT gfx1030 Stage3-3] integer dot product (Step 13), ported from
+// tests/translate_amdgcn.py (GPU-verified: dotprod example, DOTPROBE PASS
+// with expectations taken from the example source).
+//
+// Production shapes (dotprod .opt.ll):
+//   %r = tail call i32 @llvm.nvvm.idp4a.s.s(i32 %a, i32 %b, i32 %c)
+//   %r = tail call i32 @llvm.nvvm.idp2a.s.s(i32 %a, i32 %b, i1 false, i32 %c)
+// Semantics (PTX dp4a/dp2a):
+//   idp4a: d = c + sum(a.byte[i] * b.byte[i], i = 0..3)   (little-endian pack)
+//   idp2a: d = c + a.half0*b.byte[k] + a.half1*b.byte[k+1]
+// Mapping: s.s → llvm.amdgcn.sdot4 (v_dot4c_i32_i8), u.u → llvm.amdgcn.udot4
+// (v_dot4_u32_u8), clamp = false (PTX dp4a has no clamp) — signatures
+// probe-verified on the gfx1030 llc (i32,i32,i32,i1). Mixed-sign idp4a has
+// no single-instruction cover; idp2a has none at all → extract-and-multiply
+// straight-line IR (both operands sign/zero-extended per suffix into i32).
+// ---------------------------------------------------------------------------
+
+/// One parsed `@llvm.nvvm.idp4a/idp2a` call line.
+struct IdpLine<'a> {
+    indent: &'a str,
+    res: &'a str,
+    four: bool,
+    sa_signed: bool,
+    sb_signed: bool,
+    args: Vec<&'a str>,
+}
+
+/// `'s.'`/`'u.'` → (is-signed, rest).
+fn parse_sign_prefix(rest: &str) -> Option<(bool, &str)> {
+    match rest.strip_prefix('s') {
+        Some(rest) => Some((true, rest)),
+        None => {
+            let rest = rest.strip_prefix('u')?;
+            Some((false, rest))
+        }
+    }
+}
+
+fn match_idp_line(line: &str) -> Option<IdpLine<'_>> {
+    let (indent, res, rhs) = split_assign(line)?;
+    let call = strip_call_prefix(rhs)?;
+    let rest = call.strip_prefix("i32 @llvm.nvvm.idp")?;
+    let (four, rest) = match rest.strip_prefix("4a.") {
+        Some(rest) => (true, rest),
+        None => (false, rest.strip_prefix("2a.")?),
+    };
+    let (sa_signed, rest) = parse_sign_prefix(rest)?;
+    let rest = rest.strip_prefix('.')?;
+    let (sb_signed, rest) = parse_sign_prefix(rest)?;
+    let rest = rest.strip_prefix('(')?;
+    let close = rest.rfind(')')?;
+    if !is_attrs_tail(&rest[close + 1..]) {
+        return None;
+    }
+    let args = split_top_level_commas(&rest[..close]);
+    Some(IdpLine {
+        indent,
+        res,
+        four,
+        sa_signed,
+        sb_signed,
+        args,
+    })
+}
+
+/// The Step-13 driver: same-sign idp4a → sdot4/udot4, idp2a → mul-add
+/// expansion; mixed-sign idp4a and other shapes keep their nvvm call for llc
+/// to reject explicitly.
+fn rewrite_dotprod(ll: &str) -> String {
+    if !ll.contains("idp4a") && !ll.contains("idp2a") {
+        return ll.to_string();
+    }
+    let mut out = Vec::with_capacity(ll.lines().count());
+    for line in ll.lines() {
+        let parsed = match_idp_line(line);
+        let replacement = parsed.as_ref().and_then(|idp| {
+            if idp.four {
+                // Same-sign idp4a maps to the hardware v_dot4 intrinsics;
+                // mixed sign would need an expand path that no production
+                // shape exercises — keep it as the explicit failure signal.
+                (idp.sa_signed == idp.sb_signed && idp.args.len() == 3).then(|| {
+                    let dot = if idp.sa_signed { "sdot4" } else { "udot4" };
+                    format!(
+                        "{}{} = call i32 @llvm.amdgcn.{}({}, {}, {}, i1 false)",
+                        idp.indent, idp.res, dot, idp.args[0], idp.args[1], idp.args[2]
+                    )
+                })
+            } else {
+                expand_idp2a(idp)
+            }
+        });
+        match replacement {
+            Some(rep) => out.push(rep),
+            None => out.push(line.to_string()),
+        }
+    }
+    let mut text = out.join("\n");
+    if ll.ends_with('\n') && !text.is_empty() {
+        text.push('\n');
+    }
+    text
+}
+
+/// `idp2a.<sa>.<sb>(a, b, isbottom, c)` → extract + multiply-add straight
+/// IR (the script's `_expand_idp2a`). `a` is 2×i16, `b` contributes 2
+/// adjacent i8 bytes starting at byte `sh` (0 = low half, 16 = high half);
+/// every product operand is sign/zero-extended per the name suffix into the
+/// i32 domain (v_dot2 semantics without the overflow ambiguity). `isbottom`
+/// is accepted only as a literal (an immarg in all production shapes).
+fn expand_idp2a(idp: &IdpLine<'_>) -> Option<String> {
+    if idp.args.len() != 4 {
+        return None;
+    }
+    let res = idp.res; // assignment-form lines only; valueless calls keep the line
+    let (a, b, isbot, c) = (
+        arg_operand(idp.args[0])?,
+        arg_operand(idp.args[1])?,
+        arg_operand(idp.args[2])?,
+        arg_operand(idp.args[3])?,
+    );
+    let sh = match isbot {
+        "false" => 0usize,
+        "true" => 16,
+        _ => return None, // non-literal select: conservatively unsupported
+    };
+    let z = if idp.sa_signed { "sext" } else { "zext" };
+    let bz = if idp.sb_signed { "sext" } else { "zext" };
+    let indent = idp.indent;
+    let d = format!("{res}.d_");
+    let l = format!("{indent}{d}");
+    let mut seq = Vec::with_capacity(if sh == 0 { 13 } else { 14 });
+    seq.push(format!("{l}a0t = trunc i32 {a} to i16"));
+    seq.push(format!("{l}a0 = {z} i16 {d}a0t to i32"));
+    seq.push(format!("{l}a1s = lshr i32 {a}, 16"));
+    seq.push(format!("{l}a1t = trunc i32 {d}a1s to i16"));
+    seq.push(format!("{l}a1 = {z} i16 {d}a1t to i32"));
+    if sh != 0 {
+        seq.push(format!("{l}b0s = lshr i32 {b}, {sh}"));
+        seq.push(format!("{l}b0t = trunc i32 {d}b0s to i8"));
+    } else {
+        seq.push(format!("{l}b0t = trunc i32 {b} to i8"));
+    }
+    seq.push(format!("{l}b0 = {bz} i8 {d}b0t to i32"));
+    seq.push(format!("{l}b1s = lshr i32 {b}, {}", sh + 8));
+    seq.push(format!("{l}b1t = trunc i32 {d}b1s to i8"));
+    seq.push(format!("{l}b1 = {bz} i8 {d}b1t to i32"));
+    seq.push(format!("{l}m0 = mul i32 {d}a0, {d}b0"));
+    seq.push(format!("{l}m1 = mul i32 {d}a1, {d}b1"));
+    seq.push(format!("{l}r0 = add i32 {c}, {d}m0"));
+    seq.push(format!("{indent}{res} = add i32 {d}r0, {d}m1"));
+    Some(seq.join("\n"))
+}
+
+// ---------------------------------------------------------------------------
 // [PORT gfx1030 PhaseB.3] atomics family (Step 12/12d), ported from
 // tests/translate_amdgcn.py (GPU-verified: is.* classification, generic
 // fetch_add + fences, MP litmus release→acquire 200 rounds).
@@ -1417,6 +1571,11 @@ pub fn rewrite_ir_for_amdgcn(ll: &str) -> Result<String, String> {
         "llvm.nvvm.shfl.sync.down.i32",
         // [PORT gfx1030 Stage3-2] redux (butterfly fallback)
         "llvm.nvvm.redux.sync.add",
+        // [PORT gfx1030 Stage3-3] dot product family
+        "llvm.nvvm.idp4a.s.s",
+        "llvm.nvvm.idp4a.u.u",
+        "llvm.nvvm.idp2a.s.s",
+        "llvm.nvvm.idp2a.u.u",
         // [PORT gfx1030 PhaseB.3] address classification + memory fences
         "llvm.nvvm.isspacep.local",
         "llvm.nvvm.isspacep.shared",
@@ -1445,6 +1604,9 @@ pub fn rewrite_ir_for_amdgcn(ll: &str) -> Result<String, String> {
     //     ds_bpermute fallback (gfx1030 has no hardware redux; result stays
     //     broadcast under the original SSA name).
     text = rewrite_redux_add(&text);
+    // 13. [PORT gfx1030 Stage3-3] idp4a → sdot4/udot4 (v_dot4, clamp=false),
+    //     idp2a → extract-and-multiply expansion (probe-verified signatures).
+    text = rewrite_dotprod(&text);
     // 12. [PORT gfx1030 PhaseB.3] atomics: isspacep clears FIRST (the v3
     //     layering lesson — membar/scope rewrites crash into leftovers
     //     otherwise), then membar → fence, then NV scope renames, then 12d
@@ -1938,6 +2100,97 @@ entry:
         let out = rewrite_ir_for_amdgcn(ll).unwrap();
         assert!(out.contains("llvm.nvvm.redux.sync.add"));
         assert!(!out.contains("ds.bpermute"));
+    }
+
+    // ---- [PORT gfx1030 Stage3-3] dotprod (Step 13) -----------------------
+
+    /// Shape of the dotprod example in post-`opt` output (the fixture shape
+    /// tests/test_gfx1030.py::test_ir_translate_dotprod GPU-verified:
+    /// DOTPROBE PASS with expectations from the example source).
+    const SAMPLE_DOTPROD_LL: &str = "\
+declare i32 @llvm.nvvm.idp4a.s.s(i32, i32, i32) #0
+declare i32 @llvm.nvvm.idp4a.u.u(i32, i32, i32) #0
+declare i32 @llvm.nvvm.idp2a.s.s(i32, i32, i1 immarg, i32) #0
+
+define amdgpu_kernel void @dot_probe(ptr %v0, i32 %a, i32 %b, i32 %c) #1 {
+entry:
+  %d4s = tail call i32 @llvm.nvvm.idp4a.s.s(i32 %a, i32 %b, i32 %c) #3
+  %d4u = tail call i32 @llvm.nvvm.idp4a.u.u(i32 %a, i32 %b, i32 %c) #3
+  %d2s = tail call i32 @llvm.nvvm.idp2a.s.s(i32 %a, i32 %b, i1 false, i32 %c) #3
+  store i32 %d4s, ptr %v0, align 4
+  ret void
+}
+";
+
+    #[test]
+    fn idp4a_maps_to_sdot4_udot4_and_idp2a_expands() {
+        let out = rewrite_ir_for_amdgcn(SAMPLE_DOTPROD_LL).unwrap();
+        assert!(!out.contains("llvm.nvvm"), "dotprod residue");
+        // same-sign idp4a → hardware v_dot4 intrinsics, clamp=false, operands
+        // passed through verbatim
+        assert!(out.contains(
+            "%d4s = call i32 @llvm.amdgcn.sdot4(i32 %a, i32 %b, i32 %c, i1 false)"
+        ));
+        assert!(out.contains(
+            "%d4u = call i32 @llvm.amdgcn.udot4(i32 %a, i32 %b, i32 %c, i1 false)"
+        ));
+        // idp2a.s.s isbottom=false: low half of b, sext both sides
+        assert!(out.contains("%d2s.d_a0t = trunc i32 %a to i16"));
+        assert!(out.contains("%d2s.d_a0 = sext i16 %d2s.d_a0t to i32"));
+        assert!(out.contains("%d2s.d_b0t = trunc i32 %b to i8"));
+        assert!(out.contains("%d2s.d_b1s = lshr i32 %b, 8"));
+        assert!(out.contains("%d2s.d_m0 = mul i32 %d2s.d_a0, %d2s.d_b0"));
+        assert!(out.contains("%d2s.d_r0 = add i32 %c, %d2s.d_m0"));
+        assert!(out.contains("%d2s = add i32 %d2s.d_r0, %d2s.d_m1"));
+        // results keep their SSA names; downstream uses untouched
+        assert!(out.contains("store i32 %d4s, ptr %v0, align 4"));
+    }
+
+    #[test]
+    fn idp2a_high_half_and_unsigned_variants() {
+        let ll = "\
+define amdgpu_kernel void @k(ptr %v0, i32 %a, i32 %b, i32 %c) #1 {
+entry:
+  %hi = tail call i32 @llvm.nvvm.idp2a.u.u(i32 %a, i32 %b, i1 true, i32 %c) #3
+  store i32 %hi, ptr %v0, align 4
+  ret void
+}
+";
+        let out = rewrite_ir_for_amdgcn(ll).unwrap();
+        // isbottom=true → byte offset 16; u.u → zext both operands
+        assert!(out.contains("%hi.d_b0s = lshr i32 %b, 16"));
+        assert!(out.contains("%hi.d_b1s = lshr i32 %b, 24"));
+        assert!(out.contains("%hi.d_a0 = zext i16 %hi.d_a0t to i32"));
+        assert!(out.contains("%hi.d_b0 = zext i8 %hi.d_b0t to i32"));
+        assert!(out.contains("%hi = add i32 %hi.d_r0, %hi.d_m1"));
+    }
+
+    #[test]
+    fn dotprod_rewrite_is_idempotent() {
+        let once = rewrite_ir_for_amdgcn(SAMPLE_DOTPROD_LL).unwrap();
+        let twice = rewrite_ir_for_amdgcn(&once).unwrap();
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn mixed_sign_idp4a_and_dynamic_bottom_stay_for_llc_to_reject() {
+        let ll = "\
+declare i32 @llvm.nvvm.idp4a.s.u(i32, i32, i32) #0
+
+define amdgpu_kernel void @k(ptr %v0, i32 %a, i32 %b, i32 %c, i1 %bot) #1 {
+entry:
+  %mix = tail call i32 @llvm.nvvm.idp4a.s.u(i32 %a, i32 %b, i32 %c) #3
+  %dyn = tail call i32 @llvm.nvvm.idp2a.s.s(i32 %a, i32 %b, i1 %bot, i32 %c) #3
+  store i32 %mix, ptr %v0, align 4
+  ret void
+}
+";
+        let out = rewrite_ir_for_amdgcn(ll).unwrap();
+        // mixed-sign idp4a has no intrinsic cover; a non-literal isbottom
+        // cannot be resolved — both keep their explicit llc failure
+        assert!(out.contains("llvm.nvvm.idp4a.s.u"));
+        assert!(out.contains("llvm.nvvm.idp2a.s.s"));
+        assert!(!out.contains("sdot4"));
     }
 
     // ---- [PORT gfx1030 PhaseB.3] atomics (Step 12/12d) -------------------
