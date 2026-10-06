@@ -282,9 +282,11 @@ fn rewrite_allocas_in_function(body: &[&str]) -> Vec<String> {
 //   up  : t = (lane&31)-delta; src = in-segment ? seg+t : lane
 //   off = src * 4  ← the core cross-arch difference: ds_bpermute takes a BYTE
 //                    offset (lane*4) where NVVM shfl takes a lane number.
-// Conservative boundary (port discipline 5): membermask != -1 (partial warp)
-// and clamp != 31 (width != 32) stay as the nvvm call so llc fails with an
-// explicit `Cannot select` instead of silently mis-shuffling.
+// Conservative boundary (port discipline 5): a literal membermask other than
+// -1 (documented partial warp) and out-of-envelope clamps stay as the nvvm
+// call so llc fails with an explicit `Cannot select` instead of silently
+// mis-shuffling; dynamic masks and .up clamp=0 are accepted (see
+// `shfl_in_envelope` — the post-rebase #1311 production shapes).
 // ---------------------------------------------------------------------------
 
 /// One parsed `@llvm.nvvm.shfl.sync.<mode>.<st>` call line.
@@ -350,7 +352,7 @@ fn rewrite_shuffle(ll: &str) -> String {
     let mut out = Vec::with_capacity(ll.lines().count());
     for line in ll.lines() {
         let expanded = match_shfl_line(line)
-            .filter(|shfl| shfl.mask == "-1" && shfl.clamp == "31")
+            .filter(shfl_in_envelope)
             .map(expand_shfl);
         match expanded {
             Some(lines) => out.extend(lines),
@@ -362,6 +364,35 @@ fn rewrite_shuffle(ll: &str) -> String {
         text.push('\n');
     }
     text
+}
+
+/// Support envelope for the mask/clamp operands (Python `_expand_shfl`, as
+/// adapted for the post-rebase shapes).
+///
+/// membermask: a literal must be -1; a *dynamic* operand is accepted —
+/// upstream #1311's partial-warp collectives emit `(1 << live) - 1` as SSA.
+/// ds_bpermute's data movement does not depend on the mask (a segment-local
+/// read), the convergent marker survives onto the expansion, and the NVVM
+/// valid-use precondition "every mask lane is active at the shfl" is exactly
+/// the all-lanes-execute precondition ds_bpermute needs. A *literal* other
+/// than -1 documents a partial-warp intent we cannot verify — it keeps its
+/// nvvm call for llc to reject explicitly.
+///
+/// clamp: PTX's `c` operand is mode-dependent — for `.up` it bounds the
+/// lowest source lane (0 = whole warp; upstream #1311 emits 0 there), the
+/// other modes take width-1 = 31. This expansion implements CUDA width-32
+/// semantics (segment-local self-fallback), which is the call-site intent
+/// under both accepted literals. A dynamic clamp stays unsupported.
+fn shfl_in_envelope(shfl: &ShflLine<'_>) -> bool {
+    let literal_mask = shfl.mask.parse::<i32>().is_ok();
+    if literal_mask && shfl.mask != "-1" {
+        return false;
+    }
+    match shfl.clamp.parse::<i32>() {
+        Ok(0) => shfl.mode == "up",
+        Ok(31) => true,
+        _ => false,
+    }
 }
 
 /// The straight-line ds_bpermute expansion for one shfl call (script's
@@ -638,6 +669,39 @@ fn match_typed_asm_call<'a>(call: &'a str) -> Option<(&'a str, &'a str, &'a str,
         return None;
     }
     Some((ty, body, constraint, &args[..close_paren]))
+}
+
+/// Step 12e: the panic trap. Post-#1309 the panic path is inline PTX asm
+/// (`call void asm sideeffect "trap;", ""()`), a PTX mnemonic the AMDGPU
+/// backend rejects outright ("invalid instruction, did you mean: s_trap?").
+/// `llvm.trap()` lowers to `s_trap` on gfx1030 — the semantic equivalent
+/// (thread halt). Exact-shape match; anything else passes through.
+fn rewrite_trap_asm(ll: &str) -> String {
+    if !ll.contains("asm sideeffect \"trap;\"") {
+        return ll.to_string();
+    }
+    let mut out = Vec::with_capacity(ll.lines().count());
+    for line in ll.lines() {
+        let trimmed = line.trim_start();
+        let rewritten = strip_call_prefix(trimmed)
+            .filter(|call| {
+                call.strip_prefix("void asm sideeffect \"trap;\", \"\"()")
+                    .is_some_and(is_attrs_tail)
+            })
+            .map(|_| {
+                let indent = &line[..line.len() - trimmed.len()];
+                format!("{indent}call void @llvm.trap()")
+            });
+        match rewritten {
+            Some(rep) => out.push(rep),
+            None => out.push(line.to_string()),
+        }
+    }
+    let mut text = out.join("\n");
+    if ll.ends_with('\n') && !text.is_empty() {
+        text.push('\n');
+    }
+    text
 }
 
 /// Step 12: address classification, memory fences, scope renames.
@@ -1279,6 +1343,8 @@ pub fn rewrite_ir_for_amdgcn(ll: &str) -> Result<String, String> {
     //     the PTX-asm atomic family → LLVM atomic instructions.
     text = rewrite_atomics(&text);
     text = rewrite_ptx_atomic_asm(&text);
+    // 12e. [PORT gfx1030] panic trap asm -> llvm.trap() (s_trap on gfx1030).
+    text = rewrite_trap_asm(&text);
     // 14. [PORT gfx1030 PhaseB.4] counted barrier → LDS counter + generation
     //     spin software fallback (a direct S_BARRIER mapping would deadlock
     //     bystander warps), then 15: libdevice __nv_* → ocml __ocml_*.
@@ -1631,6 +1697,83 @@ entry:
         assert!(rewrite_ir_for_amdgcn(ll)
             .unwrap()
             .contains("shfl.sync.bfly.b32"));
+    }
+
+    /// Post-rebase #1311 production shape: partial-warp collective scan with a
+    /// dynamic membermask and the .up clamp=0 spelling (warp_reduce
+    /// block_reduce_partial_warp real output).
+    #[test]
+    fn dynamic_mask_up0_shfl_expands_like_the_python_pipeline() {
+        let ll = "\
+define amdgpu_kernel void @k(ptr %v0, i32 %live) #1 {
+entry:
+  %acc = tail call i32 @llvm.nvvm.shfl.sync.up.i32(i32 %live, i32 7, i32 4, i32 0) #3
+  store i32 %acc, ptr %v0, align 4
+  ret void
+}
+";
+        let out = rewrite_ir_for_amdgcn(ll).unwrap();
+        assert!(!out.contains("llvm.nvvm"), "dynamic-mask up@0 residue");
+        assert!(out.contains("= call i32 @llvm.amdgcn.ds.bpermute"));
+        // up's out-of-segment self-fallback with the dynamic delta
+        assert!(out.contains("icmp uge i32"));
+        assert!(out.contains("select i1"));
+    }
+
+    #[test]
+    fn literal_non_full_mask_shfl_stays_for_llc_to_reject() {
+        let ll = "\
+define amdgpu_kernel void @k(ptr %v0) #1 {
+entry:
+  %a = tail call i32 @llvm.nvvm.shfl.sync.up.i32(i32 7, i32 1, i32 1, i32 0) #3
+  store i32 %a, ptr %v0, align 4
+  ret void
+}
+";
+        let out = rewrite_ir_for_amdgcn(ll).unwrap();
+        assert!(out.contains("llvm.nvvm.shfl.sync.up.i32("));
+        assert!(!out.contains("ds.bpermute"));
+    }
+
+    /// Post-rebase #1309 shape: the panic path is inline PTX asm; on gfx1030
+    /// it must become llvm.trap() (lowers to s_trap).
+    #[test]
+    fn panic_trap_asm_maps_to_llvm_trap() {
+        let ll = "\
+declare void @llvm.trap() #0
+
+define amdgpu_kernel void @k(ptr %v0, i64 %n) #1 {
+entry:
+  %over = icmp ugt i64 %n, 1024
+  br i1 %over, label %panic, label %ok
+
+panic:
+  tail call void asm sideeffect \"trap;\", \"\"() #9
+  unreachable
+
+ok:
+  ret void
+}
+";
+        let out = rewrite_ir_for_amdgcn(ll).unwrap();
+        assert!(!out.contains("asm sideeffect"), "trap asm residue");
+        assert!(out.contains("call void @llvm.trap()"));
+        assert!(out.contains("declare void @llvm.trap()"));
+    }
+
+    #[test]
+    fn trap_asm_rewrite_is_idempotent() {
+        let ll = "\
+define amdgpu_kernel void @k() #1 {
+entry:
+  tail call void asm sideeffect \"trap;\", \"\"() #9
+  unreachable
+}
+";
+        let once = rewrite_ir_for_amdgcn(ll).unwrap();
+        assert!(once.contains("call void @llvm.trap()"));
+        let twice = rewrite_ir_for_amdgcn(&once).unwrap();
+        assert_eq!(once, twice);
     }
 
     // ---- [PORT gfx1030 PhaseB.3] atomics (Step 12/12d) -------------------
