@@ -277,8 +277,12 @@ def test_ir_translate_no_nvvm_residual():
     assert "@llvm.amdgcn.workgroup.id.x()" in out, "ctaid.x 未映射"
     assert "@llvm.amdgcn.workitem.id.x()" in out, "tid.x 未映射"
     assert "or i32 %ntid_x, 0" in out, "ntid.x 未 kernarg 化"
-    assert re.search(r"i64 %v5, i32 %ntid_x\) #1 \{", out), "签名未追加 i32 %ntid_x"
-    assert out.count("or i32 0, 1") == 2, "y/z 维未常量化为 1"
+    assert "or i32 %ntid_y, 0" in out, "ntid.y 未 kernarg 化（3-D launch 语义）"
+    assert re.search(
+        r"i64 %v5, i32 %ntid_x, i32 %ntid_y, i32 %ntid_z\) #1 \{", out
+    ), "签名未追加 i32 %ntid_x/%ntid_y/%ntid_z"
+    # 仅 nctaid.y 折叠为 1（ntid.y/z 已 kernarg 化，不再折叠）
+    assert out.count("or i32 0, 1") == 1, "nctaid.y 未常量化为 1"
     # 已映射 intrinsic 的 declare 已删，且未误删无关 declare
     assert "@llvm.trap" in out
 
@@ -987,13 +991,15 @@ int main() {
     CK(hipModuleLoadData(&mod, img.data()));
 
     const unsigned N = 256, ntid = 256;
-    void *ntid_p = (void *)&ntid;
+    // 步骤 5 推广后 kernel 签名带 %ntid_x/%ntid_y/%ntid_z 三形参；
+    // 本 launch 是 (256,1,1) 的一维块形
+    unsigned ntid_x = 256, ntid_y = 1, ntid_z = 1;
     long long n = N;
     int rc = 0;
 
     {   // Test 1: barrier_sync_test -> all 1
         unsigned *d; CK(hipMalloc(&d, N * 4)); CK(hipMemset(d, 0, N * 4));
-        void *kp[] = { &d, &n, ntid_p };
+        void *kp[] = { &d, &n, &ntid_x, &ntid_y, &ntid_z };
         if (run_kernel(mod, "barrier_sync_test", kp, ntid)) return 1;
         std::vector<unsigned> h(N);
         CK(hipMemcpy(h.data(), d, N * 4, hipMemcpyDeviceToHost));
@@ -1006,7 +1012,7 @@ int main() {
     }
     {   // Test 2: barrier_shared_data_test -> out[i] = (i+1) % N
         unsigned *d; CK(hipMalloc(&d, N * 4)); CK(hipMemset(d, 0, N * 4));
-        void *kp[] = { &d, &n, ntid_p };
+        void *kp[] = { &d, &n, &ntid_x, &ntid_y, &ntid_z };
         if (run_kernel(mod, "barrier_shared_data_test", kp, ntid)) return 1;
         std::vector<unsigned> h(N);
         CK(hipMemcpy(h.data(), d, N * 4, hipMemcpyDeviceToHost));
@@ -1021,7 +1027,7 @@ int main() {
     {   // Test 3: barrier_no_complete_test -> [0, 1]
         unsigned *d; CK(hipMalloc(&d, 8)); CK(hipMemset(d, 0xFF, 8));
         long long n2 = 2;
-        void *kp[] = { &d, &n2, ntid_p };
+        void *kp[] = { &d, &n2, &ntid_x, &ntid_y, &ntid_z };
         if (run_kernel(mod, "barrier_no_complete_test", kp, ntid)) return 1;
         std::vector<unsigned> h(2);
         CK(hipMemcpy(h.data(), d, 8, hipMemcpyDeviceToHost));
@@ -1087,10 +1093,13 @@ int main() {
     hipModule_t mod; CK(hipModuleLoadData(&mod, img.data()));
     hipFunction_t fn; CK(hipModuleGetFunction(&fn, mod, "vecadd"));
 
-    // 7 参数各一指针: (ptr a, i64 Na, ptr b, i64 Nb, ptr c, i64 Nc, i32 ntid_x)
+    // 9 参数各一指针: (ptr a, i64 Na, ptr b, i64 Nb, ptr c, i64 Nc,
+    //                   i32 ntid_x, i32 ntid_y, i32 ntid_z)
+    // （步骤 5 推广后每个 amdgcn kernel 无条件带三个 blockDim 形参；
+    //   本 launch 是 (256,1,1) 的一维块形）
     long long Na = N, Nb = N, Nc = N;
-    int ntid = 256;
-    void* kparams[] = { &da, &Na, &db, &Nb, &dc, &Nc, &ntid };
+    int ntid_x = 256, ntid_y = 1, ntid_z = 1;
+    void* kparams[] = { &da, &Na, &db, &Nb, &dc, &Nc, &ntid_x, &ntid_y, &ntid_z };
     CK(hipModuleLaunchKernel(fn, 4, 1, 1, 256, 1, 1, 0, nullptr, kparams, nullptr));
     CK(hipDeviceSynchronize());
 

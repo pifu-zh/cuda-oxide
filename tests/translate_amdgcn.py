@@ -72,18 +72,32 @@ def translate_nvvm_to_amdgcn(ll_text: str) -> str:
     text = text.replace("@llvm.nvvm.read.ptx.sreg.tid.y()", "@llvm.amdgcn.workitem.id.y()")
     text = text.replace("@llvm.nvvm.read.ptx.sreg.tid.z()", "@llvm.amdgcn.workitem.id.z()")
 
-    # 5. ntid.x → kernarg 参数 %ntid_x（blockDim 由 host 决定）：
-    #    调用点替换为恒等 or，签名追加参数（见 _append_ntid_kernarg_param）
+    # 5. ntid.{x,y,z} → kernarg 新参数 %ntid_x/%ntid_y/%ntid_z（blockDim 由
+    #    host 决定）。y/z 不再折叠为 1：上游 #1311 起例源含 3-D launch
+    #    （如 warp_reduce 的 (3,5,3) 块形，块内秩 = 3-D 坐标展开），折叠会
+    #    破坏 rank/size 语义（GPU 实证硬件异常）。host 恒推三个参数，故
+    #    每个 kernel 无条件追加三个形参（子集签名会与 host 推参错位）。
     text = re.sub(
         r"(?:tail )?call i32 @llvm\.nvvm\.read\.ptx\.sreg\.ntid\.x\(\)(?:\s*#\d+)?",
         "or i32 %ntid_x, 0",
         text,
     )
-    text = _append_ntid_kernarg_param(text)
-
-    # 6. ntid/nctaid .y|.z → 常量 1（1D launch：block/grid 的 y,z 维度为 1）
     text = re.sub(
-        r"(?:tail )?call i32 @llvm\.nvvm\.read\.ptx\.sreg\.(?:ntid|nctaid)\.[yz]\(\)(?:\s*#\d+)?",
+        r"(?:tail )?call i32 @llvm\.nvvm\.read\.ptx\.sreg\.ntid\.y\(\)(?:\s*#\d+)?",
+        "or i32 %ntid_y, 0",
+        text,
+    )
+    text = re.sub(
+        r"(?:tail )?call i32 @llvm\.nvvm\.read\.ptx\.sreg\.ntid\.z\(\)(?:\s*#\d+)?",
+        "or i32 %ntid_z, 0",
+        text,
+    )
+    text = _append_ntid_kernarg_params(text)
+
+    # 6. nctaid .y|.z → 常量 1（1D grid：launch 的 y,z 网格维度为 1；
+    #    ntid 不在此列——见步骤 5）
+    text = re.sub(
+        r"(?:tail )?call i32 @llvm\.nvvm\.read\.ptx\.sreg\.nctaid\.[yz]\(\)(?:\s*#\d+)?",
         "or i32 0, 1",
         text,
     )
@@ -1202,8 +1216,14 @@ def _rewrite_mbarriers(text: str) -> str:
     return "\n".join(out)
 
 
-def _append_ntid_kernarg_param(text: str) -> str:
-    """给调用了 ntid.x 的 kernel 签名末尾追加 `i32 %ntid_x` 参数。"""
+def _append_ntid_kernarg_params(text: str) -> str:
+    """给每个 kernel 签名末尾追加 `i32 %ntid_x, i32 %ntid_y, i32 %ntid_z`。
+
+    host 侧 launch 宏在 gfx 路由下恒推 blockDim.0/.1/.2 三个参数，签名必须
+    与推参一致：若只给引用了 ntid 的 kernel 追加，"内核读子集、host 推全集"
+    的签名（如只读 .y 不读 .x）会整体错位——故 kernel 无条件追加同序三个；
+    非 kernel 函数（opt 后仍存在的 alwaysinline 漏网）仅在引用任一 %ntid_*
+    时追加。幂等：签名已含 %ntid_z 即跳过（三参一次追加）。"""
     lines = text.split("\n")
     out = []
     i = 0
@@ -1219,18 +1239,29 @@ def _append_ntid_kernarg_param(text: str) -> str:
                 block.append(lines[i])
                 i += 1
             body = "\n".join(block)
-            # 仅当函数体用到 %ntid_x 且签名尚未含该参数时追加
-            if "%ntid_x" in body and "%ntid_x" not in block[0]:
-                # 参数表收尾 ")" = "{" 之前最后一个 ")"（")" 与 "{" 之间只允许
-                # 空白/flags（alwaysinline 等）/属性引用 #N——参数内的 "())"
-                # （如 captures(none)）必然位于收尾 ")" 之前
-                brace = block[0].rfind("{")
-                paren = block[0].rfind(")", 0, brace)
-                between = block[0][paren + 1 : brace]
-                if paren >= 0 and re.fullmatch(r"[\s#\w,=]*", between):
-                    block[0] = (
-                        block[0][:paren] + ", i32 %ntid_x" + block[0][paren:]
-                    )
+            define = block[0]
+            is_kernel = "amdgpu_kernel" in define
+            refs_ntid = any(f"%ntid_{a}" in body for a in "xyz")
+            # 参数表收尾 ")" = "{" 之前最后一个 ")"（")" 与 "{" 之间只允许
+            # 空白/flags（alwaysinline 等）/属性引用 #N——参数内的 "())"
+            # （如 captures(none)）必然位于收尾 ")" 之前
+            brace = define.rfind("{")
+            paren = define.rfind(")", 0, brace)
+            between = define[paren + 1 : brace] if paren >= 0 else ""
+            if (
+                (is_kernel or refs_ntid)
+                and "%ntid_z" not in define
+                and paren >= 0
+                and re.fullmatch(r"[\s#\w,=]*", between)
+            ):
+                open_p = define.rfind("(", 0, paren)
+                # 零参函数不带前导逗号
+                insertion = (
+                    "i32 %ntid_x, i32 %ntid_y, i32 %ntid_z"
+                    if not define[open_p + 1 : paren].strip()
+                    else ", i32 %ntid_x, i32 %ntid_y, i32 %ntid_z"
+                )
+                block[0] = define[:paren] + insertion + define[paren:]
             out.extend(block)
         else:
             out.append(line)

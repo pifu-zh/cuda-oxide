@@ -26,15 +26,17 @@
 //! levels, Rust-ified from `tests/translate_amdgcn.py` (steps 5-7 of the
 //! Phase-1-validated sequence, each step GPU-verified on gfx1030):
 //!
-//! 5. `ntid.x` reads → a new trailing `i32 %ntid_x` kernel parameter
-//!    (`blockDim.x` is host policy on AMDGPU: no LLVM IR intrinsic exists, and
-//!    a lowering-time conversion cannot change the kernel signature). Call
-//!    sites become `or i32 %ntid_x, 0` — an identity op producing a fresh SSA
-//!    value so no use-site renaming is needed. The host must pass the extra
-//!    kernarg (mirrors Phase-1 host_v6: `kparams` gains `&ntid`).
-//! 6. `ntid.{y,z}` / `nctaid.{y,z}` reads → `or i32 0, 1` (constant 1; the
-//!    kernel's multi-dimension guard assumes 1-D launches — same semantics
-//!    decision as Phase 1).
+//! 5. `ntid.{x,y,z}` reads → three trailing `i32 %ntid_{x,y,z}` kernel
+//!    parameters (`blockDim` is host policy on AMDGPU: no LLVM IR intrinsic
+//!    exists, and a lowering-time conversion cannot change the kernel
+//!    signature). Call sites become `or i32 %ntid_*, 0` — identity ops
+//!    producing fresh SSA values so no use-site renaming is needed. The host
+//!    launchers push `blockDim.0/.1/.2` as the last launch arguments
+//!    (mirrors the Phase-1 host_v6: `kparams` gains `&ntid`). The y/z reads
+//!    are deliberately NOT folded to 1: upstream #1311 examples launch 3-D
+//!    blocks and expand the in-block rank from the 3-D coordinates.
+//! 6. `nctaid.{y,z}` reads → `or i32 0, 1` (constant 1; the grid stays 1-D
+//!    across every example — same semantics decision as Phase 1).
 //! 7. the `declare`s of the rewritten NVVM sreg intrinsics are deleted;
 //!    `llc` auto-declares the AMDGPU target intrinsics, and leftover NVVM
 //!    declares would leak into the code object as undefined externs.
@@ -1784,16 +1786,25 @@ fn rewrite_calls(ll: &str, callee: &str, replacement: &str) -> (String, bool) {
     (text, changed)
 }
 
-/// Appends a trailing `i32 %ntid_x` parameter to every kernel `define` whose
-/// body references `%ntid_x` (Rust port of the Phase-1 script's
-/// `_append_ntid_kernarg_param`).
+/// Appends trailing `i32 %ntid_x, i32 %ntid_y, i32 %ntid_z` parameters to
+/// kernel `define`s (Rust port of the Phase-1 script's
+/// `_append_ntid_kernarg_params`, generalized from the x-only kernarg).
+///
+/// UNCONDITIONAL for kernels: the generated launchers always push
+/// `blockDim.0/.1/.2` (in that order) on the gfx path, so the signature must
+/// match the push count exactly — appending only to kernels that *reference*
+/// the sregs would misalign the whole tail for any kernel reading a subset
+/// (e.g. `.y` but not `.x`). Device functions (post-`opt` leftovers of
+/// `alwaysinline` helpers) keep the conditional rule: they gain the three
+/// parameters only when their body references any `%ntid_*`.
 ///
 /// The parameter list ends at the last `)` before the final `{`; the text
 /// between may only be whitespace, attribute group references (`#N`), flags
 /// and commas (`re.fullmatch(r"[\s#\w,=]*")` in the script). A `())` inside
 /// the parameters (e.g. `captures(none)`) always sits *before* that closing
 /// parenthesis, so the heuristic cannot cut inside a nested group.
-fn append_ntid_kernarg_param(ll: &str) -> String {
+fn append_ntid_kernarg_params(ll: &str) -> String {
+    const PARAMS: &str = "i32 %ntid_x, i32 %ntid_y, i32 %ntid_z";
     let lines: Vec<&str> = ll.lines().collect();
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut i = 0;
@@ -1815,8 +1826,14 @@ fn append_ntid_kernarg_param(ll: &str) -> String {
             i += 1;
         }
         let define = block[0].clone();
-        let body_uses = block.iter().skip(1).any(|l| l.contains("%ntid_x"));
-        if body_uses && !define.contains("%ntid_x") {
+        let is_kernel = define.contains("amdgpu_kernel");
+        let refs_ntid = block
+            .iter()
+            .skip(1)
+            .any(|l| ["%ntid_x", "%ntid_y", "%ntid_z"].iter().any(|n| l.contains(n)));
+        // Idempotence: the three arrive together, so `%ntid_z` in the
+        // signature means this define was already extended.
+        if (is_kernel || refs_ntid) && !define.contains("%ntid_z") {
             if let Some(brace) = define.rfind('{') {
                 if let Some(paren) = define[..brace].rfind(')') {
                     let between = &define[paren + 1..brace];
@@ -1824,21 +1841,15 @@ fn append_ntid_kernarg_param(ll: &str) -> String {
                         .chars()
                         .all(|c| c.is_whitespace() || c.is_ascii_alphanumeric() || "#,=_".contains(c));
                     if between_ok {
-                        // Zero-parameter functions take the parameter without
-                        // a leading comma (a case the Phase-1 script's fixed
-                        // `", i32 %ntid_x"` splice would have mangled).
+                        // Zero-parameter functions take the parameters without
+                        // a leading comma.
                         let open = define[..paren].rfind('(').unwrap_or(paren);
                         let insertion = if define[open + 1..paren].trim().is_empty() {
-                            "i32 %ntid_x"
+                            PARAMS.to_string()
                         } else {
-                            ", i32 %ntid_x"
+                            format!(", {PARAMS}")
                         };
-                        block[0] = format!(
-                            "{}{}{}",
-                            &define[..paren],
-                            insertion,
-                            &define[paren..]
-                        );
+                        block[0] = format!("{}{}{}", &define[..paren], insertion, &define[paren..]);
                     }
                 }
             }
@@ -1859,13 +1870,20 @@ fn append_ntid_kernarg_param(ll: &str) -> String {
 /// input is not text this pass understands (currently: never — unknown
 /// constructs pass through untouched for `llc` to accept or reject).
 pub fn rewrite_ir_for_amdgcn(ll: &str) -> Result<String, String> {
-    // 5. ntid.x → new kernarg parameter.
+    // 5. ntid.{x,y,z} → new kernarg parameters. The y/z reads are NOT folded
+    //    to 1: upstream #1311 examples launch 3-D blocks (warp_reduce's
+    //    (3,5,3) shapes expand the in-block rank from 3-D coordinates), where
+    //    folding is a wrong-semantics bug (GPU hardware exception, not just
+    //    wrong numbers). blockDim is host policy on AMDGPU, so all three
+    //    become kernargs.
     let mut text = rewrite_calls(ll, "llvm.nvvm.read.ptx.sreg.ntid.x", "or i32 %ntid_x, 0").0;
-    text = append_ntid_kernarg_param(&text);
-    // 6. ntid/nctaid .y/.z → constant 1 (1-D launch semantics, Phase-1 step 6).
-    const ONE_D_CONSTANTS: [(&str, &str); 4] = [
-        ("llvm.nvvm.read.ptx.sreg.ntid.y", "or i32 0, 1"),
-        ("llvm.nvvm.read.ptx.sreg.ntid.z", "or i32 0, 1"),
+    text = rewrite_calls(&text, "llvm.nvvm.read.ptx.sreg.ntid.y", "or i32 %ntid_y, 0").0;
+    text = rewrite_calls(&text, "llvm.nvvm.read.ptx.sreg.ntid.z", "or i32 %ntid_z, 0").0;
+    text = append_ntid_kernarg_params(&text);
+    // 6. nctaid .y/.z → constant 1 (1-D GRID semantics; the launch macros'
+    //    grid dims stay 1-D across the batch — the block dims are the ones
+    //    that went multi-dimensional).
+    const ONE_D_CONSTANTS: [(&str, &str); 2] = [
         ("llvm.nvvm.read.ptx.sreg.nctaid.y", "or i32 0, 1"),
         ("llvm.nvvm.read.ptx.sreg.nctaid.z", "or i32 0, 1"),
     ];
@@ -2073,15 +2091,17 @@ attributes #2 = { convergent }
     fn probe_shaped_module_is_rewritten_like_phase1() {
         let out = rewrite_ir_for_amdgcn(PROBE_SHAPED_LL).unwrap();
 
-        // 5. ntid.x call became the identity-or and the signature gained the
-        //    kernarg parameter right before the closing paren / `{`.
+        // 5. ntid.x/y calls became the identity-ors and the signature gained
+        //    the three kernarg parameters right before the closing paren / `{`.
         assert!(out.contains("  %v3.i = or i32 %ntid_x, 0\n"));
+        assert!(out.contains("  %v4.i2 = or i32 %ntid_y, 0\n"));
         assert!(out.contains(
-            "ptr nofree writeonly captures(address_is_null) %v2, i64 %v3, i32 %ntid_x) #0 {"
+            "ptr nofree writeonly captures(address_is_null) %v2, i64 %v3, i32 %ntid_x, i32 %ntid_y, i32 %ntid_z) #0 {"
         ));
-        // 6. ntid/nctaid y|z became constant 1.
-        assert!(out.contains("  %v4.i2 = or i32 0, 1\n"));
+        // 6. only the nctaid z read folded to constant 1 (ntid y/z are
+        //    kernargs now — 3-D block shapes need the real values).
         assert!(out.contains("  %v5.i = or i32 0, 1\n"));
+        assert_eq!(out.matches("= or i32 0, 1\n").count(), 1);
         // 7. rewritten intrinsics' declares are gone…
         assert!(!out.contains("@llvm.nvvm.read.ptx.sreg.ntid.x()"));
         assert!(!out.contains("@llvm.nvvm.read.ptx.sreg.ntid.y()"));
@@ -2101,14 +2121,29 @@ attributes #2 = { convergent }
     }
 
     #[test]
-    fn defines_without_ntid_are_untouched() {
+    fn every_kernel_gains_the_three_ntid_params() {
+        // The launchers push blockDim.0/.1/.2 unconditionally on the gfx path,
+        // so every amdgpu_kernel signature is extended to match — including
+        // kernels that read no ntid at all (a reference-only rule would
+        // misalign the whole kernarg tail for subset readers).
         let ll = "\
 define amdgpu_kernel void @other(ptr %p) #0 {
 entry:
   ret void
 }
 ";
-        assert_eq!(rewrite_ir_for_amdgcn(ll).unwrap(), ll);
+        let out = rewrite_ir_for_amdgcn(ll).unwrap();
+        assert!(out.contains("@other(ptr %p, i32 %ntid_x, i32 %ntid_y, i32 %ntid_z) #0 {"));
+        // non-kernel defines without ntid references stay untouched
+        let ll2 = "\
+define hidden i32 @helper() #0 {
+entry:
+  ret i32 7
+}
+";
+        assert!(rewrite_ir_for_amdgcn(ll2)
+            .unwrap()
+            .contains("define hidden i32 @helper() #0 {"));
     }
 
     #[test]
@@ -2123,7 +2158,9 @@ entry:
 }
 ";
         let out = rewrite_ir_for_amdgcn(ll).unwrap();
-        assert!(out.contains("@k(ptr captures(none) %v0, i32 %ntid_x) #0 {"));
+        assert!(out.contains(
+            "@k(ptr captures(none) %v0, i32 %ntid_x, i32 %ntid_y, i32 %ntid_z) #0 {"
+        ));
     }
 
     #[test]
@@ -2142,7 +2179,9 @@ entry:
 ";
         let out = rewrite_ir_for_amdgcn(ll).unwrap();
         assert!(out.contains("= or i32 %ntid_x, 0"));
-        assert!(out.contains("define hidden i32 @helper(i32 %ntid_x) #0 {"));
+        assert!(out.contains(
+            "define hidden i32 @helper(i32 %ntid_x, i32 %ntid_y, i32 %ntid_z) #0 {"
+        ));
     }
 
     #[test]
@@ -2181,7 +2220,17 @@ entry:
   ret void
 }
 ";
-        assert_eq!(rewrite_ir_for_amdgcn(ll).unwrap(), ll);
+        // The alloca rewrite is a no-op; the only change is the Step-5
+        // unconditional kernarg extension.
+        let expected = "\
+define amdgpu_kernel void @k(i32 %ntid_x, i32 %ntid_y, i32 %ntid_z) #0 {
+entry:
+  %buf = alloca [16 x i32], align 4, addrspace(5)
+  %g = addrspacecast ptr addrspace(5) %buf to ptr
+  ret void
+}
+";
+        assert_eq!(rewrite_ir_for_amdgcn(ll).unwrap(), expected);
     }
 
     #[test]
@@ -2594,7 +2643,16 @@ entry:
   ret void
 }
 ";
-        assert_eq!(rewrite_ir_for_amdgcn(ll).unwrap(), ll);
+        // No mbarrier rewrite; the only change is the Step-5 unconditional
+        // kernarg extension.
+        let expected = "\
+define amdgpu_kernel void @k(ptr %v0, i32 %ntid_x, i32 %ntid_y, i32 %ntid_z) #1 {
+entry:
+  store i32 1, ptr %v0, align 4
+  ret void
+}
+";
+        assert_eq!(rewrite_ir_for_amdgcn(ll).unwrap(), expected);
     }
 
     // ---- [PORT gfx1030 PhaseB.3] atomics (Step 12/12d) -------------------
