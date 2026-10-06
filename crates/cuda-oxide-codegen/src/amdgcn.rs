@@ -825,6 +825,331 @@ fn expand_idp2a(idp: &IdpLine<'_>) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// [PORT gfx1030 Stage3-4] mbarrier → software single-word i64 state machine
+// (Step 16), ported from tests/translate_amdgcn.py (RDNA2 has no mbarrier
+// hardware; the barrier example's three kernels — whole-group sync, LDS
+// neighbor read, noComplete split — passed E2E on gfx1030 with 20/20
+// stability, verified by the predecessor in phase1.md).
+//
+// NV semantics: an mbarrier is a 64-bit LDS state object; arrive atomically
+// decrements the count, and the thread observing pending==1 completes the
+// phase (reset pending, bump phase); wait tests the phase field against the
+// token returned by arrive; .noComplete decrements without completing;
+// inval ends the object's lifetime.
+//
+// Software design (single-word state, same layout reasoning as the Barrier
+// hardware description — one atomic word eliminates the count/phase race a
+// two-word side-car has at phase boundaries):
+//   bit [31:0]  pending   outstanding arrivals
+//   bit [47:32] expected  the init count (≤ 2^16-1; CUDA block ≤ 1024 — a
+//                         documented narrowing of PTX's 2^20)
+//   bit [63:48] phase     phase counter (the token; 16 bits — strictly
+//                         stronger than the hardware 1-bit parity)
+// Mapping per production shape:
+//   init.shared(ptr, n)  → whole-word atomic store (n<<32)|n (phase=0)
+//   arrive.shared(ptr)   → workgroup fence (release: prior ordinary LDS
+//                          stores become visible to waiters — the Step-14
+//                          proven pattern) + atomicrmw sub 1; the unique
+//                          pending==1 observer completes the phase; token =
+//                          old phase field
+//   arrive.noComplete(n) → atomicrmw sub n, no completion write (PTX valid
+//                          usage: count < pending; beyond that = UB, same
+//                          as NV)
+//   test_wait (PTX asm)  → one volatile seq_cst i64 load, compare phase
+//                          field ≠ token, return i32 0/1 (matches the asm
+//                          result type: trunc-to-i1 and and-1 uses both
+//                          work). The predicate must stay NON-blocking —
+//                          an internal spin deadlocks the noComplete split
+//                          mode where test_wait legitimately returns false
+//                          (GPU-proven lesson, kept from the Python port).
+//   inval.shared(ptr)    → call line deleted (no-op: software init rewrites
+//                          the whole word, covering inval's lifetime pass)
+// Not supported (documented): expect_tx byte-transaction counting (TMA
+// territory; RDNA2 has no async copy — vmcnt partial draining is the right
+// path there, mbarrier here only carries arrival sync).
+// Compile probe (gfx1030 llc, /tmp probe from the Python port):
+// ds_sub_rtn_u64 / ds_write_b64 / ds_read_b64 / s_barrier /
+// fence→s_waitcnt lgkmcnt(0) all accepted; GPU numbers above.
+// ---------------------------------------------------------------------------
+
+/// The mbarrier test_wait PTX-asm body (exact production text — the regex
+/// anchor in the script).
+const MB_TEST_WAIT_ASM_BODY: &str =
+    "{ .reg .pred %p0; mbarrier.test_wait.shared.b64 %p0, [$1], $2; selp.b32 $0, 1, 0, %p0; }";
+
+/// `ptr addrspace(3) [<attrs>]* <symbol>` → symbol (the script's `_MB_PTR_OP`).
+fn mb_shared_ptr_operand(arg: &str) -> Option<&str> {
+    let mut rest = arg.trim().strip_prefix("ptr addrspace(3) ")?;
+    loop {
+        if let Some(r) = rest.strip_prefix("nonnull ") {
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("noundef ") {
+            rest = r;
+        } else {
+            break;
+        }
+    }
+    let sym = rest.trim();
+    (sym.starts_with('@') || sym.starts_with('%')).then_some(sym)
+}
+
+/// Tail after an mbarrier intrinsic's `(`: one shared-pointer argument plus
+/// one `i32` operand, attribute tail checked after `)`.
+fn mb_ptr_count_args(rest: &str) -> Option<(&str, &str)> {
+    let close = rest.rfind(')')?;
+    if !is_attrs_tail(&rest[close + 1..]) {
+        return None;
+    }
+    let parts = split_top_level_commas(&rest[..close]);
+    if parts.len() != 2 || !parts[1].trim().starts_with("i32 ") {
+        return None;
+    }
+    Some((mb_shared_ptr_operand(parts[0])?, arg_operand(parts[1])?))
+}
+
+/// Tail after an mbarrier intrinsic's `(`: a single shared-pointer argument,
+/// attribute tail checked after `)`.
+fn mb_ptr_args(rest: &str) -> Option<&str> {
+    let close = rest.rfind(')')?;
+    if !is_attrs_tail(&rest[close + 1..]) {
+        return None;
+    }
+    let parts = split_top_level_commas(&rest[..close]);
+    if parts.len() != 1 {
+        return None;
+    }
+    mb_shared_ptr_operand(parts[0])
+}
+
+/// One recognized mbarrier call line (the five production shapes).
+enum MbLine<'a> {
+    Init {
+        indent: &'a str,
+        ptr: &'a str,
+        count: &'a str,
+    },
+    Arrive {
+        indent: &'a str,
+        res: &'a str,
+        ptr: &'a str,
+    },
+    ArriveNoComplete {
+        indent: &'a str,
+        res: &'a str,
+        ptr: &'a str,
+        count: &'a str,
+    },
+    Inval,
+    TestWait {
+        indent: &'a str,
+        res: &'a str,
+        ptr: &'a str,
+        token: &'a str,
+    },
+}
+
+fn match_mb_line(line: &str) -> Option<MbLine<'_>> {
+    let indent_len = line.len() - line.trim_start().len();
+    let indent = &line[..indent_len];
+    let body = line[indent_len..].trim_start();
+
+    if let Some(call) = strip_call_prefix(body) {
+        if let Some(rest) = call.strip_prefix("void @llvm.nvvm.mbarrier.init.shared(") {
+            let (ptr, count) = mb_ptr_count_args(rest)?;
+            return Some(MbLine::Init { indent, ptr, count });
+        }
+        if call.starts_with("void @llvm.nvvm.mbarrier.inval.shared(")
+            && mb_ptr_args(&call["void @llvm.nvvm.mbarrier.inval.shared(".len()..]).is_some()
+        {
+            return Some(MbLine::Inval);
+        }
+    }
+
+    // Value forms carry `%res = ...` (assignment shape only — a valueless
+    // i64/i32 call keeps its nvvm form for llc to reject explicitly).
+    let (res, rhs) = match split_assign(line) {
+        Some((_, res, rhs)) => (res, rhs),
+        None => return None,
+    };
+    let call = strip_call_prefix(rhs)?;
+    if let Some(rest) =
+        call.strip_prefix("i64 @llvm.nvvm.mbarrier.arrive.noComplete.shared(")
+    {
+        let (ptr, count) = mb_ptr_count_args(rest)?;
+        return Some(MbLine::ArriveNoComplete {
+            indent,
+            res,
+            ptr,
+            count,
+        });
+    }
+    if let Some(rest) = call.strip_prefix("i64 @llvm.nvvm.mbarrier.arrive.shared(") {
+        let ptr = mb_ptr_args(rest)?;
+        return Some(MbLine::Arrive { indent, res, ptr });
+    }
+    if let Some((ty, asm_body, constraint, args)) = match_typed_asm_call(call) {
+        if ty == "i32" && asm_body == MB_TEST_WAIT_ASM_BODY && constraint == "=r,l,l,~{memory}" {
+            let parts = split_top_level_commas(args);
+            if parts.len() == 2 && parts[1].trim().starts_with("i64 ") {
+                if let (Some(ptr), Some(token)) =
+                    (mb_shared_ptr_operand(parts[0]), arg_operand(parts[1]))
+                {
+                    return Some(MbLine::TestWait {
+                        indent,
+                        res,
+                        ptr,
+                        token,
+                    });
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The helper module text appended once per module when any mbarrier is
+/// rewritten. Byte-parity with the Python `_MB_HELPERS` (GPU-verified IR).
+const MB_HELPERS: &str = r#"
+
+; [PORT gfx1030] 软件 mbarrier 状态机 helper（状态住对象自身 8 字节，无新增
+; LDS 全局量；位域注释见各函数头。LDS 不可静态初始化 → 对象初始为 undef，
+; 首次 init 整字写入后才有定义——与 NV "init 必须先于任何 arrive/wait 且须
+; 有组内同步发布" 契约一致）
+
+define internal void @__port_mb_init(ptr addrspace(3) %bar, i32 %count) nounwind {
+; state = {pending: count, expected: count, phase: 0}
+entry:
+  %c64 = zext i32 %count to i64
+  %c64.hi = shl i64 %c64, 32
+  %state = or i64 %c64.hi, %c64
+  store atomic i64 %state, ptr addrspace(3) %bar seq_cst, align 8
+  ret void
+}
+
+define internal i64 @__port_mb_arrive(ptr addrspace(3) %bar) nounwind {
+; release 栅栏 + 递减；唯一 pending==1 观察者补完成写；token = 旧相位
+entry:
+  fence syncscope("workgroup") seq_cst
+  %old = atomicrmw sub ptr addrspace(3) %bar, i64 1 seq_cst
+  %pend = and i64 %old, 4294967295
+  %last = icmp eq i64 %pend, 1
+  br i1 %last, label %release, label %out
+
+release:
+  %exp.sh = lshr i64 %old, 32
+  %exp = and i64 %exp.sh, 65535
+  %ph.sh = lshr i64 %old, 48
+  %ph = and i64 %ph.sh, 65535
+  %ph1 = add i64 %ph, 1
+  %ph1.sh = shl i64 %ph1, 48
+  %exp.sh2 = shl i64 %exp, 32
+  %t = or i64 %ph1.sh, %exp.sh2
+  %new = or i64 %t, %exp
+  store atomic i64 %new, ptr addrspace(3) %bar seq_cst, align 8
+  br label %out
+
+out:
+  %tok.sh = lshr i64 %old, 48
+  %tok = and i64 %tok.sh, 65535
+  ret i64 %tok
+}
+
+define internal i64 @__port_mb_arrive_nc(ptr addrspace(3) %bar, i32 %count) nounwind {
+; .noComplete：只递减、永不补完成写（count < pending 为 PTX valid usage）
+entry:
+  fence syncscope("workgroup") seq_cst
+  %c64 = zext i32 %count to i64
+  %old = atomicrmw sub ptr addrspace(3) %bar, i64 %c64 seq_cst
+  %tok.sh = lshr i64 %old, 48
+  %tok = and i64 %tok.sh, 65535
+  ret i64 %tok
+}
+
+define internal i32 @__port_mb_test_wait(ptr addrspace(3) %bar, i64 %token) nounwind {
+; 非阻塞单次测试（PTX mbarrier.test_wait 语义 = 谓词而非等待；阻塞语义由
+; 调用方的 while(!test_wait) 循环承担——Rust mbarrier_wait 的源码形态）。
+; volatile + seq_cst：外提禁令（helper 被内联时防自旋读被提出循环）+ acquire。
+; GPU 实证教训：首版把 helper 写成内部自旋，noComplete 分裂模式
+; （test_wait 期望立即返回 false）死锁——谓词必须非阻塞。
+entry:
+  %cur = load atomic volatile i64, ptr addrspace(3) %bar seq_cst, align 8
+  %cur.sh = lshr i64 %cur, 48
+  %cur.ph = and i64 %cur.sh, 65535
+  %done = icmp ne i64 %cur.ph, %token
+  %done32 = zext i1 %done to i32
+  ret i32 %done32
+}
+"#;
+
+/// Step 16 driver: rewrite the five production mbarrier shapes into the
+/// software state-machine helpers, keeping every SSA result name (downstream
+/// uses untouched); inval lines are deleted. Idempotent: the rewritten output
+/// matches none of the five shapes, and the helpers-exists guard prevents
+/// double appends.
+fn rewrite_mbarriers(ll: &str) -> String {
+    if !ll.contains("mbarrier") {
+        return ll.to_string();
+    }
+    let mut out: Vec<String> = Vec::with_capacity(ll.lines().count());
+    let mut changed = false;
+    for line in ll.lines() {
+        match match_mb_line(line) {
+            Some(MbLine::TestWait {
+                indent,
+                res,
+                ptr,
+                token,
+            }) => {
+                out.push(format!(
+                    "{indent}{res} = call i32 @__port_mb_test_wait(ptr addrspace(3) {ptr}, i64 {token})"
+                ));
+                changed = true;
+            }
+            Some(MbLine::Init { indent, ptr, count }) => {
+                out.push(format!(
+                    "{indent}call void @__port_mb_init(ptr addrspace(3) {ptr}, i32 {count})"
+                ));
+                changed = true;
+            }
+            Some(MbLine::ArriveNoComplete {
+                indent,
+                res,
+                ptr,
+                count,
+            }) => {
+                out.push(format!(
+                    "{indent}{res} = call i64 @__port_mb_arrive_nc(ptr addrspace(3) {ptr}, i32 {count})"
+                ));
+                changed = true;
+            }
+            Some(MbLine::Arrive { indent, res, ptr }) => {
+                out.push(format!(
+                    "{indent}{res} = call i64 @__port_mb_arrive(ptr addrspace(3) {ptr})"
+                ));
+                changed = true;
+            }
+            Some(MbLine::Inval) => {
+                // no-op: the software init rewrites the whole word (semantics
+                // argument in the block comment)
+                changed = true;
+            }
+            None => out.push(line.to_string()),
+        }
+    }
+    let mut text = out.join("\n");
+    // Guards against the INPUT text (like the script): the rewritten call
+    // sites themselves contain the helper names, so checking the output here
+    // would skip the append.
+    if changed && !ll.contains("@__port_mb_init(ptr addrspace(3)") {
+        text.push_str(MB_HELPERS);
+    }
+    if ll.ends_with('\n') && !text.is_empty() {
+        text.push('\n');
+    }
+    text
+}
+
+// ---------------------------------------------------------------------------
 // [PORT gfx1030 PhaseB.3] atomics family (Step 12/12d), ported from
 // tests/translate_amdgcn.py (GPU-verified: is.* classification, generic
 // fetch_add + fences, MP litmus release→acquire 200 rounds).
@@ -1576,6 +1901,12 @@ pub fn rewrite_ir_for_amdgcn(ll: &str) -> Result<String, String> {
         "llvm.nvvm.idp4a.u.u",
         "llvm.nvvm.idp2a.s.s",
         "llvm.nvvm.idp2a.u.u",
+        // [PORT gfx1030 Stage3-4] mbarrier (software state machine; test_wait
+        // is PTX asm, not an intrinsic, so it has no declare here)
+        "llvm.nvvm.mbarrier.init.shared",
+        "llvm.nvvm.mbarrier.arrive.shared",
+        "llvm.nvvm.mbarrier.arrive.noComplete.shared",
+        "llvm.nvvm.mbarrier.inval.shared",
         // [PORT gfx1030 PhaseB.3] address classification + memory fences
         "llvm.nvvm.isspacep.local",
         "llvm.nvvm.isspacep.shared",
@@ -1620,6 +1951,10 @@ pub fn rewrite_ir_for_amdgcn(ll: &str) -> Result<String, String> {
     //     bystander warps), then 15: libdevice __nv_* → ocml __ocml_*.
     text = rewrite_counted_barriers(&text);
     text = rewrite_ocml(&text);
+    // 16. [PORT gfx1030 Stage3-4] mbarrier → software single-word i64 state
+    //     machine (RDNA2 has no mbarrier hardware; a direct mapping is
+    //     impossible and the software machine is the GPU-verified fallback).
+    text = rewrite_mbarriers(&text);
     Ok(text)
 }
 
@@ -2191,6 +2526,75 @@ entry:
         assert!(out.contains("llvm.nvvm.idp4a.s.u"));
         assert!(out.contains("llvm.nvvm.idp2a.s.s"));
         assert!(!out.contains("sdot4"));
+    }
+
+    // ---- [PORT gfx1030 Stage3-4] mbarrier (Step 16) ----------------------
+
+    /// Shape of the barrier example in post-`opt` output (the fixture shape
+    /// tests/test_gfx1030.py::test_ir_translate_mbarrier GPU-verified with
+    /// 20/20 stability: whole-group sync, LDS neighbor read, noComplete
+    /// split).
+    const SAMPLE_MBARRIER_LL: &str = "\
+declare void @llvm.nvvm.mbarrier.init.shared(ptr addrspace(3), i32) #1
+declare i64 @llvm.nvvm.mbarrier.arrive.shared(ptr addrspace(3)) #1
+declare i64 @llvm.nvvm.mbarrier.arrive.noComplete.shared(ptr addrspace(3), i32) #1
+declare void @llvm.nvvm.mbarrier.inval.shared(ptr addrspace(3)) #1
+
+define amdgpu_kernel void @mb_probe(ptr %v0, i32 %n) #1 {
+entry:
+  tail call void @llvm.nvvm.mbarrier.init.shared(ptr addrspace(3) @bar, i32 %n) #4
+  %tok = tail call i64 @llvm.nvvm.mbarrier.arrive.shared(ptr addrspace(3) @bar) #4
+  %r = tail call i32 asm sideeffect \"{ .reg .pred %p0; mbarrier.test_wait.shared.b64 %p0, [$1], $2; selp.b32 $0, 1, 0, %p0; }\", \"=r,l,l,~{memory}\"(ptr addrspace(3) @bar, i64 %tok) #3
+  store i32 %r, ptr %v0, align 4
+  %nc = tail call i64 @llvm.nvvm.mbarrier.arrive.noComplete.shared(ptr addrspace(3) @bar, i32 4) #4
+  tail call void @llvm.nvvm.mbarrier.inval.shared(ptr addrspace(3) @bar) #4
+  ret void
+}
+";
+
+    #[test]
+    fn mbarriers_map_to_software_state_machine() {
+        let out = rewrite_ir_for_amdgcn(SAMPLE_MBARRIER_LL).unwrap();
+        assert!(!out.contains("llvm.nvvm"), "mbarrier residue");
+        assert!(
+            !out.contains("mbarrier.test_wait.shared.b64"),
+            "test_wait asm residue"
+        );
+        // init/arrive/noComplete/wait replaced, results keep SSA names
+        assert!(out.contains("call void @__port_mb_init(ptr addrspace(3) @bar, i32 %n)"));
+        assert!(out.contains("%tok = call i64 @__port_mb_arrive(ptr addrspace(3) @bar)"));
+        assert!(out.contains(
+            "%r = call i32 @__port_mb_test_wait(ptr addrspace(3) @bar, i64 %tok)"
+        ));
+        assert!(out.contains("%nc = call i64 @__port_mb_arrive_nc(ptr addrspace(3) @bar, i32 4)"));
+        // inval line deleted (no replacement), downstream uses untouched
+        assert!(out.contains("store i32 %r, ptr %v0, align 4"));
+        // the four helpers are appended exactly once
+        assert_eq!(out.matches("define internal void @__port_mb_init").count(), 1);
+        assert_eq!(out.matches("define internal i64 @__port_mb_arrive(").count(), 1);
+        assert_eq!(out.matches("define internal i64 @__port_mb_arrive_nc").count(), 1);
+        assert_eq!(out.matches("define internal i32 @__port_mb_test_wait").count(), 1);
+        // the wait predicate must be non-blocking: no spin loop in the helper
+        assert!(out.contains("load atomic volatile i64, ptr addrspace(3) %bar"));
+    }
+
+    #[test]
+    fn mbarrier_rewrite_is_idempotent() {
+        let once = rewrite_ir_for_amdgcn(SAMPLE_MBARRIER_LL).unwrap();
+        let twice = rewrite_ir_for_amdgcn(&once).unwrap();
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn modules_without_mbarriers_are_untouched_by_step16() {
+        let ll = "\
+define amdgpu_kernel void @k(ptr %v0) #1 {
+entry:
+  store i32 1, ptr %v0, align 4
+  ret void
+}
+";
+        assert_eq!(rewrite_ir_for_amdgcn(ll).unwrap(), ll);
     }
 
     // ---- [PORT gfx1030 PhaseB.3] atomics (Step 12/12d) -------------------
