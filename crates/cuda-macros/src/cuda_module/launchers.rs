@@ -520,10 +520,16 @@ fn generate_cuda_module_prepared_launch_method(kernel: &CudaModuleKernel) -> Tok
 /// is a token stream the callers hoist into a `let` before their `quote!`.
 fn cuda_module_async_ntid_append(launch: impl ToTokens, config_expr: impl ToTokens) -> TokenStream2 {
     let ntid_x = internal_ident("__cuda_oxide_ntid_x");
+    let ntid_y = internal_ident("__cuda_oxide_ntid_y");
+    let ntid_z = internal_ident("__cuda_oxide_ntid_z");
     quote! {
         if ::cuda_host::launch::amdgcn_ntid_append_active() {
             let #ntid_x: u32 = #config_expr.block_dim.0;
+            let #ntid_y: u32 = #config_expr.block_dim.1;
+            let #ntid_z: u32 = #config_expr.block_dim.2;
             #launch.push_scalar_arg(#ntid_x);
+            #launch.push_scalar_arg(#ntid_y);
+            #launch.push_scalar_arg(#ntid_z);
         }
     }
 }
@@ -1291,21 +1297,31 @@ fn cuda_module_launch_call(kernel: &CudaModuleKernel) -> TokenStream2 {
     let stream = internal_ident("__cuda_oxide_stream");
     let config = internal_ident("__cuda_oxide_config");
     let args = internal_ident("__cuda_oxide_args");
-    // [PORT gfx1030 Stage2.b] amdgcn kernels get their `blockDim.x` reads
-    // rewritten into a trailing `i32 ntid_x` kernel parameter (AMDGPU has no
-    // blockDim sreg; cuda-oxide-codegen/src/amdgcn.rs prep pass step 5), so
-    // the host must supply it as the last launch argument. Appended before
-    // every generated sync launch; the driver consumes only the
-    // metadata-defined prefix of the parameter array, so kernels compiled
-    // without the extra parameter ignore the slot. Async launch builders are
-    // not covered yet (known Stage 2 leftover).
+    // [PORT gfx1030 Stage2.b] amdgcn kernels get their `blockDim.{x,y,z}`
+    // reads rewritten into trailing `i32 ntid_{x,y,z}` kernel parameters
+    // (AMDGPU has no blockDim sreg; cuda-oxide-codegen/src/amdgcn.rs prep
+    // pass step 5), so the host must supply all three as the last launch
+    // arguments. Appended before every generated sync launch; the driver
+    // consumes only the metadata-defined prefix of the parameter array, so
+    // kernels compiled without the extra parameters ignore the slots. The
+    // x/y/z generalization covers the #1311 3-D block shapes.
     let ntid_x = internal_ident("__cuda_oxide_ntid_x");
+    let ntid_y = internal_ident("__cuda_oxide_ntid_y");
+    let ntid_z = internal_ident("__cuda_oxide_ntid_z");
     let ntid_append = quote! {
         #[allow(unused_mut, unused_variables)]
         let mut #ntid_x: u32 = 0;
+        #[allow(unused_mut, unused_variables)]
+        let mut #ntid_y: u32 = 0;
+        #[allow(unused_mut, unused_variables)]
+        let mut #ntid_z: u32 = 0;
         if ::cuda_host::launch::amdgcn_ntid_append_active() {
             #ntid_x = #config.block_dim.0;
+            #ntid_y = #config.block_dim.1;
+            #ntid_z = #config.block_dim.2;
             #args.push(::core::ptr::addr_of_mut!(#ntid_x) as *mut ::std::ffi::c_void);
+            #args.push(::core::ptr::addr_of_mut!(#ntid_y) as *mut ::std::ffi::c_void);
+            #args.push(::core::ptr::addr_of_mut!(#ntid_z) as *mut ::std::ffi::c_void);
         }
     };
     let cluster_dim = kernel.cluster_dim.map(|(x, y, z)| quote! { (#x, #y, #z) });

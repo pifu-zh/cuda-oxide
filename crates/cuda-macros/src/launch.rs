@@ -675,17 +675,20 @@ pub(crate) fn expand_cuda_launch_async(input: CudaLaunchAsyncInput) -> TokenStre
         })
         .collect();
 
-    // [PORT gfx1030 PhaseB.1] amdgcn kernels get their `blockDim.x` reads
-    // rewritten into a trailing `i32 ntid_x` kernel parameter (AMDGPU has no
-    // blockDim sreg; cuda-oxide-codegen/src/amdgcn.rs prep pass step 5), so
-    // the async builder must supply it as the last launch argument, after
-    // every kernel argument. Appended only when the gfx routing is active;
-    // the driver consumes only the metadata-defined prefix of the parameter
-    // array, so kernels compiled without the extra parameter ignore the
-    // slot. Mirrors the generated sync launchers (Stage 2.b).
+    // [PORT gfx1030 PhaseB.1] amdgcn kernels get their `blockDim.{x,y,z}`
+    // reads rewritten into trailing `i32 ntid_{x,y,z}` kernel parameters
+    // (AMDGPU has no blockDim sreg; cuda-oxide-codegen/src/amdgcn.rs prep
+    // pass step 5), so the async builder must supply all three as the last
+    // launch arguments, after every kernel argument. Appended only when the
+    // gfx routing is active; the driver consumes only the metadata-defined
+    // prefix of the parameter array, so kernels compiled without the extra
+    // parameters ignore the slots. Mirrors the generated sync launchers
+    // (Stage 2.b; x/y/z generalization for the #1311 3-D block shapes).
     let ntid_append = quote! {
         if ::cuda_host::launch::amdgcn_ntid_append_active() {
             #launch_ident.push_scalar_arg(#config.block_dim.0);
+            #launch_ident.push_scalar_arg(#config.block_dim.1);
+            #launch_ident.push_scalar_arg(#config.block_dim.2);
         }
     };
 
