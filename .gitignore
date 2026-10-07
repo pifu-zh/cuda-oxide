@@ -24,7 +24,6 @@ target/
 .codex/
 .codex-work/
 .agents/
-AGENTS.md
 .mcp/
 
 # Internal design notes are maintained out-of-band (see cuda-oxide-book/ for the published book).
