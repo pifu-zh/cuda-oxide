@@ -27,7 +27,8 @@
 #     探针 crate 在 /tmp 下构建时仓库 .cargo/config.toml alias 不生效）
 #   - ~/opt/cuda13（CUDA_TOOLKIT_PATH；device-only 构建不触发 toolkit 探测，仅为与
 #     phase1 验收命令保持一致）
-#   - docker 容器 zhuo：hipcc + ld.lld + ROCm runtime（GPU 验证在其中执行）
+#   - docker 容器 zhuo（原 phase1 路径）或宿主机 /opt/rocm（hipcc + ld.lld，
+#     2026-09 起宿主可直接执行 GPU——两者缺一时自动回退到另一个）
 #   - pytest：pip3 install --user pytest
 #
 # 运行：
@@ -173,6 +174,50 @@ def _docker_available() -> bool:
     return _run(["docker", "info"]).returncode == 0 and _run(
         ["docker", "exec", DOCKER_CONTAINER, "true"]
     ).returncode == 0
+
+
+HOST_ROCM = Path("/opt/rocm")
+
+
+def _host_rocm_available() -> bool:
+    """宿主机直跑回退：hipcc + ld.lld 在位即认为可用（2026-09 起宿主进程
+    可直接执行 GPU：/opt/rocm + /dev/kfd ACL）。"""
+    return (HOST_ROCM / "bin" / "hipcc").exists() and (
+        HOST_ROCM / "llvm" / "bin" / "ld.lld"
+    ).exists()
+
+
+def _link_compile_run(workdir, co_name, linked_name, host_cpp, bin_name,
+                      timeout=300):
+    """ld.lld -shared → hipcc host 探针 → 运行。
+
+    容器可用走容器（phase1 原路径）；否则回退宿主机 ROCm 工具链。
+    host_cpp 内的 @CO_PATH@ 用相对文件名（两种模式下 cwd 都在产物目录）。
+    """
+    cmds = (
+        "set -e; cd {wd}; "
+        "ld.lld -shared {co} -o {linked}; "
+        "hipcc -O2 --offload-arch=gfx1030 {cpp} -o {bin}; "
+        "timeout 60 ./{bin}"
+    ).format(wd=workdir, co=co_name, linked=linked_name,
+             cpp=host_cpp.name, bin=bin_name)
+    if _docker_available():
+        return _run(["docker", "exec", DOCKER_CONTAINER, "bash", "-c", cmds],
+                    timeout=timeout)
+    env = dict(
+        os.environ,
+        PATH=f"{HOST_ROCM}/bin:{HOST_ROCM}/llvm/bin:{os.environ.get('PATH', '')}",
+        LD_LIBRARY_PATH=(
+            f"{HOST_ROCM}/lib:{os.environ.get('LD_LIBRARY_PATH', '')}"),
+    )
+    # [PORT gfx1030][goal 2026-10-20] ROCm 10.1 本机安装不带 HIP 开发头
+    # （amdrocm-runtime-dev10.1 拆包落在 ~/opt/rocm-headers/hip）——CPATH 让
+    # hipcc 的 clang 找到 <hip/hip_runtime.h>，不动系统目录。
+    user_hip_headers = Path.home() / "opt" / "rocm-headers"
+    if user_hip_headers.is_dir():
+        env["CPATH"] = (
+            f"{user_hip_headers}:{os.environ.get('CPATH', '')}").rstrip(":")
+    return _run(["bash", "-c", cmds], cwd=workdir, env=env, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -821,8 +866,8 @@ def test_gfx1030_device_identity():
 
 def test_vecadd_end_to_end(built_probe):
     """核心回归：Rust kernel 一路到 gfx1030 数值校验 PASS。"""
-    if not _docker_available():
-        pytest.skip(f"docker 容器 {DOCKER_CONTAINER} 不可用")
+    if not _docker_available() and not _host_rocm_available():
+        pytest.skip(f"docker 容器 {DOCKER_CONTAINER} 与宿主机 ROCm 工具均不可用")
     assert _gpu_available(), "rocm-smi 报告 GPU 不可用（GPU down 立即停）"
 
     # -- 改写（用 .opt.ll：与 phase1 golden 同构的 tail-call 形态）----------
@@ -857,21 +902,21 @@ def test_vecadd_end_to_end(built_probe):
     )
     assert co.stat().st_size > 0
 
-    # -- 容器内：ld.lld -shared → hipcc 编 host 探针 → 运行 ----------------
-    docker_cp(co, "vecadd_v5llc.co")
+    # -- 链接/编译/运行（容器路径优先，宿主机直跑回退）----------------------
+    if _docker_available():
+        docker_cp(co, "vecadd_v5llc.co")
+        wd = CONTAINER_WORKDIR
+    else:
+        wd = built_probe.dir
     host_cpp = built_probe.dir / "host_gfx1030_test.cpp"
-    host_cpp.write_text(HOST_PROBE_CPP.replace("@CO_PATH@", f"{CONTAINER_WORKDIR}/vecadd_linked.co"))
-    docker_cp(host_cpp, "host_gfx1030_test.cpp")
+    host_cpp.write_text(HOST_PROBE_CPP.replace("@CO_PATH@", "vecadd_linked.co"))
+    if _docker_available():
+        docker_cp(host_cpp, "host_gfx1030_test.cpp")
 
-    cmds = (
-        "set -e; cd {wd}; "
-        "ld.lld -shared vecadd_v5llc.co -o vecadd_linked.co; "
-        "hipcc -O2 --offload-arch=gfx1030 host_gfx1030_test.cpp -o host_gfx1030_test; "
-        "./host_gfx1030_test"
-    ).format(wd=CONTAINER_WORKDIR)
-    proc = _run(["docker", "exec", DOCKER_CONTAINER, "bash", "-c", cmds], timeout=300)
+    proc = _link_compile_run(wd, "vecadd_v5llc.co", "vecadd_linked.co",
+                             host_cpp, "host_gfx1030_test")
     assert proc.returncode == 0, (
-        f"[阶段 容器内链接/编译/运行] 失败 (rc={proc.returncode})\n"
+        f"[阶段 链接/编译/运行] 失败 (rc={proc.returncode})\n"
         f"--- 关键错误输出 stdout（尾20行）---\n{_tail(proc.stdout)}\n"
         f"--- 关键错误输出 stderr（尾20行）---\n{_tail(proc.stderr)}\n"
         f"--- 环境前提状态 ---\n{_env_diag()}"
@@ -904,8 +949,8 @@ def test_barrier_mbarrier_software(tmp_path):
       barrier_shared_data_test   → mbarrier + LDS 邻居读（out[i]=(i+1)%256）
       barrier_no_complete_test   → noComplete 相位语义（out=[0,1]）
     """
-    if not _docker_available():
-        pytest.skip(f"docker 容器 {DOCKER_CONTAINER} 不可用")
+    if not _docker_available() and not _host_rocm_available():
+        pytest.skip(f"docker 容器 {DOCKER_CONTAINER} 与宿主机 ROCm 工具均不可用")
     assert _gpu_available(), "rocm-smi 报告 GPU 不可用（GPU down 立即停）"
 
     crate_dir = tmp_path / "ox-barrier-e2e"
@@ -941,21 +986,20 @@ def test_barrier_mbarrier_software(tmp_path):
         f"--- 环境前提状态 ---\n{_env_diag()}"
     )
 
-    docker_cp(co, "barrier_v5.co")
+    if _docker_available():
+        docker_cp(co, "barrier_v5.co")
+        wd = CONTAINER_WORKDIR
+    else:
+        wd = crate_dir
     host_cpp = crate_dir / "host_barrier_test.cpp"
-    host_cpp.write_text(
-        HOST_BARRIER_CPP.replace("@CO_PATH@", f"{CONTAINER_WORKDIR}/barrier_linked.co")
-    )
-    docker_cp(host_cpp, "host_barrier_test.cpp")
-    cmds = (
-        "set -e; cd {wd}; "
-        "ld.lld -shared barrier_v5.co -o barrier_linked.co; "
-        "hipcc -O2 --offload-arch=gfx1030 host_barrier_test.cpp -o host_barrier_test; "
-        "timeout 60 ./host_barrier_test"
-    ).format(wd=CONTAINER_WORKDIR)
-    proc = _run(["docker", "exec", DOCKER_CONTAINER, "bash", "-c", cmds], timeout=300)
+    host_cpp.write_text(HOST_BARRIER_CPP.replace("@CO_PATH@", "barrier_linked.co"))
+    if _docker_available():
+        docker_cp(host_cpp, "host_barrier_test.cpp")
+
+    proc = _link_compile_run(wd, "barrier_v5.co", "barrier_linked.co",
+                             host_cpp, "host_barrier_test")
     assert proc.returncode == 0, (
-        f"[阶段 容器内链接/编译/运行] 失败 (rc={proc.returncode})\n"
+        f"[阶段 链接/编译/运行] 失败 (rc={proc.returncode})\n"
         f"--- 关键错误输出 stdout（尾20行）---\n{_tail(proc.stdout)}\n"
         f"--- 关键错误输出 stderr（尾20行）---\n{_tail(proc.stderr)}\n"
         f"--- 环境前提状态 ---\n{_env_diag()}"
