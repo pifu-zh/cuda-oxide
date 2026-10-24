@@ -93,15 +93,22 @@ pub struct HipMemPoolProps {
     pub reserved: [u8; 56],
 }
 
-/// Candidate sonames, tried in order. The host ROCm install ships
-/// `libamdhip64.so.7`; containers commonly expose `.so.1`. `dlopen` searches
-/// the ldconfig cache, so plain sonames suffice.
+/// Candidate sonames, tried in order, then absolute install-path fallbacks.
+/// The host ROCm install ships `libamdhip64.so.7`; containers commonly expose
+/// `.so.1`. `dlopen` searches the ldconfig cache for plain sonames — but
+/// non-ldconfig installs (zip-style `/opt/rocm`, as on the gfx1030 dev host)
+/// have no cache entry, so the standard install locations are appended.
+/// The `CUDA_OXIDE_HIP_LIBRARY` env override still wins over everything here.
 pub const HIP_LIB_NAMES: &[&str] = &[
     "libamdhip64.so.1",
     "libamdhip64.so",
     "libamdhip64.so.7",
     "libamdhip64.so.6",
     "libamdhip64.so.5",
+    // Absolute fallbacks (dlopen accepts absolute paths).
+    "/opt/rocm/lib/libamdhip64.so.7",
+    "/opt/rocm/lib/libamdhip64.so.1",
+    "/opt/rocm/lib64/libamdhip64.so.1",
 ];
 
 unsafe fn get<T: Copy>(lib: &Library, name: &str) -> Result<T, libloading::Error> {

@@ -354,7 +354,7 @@ def _rewrite_shuffle(text: str) -> str:
 
     语义映射（wave64 机器上保持 CUDA 32-lane warp 语义——按 32 对齐段
     切分，段内交换，段外回自身值）：
-      lane  = mbcnt.lo(-1, 0)                ; 0..63
+      lane  = mbcnt.hi(-1, mbcnt.lo(-1, 0))  ; wave64 正确（wave32 下 hi=0）
       seg   = lane & -32                     ; 段基址
       idx   : src = seg + (delta & 31)
       bfly  : src = lane ^ delta             ; delta<32 不跨段
@@ -363,7 +363,7 @@ def _rewrite_shuffle(text: str) -> str:
       off   = src * 4（ds_bpermute 是字节偏移，NV 是 lane 号——本步的
               核心差异点）
       val   : float 经 bitcast 往返，i32 直通
-    结果写回原 SSA 名，下游引用零改动。_laneid 同步映射 mbcnt.lo。
+    结果写回原 SSA 名，下游引用零改动。_laneid 同步映射 mbcnt.lo+hi 两段。
     """
     if "shfl.sync." not in text and "sreg.laneid" not in text:
         return text
@@ -373,9 +373,25 @@ def _rewrite_shuffle(text: str) -> str:
     for line in lines:
         m = _LANEID_RE.match(line)
         if m:
-            lhs = f"{m.group('res')} = " if m.group("res") else ""
-            out.append(f"{m.group('indent')}{lhs}call i32 "
-                       "@llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)")
+            # [PORT gfx1030][review 2026-10-20] wave64 正确的 lane 号需要
+            # lo+hi 两段（wave32 下 hi 恒 0，免费）；此前只用 mbcnt.lo，
+            # lane 32-63 在 wave64 下全部算成 32。
+            ind = m.group("indent")
+            if m.group("res"):
+                r = m.group("res")
+                out.append(f"{ind}{r}.lnlo = call i32 "
+                           "@llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)")
+                out.append(f"{ind}{r} = call i32 "
+                           f"@llvm.amdgcn.mbcnt.hi(i32 -1, i32 {r}.lnlo)")
+            else:
+                # 值未被使用的调用语句（现实产物中不应出现；旧代码此形态
+                # 产出的非赋值 call 本就不合法，llc 会显式拒绝）：给出
+                # lo+hi 两行，名字固定——重复出现会在 llc 处响亮失败。
+                out.append(f"{ind}%__port_laneid_lo = call i32 "
+                           "@llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)")
+                out.append(f"{ind}%__port_laneid = call i32 "
+                           "@llvm.amdgcn.mbcnt.hi(i32 -1, "
+                           "i32 %__port_laneid_lo)")
             continue
         m = _SHFL_RE.match(line)
         if not m:
@@ -434,7 +450,8 @@ def _expand_shfl(m) -> "list[str] | None":
     r = res  # 中间名以 .b_ 标记（NVVM 名不含下划线，避免碰撞）
     L = indent + f"{r}.b_"
 
-    seq = [f"{indent}{r}.b_ln = call i32 @llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)"]
+    seq = [f"{indent}{r}.b_lnlo = call i32 @llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)",
+           f"{indent}{r}.b_ln = call i32 @llvm.amdgcn.mbcnt.hi(i32 -1, i32 {r}.b_lnlo)"]
     if mode == "bfly":
         seq.append(f"{L}src = xor i32 {r}.b_ln, {delta}")
     elif mode == "idx":
@@ -500,7 +517,8 @@ def _rewrite_shfl_asm(text: str) -> str:
         L = ind + f"{res}.b_"
         out.extend(
             [
-                f"{ind}{res}.b_ln = call i32 @llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)",
+                f"{ind}{res}.b_lnlo = call i32 @llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)",
+                f"{ind}{res}.b_ln = call i32 @llvm.amdgcn.mbcnt.hi(i32 -1, i32 {res}.b_lnlo)",
                 f"{L}src = xor i32 {res}.b_ln, {delta}",
                 f"{L}off = shl i32 {L}src, 2",
                 f"{L}lo = trunc i64 {val} to i32",
@@ -551,7 +569,8 @@ def _rewrite_redux_add(text: str) -> str:
             continue
         res, val, ind = m.group("res"), m.group("val"), m.group("indent")
         L = ind + f"{res}.b_"
-        seq = [f"{ind}{res}.b_ln = call i32 @llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)"]
+        seq = [f"{ind}{res}.b_lnlo = call i32 @llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)",
+              f"{ind}{res}.b_ln = call i32 @llvm.amdgcn.mbcnt.hi(i32 -1, i32 {res}.b_lnlo)"]
         cur = val
         for shift in (16, 8, 4, 2, 1):
             seq.append(f"{L}m{shift} = xor i32 {res}.b_ln, {shift}")
@@ -923,7 +942,17 @@ def _rewrite_cb_in_function(body: "list[str]") -> "tuple[list[str], set, bool]":
     for k, line in enumerate(body):
         m = _CB_CALL_RE.match(line)
         if m:
-            ids.add(int(m.group("id")))
+            cb_id = int(m.group("id"))
+            # [review 2026-10-20] 信封：槽位数组是 [16 x i32]，范围外常量 id
+            # 会成为 GEP inbounds 越界——保留 nvvm 调用让 llc 显式拒绝。
+            if 0 <= cb_id < 16:
+                ids.add(cb_id)
+                body[k] = (
+                    f"{m.group('indent')}call void "
+                    f"@__port_cb_{m.group('kind')}"
+                    f"(i32 {m.group('id')}, i32 {m.group('n')})"
+                )
+                changed = True
             body[k] = (
                 f"{m.group('indent')}call void "
                 f"@__port_cb_{m.group('kind')}"
@@ -937,13 +966,11 @@ def _rewrite_cb_in_function(body: "list[str]") -> "tuple[list[str], set, bool]":
     if any(_CB_INIT_MARKER in ln for ln in body):
         return body, ids, changed
 
-    # 注入点：入口 label（define 行后首个 "xxx:" 行）之后的连续 alloca 之后
-    ins = 1
-    while ins < len(body) and not body[ins].rstrip().endswith(":"):
-        ins += 1
-    ins += 1  # 越过 label 行
-    while ins < len(body) and "= alloca " in body[ins]:
-        ins += 1
+    # 注入点：入口块开头。[review 2026-10-20] 只检查 define 后第一行是否为
+    # label——有名入口在其后插入；无名入口（重 opt 后合法常见）第一行已是
+    # 入口指令，直接插。旧的"找首个 label 行"扫描在无名入口时会把 init 注到
+    # 更后面的块里（barrier 跑在 undef LDS 计数器上，静默挂死）。
+    ins = 2 if (len(body) > 1 and body[1].rstrip().endswith(":")) else 1
     init = [_CB_INIT_MARKER + f" (ids: {','.join(map(str, sorted(ids)))})"]
     for cb_id in sorted(ids):
         init.append(

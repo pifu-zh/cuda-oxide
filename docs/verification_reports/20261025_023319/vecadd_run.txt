@@ -1,0 +1,30 @@
+warning: user-defined alias `oxide` is shadowing an external subcommand found at `/home/zhuo/.cargo/bin/cargo-oxide`
+  |
+  = note: this was previously accepted but will become a hard error in the future; see <https://github.com/rust-lang/cargo/issues/10049>
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running `target/debug/cargo-oxide run vecadd`
+Building rustc-codegen-cuda backend...
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.03s
+✓ Backend built: /home/zhuo/workspace/src/cuda-oxide/crates/rustc-codegen-cuda/target/x86_64-unknown-linux-gnu/debug/librustc_codegen_cuda.so
+=========================================
+RUSTC-CODEGEN-CUDA: vecadd
+=========================================
+
+This is the proper cargo workflow:
+  CARGO_ENCODED_RUSTFLAGS=<cuda-oxide flags> cargo run
+
+Building and running vecadd...
+
+   Compiling vecadd v0.1.0 (/home/zhuo/workspace/src/cuda-oxide/crates/rustc-codegen-cuda/examples/vecadd)
+    Finished `release` profile [optimized] target(s) in 0.32s
+     Running `target/release/vecadd`
+=== Unified Compilation Vector Addition ===
+
+Input vectors (first 5 elements):
+  a = [0.0, 1.0, 2.0, 3.0, 4.0]
+  b = [0.0, 2.0, 4.0, 6.0, 8.0]
+
+Output vector (first 5 elements):
+  c = [0.0, 3.0, 6.0, 9.0, 12.0]
+
+✓ SUCCESS: All 1024 elements correct!

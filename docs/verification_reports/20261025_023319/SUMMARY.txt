@@ -1,0 +1,4 @@
+gfx1030 verification report 20261025_023319
+repo: a76b75b7
+PASS gates: 5   FAILED gates: 0
+artifacts in: /tmp/gfx1030_reports/20261025_023319

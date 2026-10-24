@@ -428,7 +428,7 @@ fn discover_amdgcn_lld(
             let candidate = dir.join(name);
             if candidate.is_file()
                 && let Some(found) =
-                    from_candidate(candidate, format!("llvm-tools directory of the resolved llc"))
+                    from_candidate(candidate, "llvm-tools directory of the resolved llc".to_string())
             {
                 return Ok(found);
             }

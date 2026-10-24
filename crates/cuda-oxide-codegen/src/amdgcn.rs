@@ -277,7 +277,7 @@ fn rewrite_allocas_in_function(body: &[&str]) -> Vec<String> {
 // (GPU-verified on gfx1030: four modes × f32/i32 + f64, wave64 32 warps).
 //
 // Semantics (wave64 machines keep CUDA's 32-lane warp semantics via 32-aligned
-// segmentation): lane = mbcnt.lo(-1, 0); seg = lane & -32;
+// segmentation): lane = mbcnt.hi(-1, mbcnt.lo(-1, 0)); seg = lane & -32;
 //   idx : src = seg + (delta & 31)
 //   bfly: src = lane ^ delta            (delta < 32 never crosses a segment)
 //   down: t = (lane&31)+delta; src = t <= 31 ? seg+t : lane
@@ -343,6 +343,43 @@ fn match_shfl_line(line: &str) -> Option<ShflLine<'_>> {
         mask: arg_operand(args[0])?,
         clamp: arg_operand(args[3])?,
     })
+}
+
+/// laneid → the wave64-correct lane id: `mbcnt.lo(-1, 0)` followed by
+/// `mbcnt.hi(-1, lo)` (under wave32 the hi half is 0, so the pair is free;
+/// a lo-only lane computed 32 for every lane 32-63 under wave64). The
+/// original SSA name lands on the hi line, so every downstream use is
+/// untouched. Value-less call statements keep a loud shape (fixed SSA
+/// names; a repeated occurrence fails verification at llc) — production
+/// modules always use the lane id.
+fn rewrite_laneid(ll: &str) -> String {
+    if !ll.contains("sreg.laneid") {
+        return ll.to_string();
+    }
+    let mut out = Vec::with_capacity(ll.lines().count());
+    for line in ll.lines() {
+        let parsed = split_assign(line).and_then(|(indent, res, rhs)| {
+            let call = strip_call_prefix(rhs)?;
+            let attrs = call.strip_prefix("i32 @llvm.nvvm.read.ptx.sreg.laneid()")?;
+            is_attrs_tail(attrs).then_some((indent, res))
+        });
+        match parsed {
+            Some((indent, res)) => {
+                out.push(format!(
+                    "{indent}{res}.lnlo = call i32 @llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)"
+                ));
+                out.push(format!(
+                    "{indent}{res} = call i32 @llvm.amdgcn.mbcnt.hi(i32 -1, i32 {res}.lnlo)"
+                ));
+            }
+            None => out.push(line.to_string()),
+        }
+    }
+    let mut text = out.join("\n");
+    if ll.ends_with('\n') && !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text
 }
 
 /// The Step-10 driver: rewrite every shfl call line whose mask/clamp pair is
@@ -415,9 +452,16 @@ fn expand_shfl(shfl: ShflLine<'_>) -> Vec<String> {
     let mut def = |suffix: &str, rhs: String| {
         seq.push(format!("{indent}{base}{suffix} = {rhs}"));
     };
+    // [PORT gfx1030][review 2026-10-20] wave64-correct lane id needs lo+hi
+    // (under wave32 the hi half is 0, so the pair is free); the previous
+    // lo-only lane computed 32 for every lane 32-63 under wave64.
+    def(
+        "lnlo",
+        "call i32 @llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)".to_string(),
+    );
     def(
         "ln",
-        "call i32 @llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)".to_string(),
+        format!("call i32 @llvm.amdgcn.mbcnt.hi(i32 -1, i32 {base}lnlo)"),
     );
     match mode {
         "bfly" => def("src", format!("xor i32 {base}ln, {delta}")),
@@ -547,8 +591,12 @@ fn expand_shfl_asm(parts: ShflAsmLine<'_>) -> Vec<String> {
         seq.push(format!("{indent}{base}{suffix} = {rhs}"));
     };
     def(
-        "ln",
+        "lnlo",
         "call i32 @llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)".to_string(),
+    );
+    def(
+        "ln",
+        format!("call i32 @llvm.amdgcn.mbcnt.hi(i32 -1, i32 {base}lnlo)"),
     );
     def("src", format!("xor i32 {base}ln, {delta}"));
     def("off", format!("shl i32 {base}src, 2"));
@@ -650,7 +698,10 @@ fn expand_redux_add(rd: ReduxLine<'_>) -> Vec<String> {
     let base = format!("{res}.b_");
     let mut seq = Vec::with_capacity(17);
     seq.push(format!(
-        "{indent}{base}ln = call i32 @llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)"
+        "{indent}{base}lnlo = call i32 @llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)"
+    ));
+    seq.push(format!(
+        "{indent}{base}ln = call i32 @llvm.amdgcn.mbcnt.hi(i32 -1, i32 {base}lnlo)"
     ));
     let mut cur = val.to_string();
     for shift in [16usize, 8, 4, 2, 1] {
@@ -1515,6 +1566,12 @@ fn match_counted_barrier_line(line: &str) -> Option<CountedBarrierLine<'_>> {
     if !is_attrs_tail(tail) {
         return None;
     }
+    // [PORT gfx1030][review 2026-10-20] Envelope: the slot arrays are
+    // [16 x i32]; an out-of-range constant id would be a GEP inbounds OOB —
+    // keep the nvvm call for llc to reject explicitly instead.
+    if !(0..16).contains(&id) {
+        return None;
+    }
     Some(CountedBarrierLine { indent, kind, id, n })
 }
 
@@ -1629,15 +1686,18 @@ fn rewrite_counted_barriers_in_function(body: &[&str]) -> (Vec<String>, bool) {
         return (new_body, true);
     }
     ids.sort_unstable();
-    // Injection point: after the entry label line and any entry allocas.
-    let mut ins = 1;
-    while ins < new_body.len() && !new_body[ins].trim_end().ends_with(':') {
-        ins += 1;
-    }
-    ins += 1; // past the label line
-    while ins < new_body.len() && new_body[ins].contains("= alloca ") {
-        ins += 1;
-    }
+    // [PORT gfx1030][review 2026-10-20] Injection point: start of the entry
+    // block. A named entry prints its label as the first body line — insert
+    // after it; an unnamed entry (legal, common after heavy opt) starts
+    // directly with instructions, so index 1 is already inside the entry
+    // block. The previous scan for the FIRST label line ran past an unnamed
+    // entry block and injected the init into the first LATER block, where
+    // barriers would run on undef LDS counters.
+    let ins = if new_body.len() > 1 && new_body[1].trim_end().ends_with(':') {
+        2
+    } else {
+        1
+    };
     let mut init = vec![format!(
         "{CB_INIT_MARKER} (ids: {})",
         ids.iter()
@@ -1941,12 +2001,12 @@ pub fn rewrite_ir_for_amdgcn(ll: &str) -> Result<String, String> {
     // 8. generic allocas → addrspace(5) + per-alloca addrspacecast at the use
     //    sites (AMDGPU module verifier contract; batch-verified).
     text = rewrite_allocas(&text);
-    // 10. [PORT gfx1030 PhaseB.2] laneid → mbcnt.lo(-1, 0) and the four shfl
-    //     modes → segmented ds_bpermute expansions (byte offset = lane * 4),
-    //     then 10c: the f64 PTX-asm shuffle → double ds_bpermute. Shapes
-    //     outside the supported envelope keep their nvvm call for llc to
-    //     reject explicitly.
-    text = rewrite_calls(&text, "llvm.nvvm.read.ptx.sreg.laneid", "call i32 @llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)").0;
+    // 10. [PORT gfx1030 PhaseB.2] laneid → the wave64-correct mbcnt.lo+hi
+    //     pair, and the four shfl modes → segmented ds_bpermute expansions
+    //     (byte offset = lane * 4), then 10c: the f64 PTX-asm shuffle →
+    //     double ds_bpermute. Shapes outside the supported envelope keep
+    //     their nvvm call for llc to reject explicitly.
+    text = rewrite_laneid(&text);
     text = rewrite_shuffle(&text);
     text = rewrite_shfl_asm(&text);
     // 11. [PORT gfx1030 Stage3-2] redux.sync.add → 5-round xor-butterfly
@@ -2289,8 +2349,9 @@ entry:
         let out = rewrite_ir_for_amdgcn(SAMPLE_SHFL_LL).unwrap();
         // no nvvm residue at all (declares and calls)
         assert!(!out.contains("llvm.nvvm"), "shfl/laneid residue");
-        // laneid → mbcnt.lo with the SSA name kept
-        assert!(out.contains("%lane = call i32 @llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)"));
+        // laneid → the mbcnt.lo+hi pair with the SSA name kept on the hi line
+        assert!(out.contains("%lane.lnlo = call i32 @llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)"));
+        assert!(out.contains("%lane = call i32 @llvm.amdgcn.mbcnt.hi(i32 -1, i32 %lane.lnlo)"));
         // four f32 shuffles → four bitcast round trips; f64 split → two
         // bpermutes per call
         assert_eq!(out.matches("@llvm.amdgcn.ds.bpermute").count(), 4 + 2);

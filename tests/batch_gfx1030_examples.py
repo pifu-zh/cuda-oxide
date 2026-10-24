@@ -186,6 +186,11 @@ def integrated_build(name: str, d: Path, env: dict):
     src = d / "src" / "main.rs"
     if src.exists():
         os.utime(src, None)
+    # [PORT gfx1030][review 2026-10-20] 清掉上一轮遗留的 hsaco：成功判据是
+    # "本次构建退出 0 且 hsaco 存在"，残留文件会把一次没产物的构建认证成
+    # PASS（clean_generated_files 不清理 *.hsaco）。
+    for stale in d.glob("*.hsaco"):
+        stale.unlink()
     env_int = dict(env, CUDA_OXIDE_TARGET="gfx1030")
     proc = run(["cargo", f"+{NIGHTLY}", "oxide", "build"], cwd=d, env=env_int)
     hsacos = list(d.glob("*.hsaco"))
@@ -303,6 +308,14 @@ def main():
         ipass = sum(1 for r in results.values() if r.get("integrated") == "pass")
         summary += f"; integrated hsaco-pass {ipass} / 17"
     print(summary)
+
+    # [PORT gfx1030][review 2026-10-20] 编排层退出码：excluded 不算失败，
+    # 其余任何非 pass（build/llc/residual）都让进程非零——供 CI/脚本门禁
+    # 使用，不再"全失败也 exit 0"。
+    hard_fail = any(
+        r.get("status") not in ("pass", "excluded") for r in results.values()
+    )
+    sys.exit(1 if hard_fail else 0)
 
 
 if __name__ == "__main__":

@@ -55,9 +55,9 @@
 | host-hip 替身 crate（dlopen libamdhip64，204 个被引符号全覆盖） | FULL | [static] 子代理逐符号对账（cuda-core/async 引用面）+ 本机 vecadd/barrier 实跑 | 两处属性映射错行已修（17d9e89b，实机取证） |
 | hipMalloc/Memcpy/Free 基础内存路径 | FULL | [e2e] GPU e2e 即该路径 | — |
 | 属性查询（16 行映射表） | FULL | [probe] 本机 ROCm 10.1 按号直查：74=65536/75=65536/76=131072/77=报错，修复后两行与真值一致；其余行 7.16 容器头+10.1 头双确认 | `scripts/gfx1030_hip_attr_probe.c` 已固化为仓库工件 |
-| sync launch / async builder（cuda_launch_async!、cuda_module 各 9+ 变体） | PARTIAL | [e2e] sync（pytest e2e 用 hipModuleLaunchKernel 同 ABI）；async 编译面全通（9 处 ntid 追加），本机未单独跑 async 运行断言 | async 路径本机 e2e（矩阵跟进项 #2）；sync 原生宏缺 ntid 追加（review P1，待修） |
+| sync launch / async builder（cuda_launch_async!、cuda_module 各 9+ 变体） | PARTIAL | [e2e] sync（pytest e2e 用 hipModuleLaunchKernel 同 ABI）；sync 原生宏 ntid 已随 e1770ba2 补重放覆盖 | async 路径本机 e2e（矩阵跟进项 #2） |
 | stream/event/pool/managed 内存 | NOT TESTED | 符号在表 [static]；本机无运行断言 | 同上，逐面补 e2e |
-| host func / graph / multicast / cluster API | PARTIAL / UNSUPPORTED | v2 host func BLOCKING 违约（review P1）；graph/multicast：RDNA2 无硬件或明示 NOT_SUPPORTED stub [static] | BLOCKING 一行修复即可转 FULL |
+| host func / graph / multicast / cluster API | PARTIAL / UNSUPPORTED | v2 host func BLOCKING 已修（回落 cuLaunchHostFunc，2026-10-20）；graph/multicast：RDNA2 无硬件或明示 NOT_SUPPORTED stub [static] | host func 路径本机 e2e |
 
 ## 5. 线程 / 工作组 / 索引 / 同步 / 共享内存
 
@@ -68,7 +68,7 @@
 | 静态共享内存（LDS，undef 初始化契约） | FULL | [hist] sharedmem 例 GPU PASS；[e2e] pytest alloca/addrspace 测试 | — |
 | mbarrier（软件单字状态机：pending/expected/phase） | FULL | [e2e] 本机 test_barrier_mbarrier_software 三 kernel 语义断言全过（补重放 Step 16 后） | expect_tx 字节级（=vmcnt 部分排空等价）待实现 |
 | counted barrier（LDS 计数器+世代自旋，旁观 warp 安全） | FULL | [hist] 128 线程 wave64 含旁观 warp GPU PASS；[e2e] 本机 pytest IR 断言 | id 常量缺 0..15 范围检查（review P1） |
-| warp shuffle 4 模式 × f32/i32 + f64 asm 拆分 + 动态 mask(up,0) | FULL | [hist] 四模式真卡验证；[e2e] 本机 pytest 全形态 | wave64 下 lane 号错误（mbcnt.lo 单独使用，review P1——被 wave32 默认掩盖） |
+| warp shuffle 4 模式 × f32/i32 + f64 asm 拆分 + 动态 mask(up,0) | FULL | [hist] 四模式真卡验证；[e2e] 本机 pytest 全形态（含 mbcnt.lo+hi 两段 lane 号，wave64 正确） | — |
 | 部分交换（字面 mask≠-1）/ 非 32 宽度 clamp | PARTIAL(信封) | [static] 信封外保留 nvvm 调用让 llc 显式拒绝（fail-loudly 设计，非静默错） | 按需扩信封 |
 
 ## 6. 原子操作 / 内存序 / 数值
@@ -96,7 +96,7 @@
 |---|---|---|---|
 | cargo oxide run/build/pipeline/inspect | FULL | [run] 本机 vecadd/barrier | — |
 | pytest 回归套件（IR 改写 10 + 设备身份 + GPU e2e 2） | FULL | [e2e] 本机 14/14 | docker 容器路径回退宿主机（已入树） |
-| 批量双维度验证（Python 改写管线 / Rust 集成管线） | FULL | [e2e] 本机 14/17+14/17 持平（3 例诚实排除：抽取器限制） | batch 脚本 exit code 恒 0（review P1）；stale hsaco 假 PASS（P1） |
+| 批量双维度验证（Python 改写管线 / Rust 集成管线） | FULL | [e2e] 本机 14/17+14/17 持平（3 例诚实排除：抽取器限制）；exit code + stale hsaco 两处假 PASS 源已修（2026-10-20） | — |
 | 一键验证+报告（scripts/verify_gfx1030.sh） | FULL | 本脚本：环境快照/5 门/汇总，时间戳归档 | 首跑归档随本矩阵提交 |
 | cargo-oxide doctor（工具链自检） | NOT TESTED | llc 解析逻辑存在（CUDA_OXIDE_LLC→rustlib→PATH） | 本机跑一次 doctor |
 | 性能基线（rocprof/带宽/达标率） | NOT TESTED | 历史流程在 gpu-perf skill（主机 ROCm 7.14 时代）；10.1 时代未重建 | Phase D 后续：重建 L4 基线 |
@@ -104,8 +104,7 @@
 
 ## 已知限制与阻塞（跨条目）
 
-1. **wave64 假设**：lane 号展开依赖 wave32 编译默认；任何 wave64 选择会静默错（修复=补 mbcnt.hi，已列入 P1）。
-2. **COv5×驱动耦合**：code object v6 被当前 amdgpu 驱动拒绝（partial 支持陷阱），驱动升级必须复验全套。
+1. **COv5×驱动耦合**：code object v6 被当前 amdgpu 驱动拒绝（partial 支持陷阱），驱动升级必须复验全套。
 3. **docker 缺组**：本机 zhuo 不在 docker 组（`sudo usermod -aG docker zhuo` 可解）；e2e 已回退宿主机直跑，不阻塞。
 4. **无 HIP 头**：ROCm 10.1 本机安装不含开发头；`amdrocm-runtime-dev10.1` 拆包至 `~/opt/rocm-headers/`（CPATH 接入），不动系统目录。
 5. **硬件能力边界**（RDNA2 事实，非缺陷）：无 MFMA/WMMA、无 TMA/TDM、无 cluster/multicast、fp8/fp4 无硬件——对应条目均给出软件等价或显式拒绝路径。
@@ -114,6 +113,6 @@
 
 1. 3-D block launch 的本机 GPU e2e（ntid x/y/z 直验）
 2. async launch 路径本机运行断言
-3. review P1 修复批（dlopen 绝对路径候选 / mbcnt.hi / counted-barrier 注入点+id 范围 / batch exit code+stale hsaco / sync 原生宏 ntid / host func BLOCKING）
+3. ~~review P1 修复批~~（已完成 2026-10-20：dlopen 绝对路径 / mbcnt.lo+hi / counted-barrier 注入点+id 范围 / batch exit code+stale hsaco / host func BLOCKING / sync 原生宏经补重放覆盖）
 4. 性能基线重建（Phase D 性能门）
 5. batch 面从 17 例向 190+ 扩展（按族分批）

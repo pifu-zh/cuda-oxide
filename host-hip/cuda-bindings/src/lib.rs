@@ -656,15 +656,28 @@ pub unsafe extern "C" fn cuLaunchHostFunc(
     hip!(hipLaunchHostFunc(hStream as HipStream, callback, userData))
 }
 
-/// Newer 4-arg host-func variant (stream, callback, data, mode). No HIP
-/// equivalent; unused by the gfx1030 example paths.
+/// Newer 4-arg host-func variant (stream, callback, data, mode).
+///
+/// [PORT gfx1030][review 2026-10-20] Upstream contract (crates.io
+/// cuda-bindings 0.3.1 `host_func_v2_outcome`): when the driver lacks the v2
+/// entry point, `CU_HOST_TASK_BLOCKING` falls back to `cuLaunchHostFunc`,
+/// which is itself a blocking host task; only SPINWAIT is unsupported here
+/// (HIP has no spin-wait host callback). The unconditional NOT_SUPPORTED
+/// broke that fallback for opt-in `CUDA_ASYNC_HOST_SYNC=block` users.
 pub unsafe extern "C" fn cu_launch_host_func(
-    _hStream: CUstream,
-    _callback: Option<unsafe extern "C" fn(*mut c_void)>,
-    _userData: *mut c_void,
-    _mode: u32,
+    hStream: CUstream,
+    callback: Option<unsafe extern "C" fn(*mut c_void)>,
+    userData: *mut c_void,
+    mode: u32,
 ) -> CUresult {
-    cudaError_enum_CUDA_ERROR_NOT_SUPPORTED
+    if mode == CU_HOST_TASK_BLOCKING {
+        let Some(callback) = callback else {
+            return cudaError_enum_CUDA_ERROR_INVALID_VALUE;
+        };
+        hip!(hipLaunchHostFunc(hStream as HipStream, callback, userData))
+    } else {
+        cudaError_enum_CUDA_ERROR_NOT_SUPPORTED
+    }
 }
 
 /// Events
