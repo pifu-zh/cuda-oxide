@@ -461,7 +461,10 @@ pub unsafe extern "C" fn cuDeviceGetAttribute(
         5 => 29,  // MAX_GRID_DIM_X
         6 => 30,  // MAX_GRID_DIM_Y
         7 => 31,  // MAX_GRID_DIM_Z
-        8 => 76,  // MAX_SHARED_MEMORY_PER_BLOCK -> MaxSharedMemoryPerBlock
+        // [PORT gfx1030][review 2026-10-20] 74 not 76: HIP 76 is per-multiprocessor
+        // (128 KiB on gfx1030) — admitting 2x the real per-block limit. Probed live
+        // on ROCm 10.1: attr 74 = 65536, 76 = 131072.
+        8 => 74,  // MAX_SHARED_MEMORY_PER_BLOCK -> hipDeviceAttributeMaxSharedMemoryPerBlock
         13 => 5,  // CLOCK_RATE -> ClockRate (verified: 2720000 kHz on gfx1030)
         16 => 63, // MULTIPROCESSOR_COUNT -> MultiprocessorCount
         38 => 19, // L2_CACHE_SIZE -> L2CacheSize
@@ -469,7 +472,10 @@ pub unsafe extern "C" fn cuDeviceGetAttribute(
         75 => 23, // COMPUTE_CAPABILITY_MAJOR -> ComputeCapabilityMajor
         76 => 61, // COMPUTE_CAPABILITY_MINOR -> ComputeCapabilityMinor
         95 => 10, // COOPERATIVE_LAUNCH -> CooperativeLaunch
-        97 => 77, // MAX_SHARED_MEMORY_PER_BLOCK_OPTIN -> SharedMemPerBlockOptin
+        // [PORT gfx1030][review 2026-10-20] 75 not 77: HIP 77 (a perf-ratio attr)
+        // ERRORS on gfx1030 (probed rc=1 on ROCm 10.1), failing every optin
+        // query; 75 is SharedMemPerBlockOptin (= 65536, probed).
+        97 => 75, // MAX_SHARED_MEMORY_PER_BLOCK_OPTIN -> SharedMemPerBlockOptin
         // RDNA2 has no thread-block clusters and no switch multicast; the
         // attrs are answered explicitly rather than with a wrong 0.
         120 | 132 => return cudaError_enum_CUDA_ERROR_NOT_SUPPORTED,
