@@ -342,6 +342,34 @@ pub(crate) fn expand_cuda_launch(input: CudaLaunchInput) -> TokenStream2 {
     // All paths use the stream-aware cuda_core helpers. Those helpers bind the
     // stream's owning CUDA context to the calling thread and then delegate to
     // the raw cuLaunchKernel/cuLaunchKernelEx wrappers.
+    // [PORT gfx1030][adapt-rocm] amdgcn kernels gain three trailing
+    // `i32 ntid_{x,y,z}` kernel parameters (prep pass step 5, e1770ba2);
+    // the sync raw macro must append them AFTER every user argument or the
+    // kernarg array is shorter than the kernel's metadata param list —
+    // hipModuleLaunchKernel then walks past the array and segfaults inside
+    // libamdhip64 (root cause of the host_closure crash). Mirrors the async
+    // macro's append; `#config` is evaluated exactly once.
+    let ntid_append = quote! {
+        // Locals must outlive the launch call: the packet holds raw pointers
+        // into this stack frame, so they are declared at block scope and only
+        // assigned/pushed inside the gate (declaring them inside the `if`
+        // left the driver copying from already-reused stack slots — the
+        // garbage ntid made every in-kernel bounds guard reject, and the
+        // closures test wrote all zeros).
+        let mut __cuda_oxide_ntid_x = 0u32;
+        let mut __cuda_oxide_ntid_y = 0u32;
+        let mut __cuda_oxide_ntid_z = 0u32;
+        if ::cuda_host::launch::amdgcn_ntid_append_active() {
+            let __cuda_oxide_cfg = #config;
+            __cuda_oxide_ntid_x = __cuda_oxide_cfg.block_dim.0;
+            __cuda_oxide_ntid_y = __cuda_oxide_cfg.block_dim.1;
+            __cuda_oxide_ntid_z = __cuda_oxide_cfg.block_dim.2;
+            #args_ident.push(&mut __cuda_oxide_ntid_x as *mut _ as *mut std::ffi::c_void);
+            #args_ident.push(&mut __cuda_oxide_ntid_y as *mut _ as *mut std::ffi::c_void);
+            #args_ident.push(&mut __cuda_oxide_ntid_z as *mut _ as *mut std::ffi::c_void);
+        }
+    };
+
     let launch_call = match (&cluster_dim, &cooperative) {
         (Some(cdim), Some(coop)) => quote! {
             {
@@ -455,6 +483,7 @@ pub(crate) fn expand_cuda_launch(input: CudaLaunchInput) -> TokenStream2 {
 
                 let mut #args_ident: Vec<*mut std::ffi::c_void> = Vec::new();
                 #(#arg_code)*
+                #ntid_append
 
                 #launch_call
             }
@@ -476,6 +505,7 @@ pub(crate) fn expand_cuda_launch(input: CudaLaunchInput) -> TokenStream2 {
 
                 let mut #args_ident: Vec<*mut std::ffi::c_void> = Vec::new();
                 #(#arg_code)*
+                #ntid_append
 
                 #launch_call
             }
@@ -495,6 +525,7 @@ pub(crate) fn expand_cuda_launch(input: CudaLaunchInput) -> TokenStream2 {
 
                 let mut #args_ident: Vec<*mut std::ffi::c_void> = Vec::new();
                 #(#arg_code)*
+                #ntid_append
 
                 #launch_call
             }

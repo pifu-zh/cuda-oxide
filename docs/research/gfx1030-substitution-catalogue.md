@@ -75,6 +75,18 @@
 | thread-block cluster / switch multicast | RDNA2 无（上游 CUDA 13 同样硬件门控） | HARDWARE_LIMITED；shim 显式 NOT_SUPPORTED |
 | 直通 LDS 宽度 | [probe] 汇编器拒 dwordx2/x4（仅 b32） | 硬件事实（soft-TMA 78.4% 上限的根因之一） |
 
+### 2.6 闭包引用捕获（HMM 依赖）——本轮新增
+
+| 项 | 内容 |
+|---|---|
+| 原始功能 | 非 move 闭包按引用捕获宿主变量；闭包结构体内嵌宿主指针，kernel 内解引用 |
+| 原实现依据 | cuda-macros launch.rs 注释明示："non-move closures push the closure struct (which contains host references the GPU dereferences **via HMM**)" |
+| gfx1030 缺口 | ROCm 10.1 对宿主栈内存无 HMM/SVM 一致访问；kernel 解引用宿主栈地址 → HSA_STATUS_ERROR_MEMORY_FAULT（故障地址=宿主栈 0x7ffc…，gdb+rocdevice 日志实证） |
+| 上游处理 | 依赖 NVIDIA HMM（统一内存驱动能力）；未提供非 HMM 回退 |
+| 替代方案 | **move 捕获**（拷贝语义）——同例 Test 1-8/10-13 十二种闭包形状全部真卡验证可用 |
+| 分类 | NOT FEASIBLE（本卡 HMM 语义）；ALGORITHM SUBSTITUTION（move 捕获等价语义，功能可用、零性能损耗——按值进 kernarg） |
+| Rust/工具链改动 | 无需（语言层已有 move 语法）；可考虑：编译器对 gfx 目标上的引用捕获闭包给诊断提示（后续项） |
+
 ## 3. 深度案例：soft TMA（aiter 技术提取 → 自研实现 → 量化）
 
 **过程**（本节即 goal §7.5 的完整示范：研究不得停留在文档）：
@@ -88,7 +100,7 @@
 
 ## 4. 开放研究项（按价值排序）
 
-1. **async launch 挂死调查**（当前最高优先级）：host_closure 例（cuda-async→0.5.0 dlopen→shim 链路）模块加载已通（本轮两修复：gfx 执行架构路由 + hsaco 文件工件路由），首个 async 闭包 launch 后 kernel 永不完成（单阻塞 ioctl）。待做：非闭包 async 变体隔离 / rocprof 查 kernel 是否真在跑 / stream+event shim 单独 C 探针。
+1. ~~async launch 挂死调查~~ **已解决（2026-10-25）**：三层根因逐一定位并修复——(a) 段错误=sync 原生宏缺 ntid 追加（kernarg 槽数 < 签名形参数，hipModuleLaunchKernel 遍历元数据越界，崩在 libamdhip64 内部）；(b) 全零输出=ntid 局部变量声明在 if 块内、push 裸指针悬垂（驱动从被复用栈槽拷贝垃圾 blockDim→核内越界守卫全拒）；(c) HSA 宿主栈地址故障=Test 9 非 move 引用捕获依赖 HMM（见 §2.6 新条目）。终局：host_closure Test 1-8+10-13 十二形状×四路径 48+ launch 真卡全绿；shim stream 面独立 C 探针 1024/1024。
 2. **设备端 printf**（vprintf 路径探针）。
 3. **grid_constant 集成维度验证**（Python 维度已适配 packed-as3 形态）。
 4. **batch 面向 190+ 上游示例扩展**（按族分批，扩大真验证覆盖）。

@@ -56,7 +56,8 @@
 | hipMalloc/Memcpy/Free 基础内存路径 | FULL | [e2e] GPU e2e 即该路径 | — |
 | 属性查询（16 行映射表） | FULL | [probe] 本机 ROCm 10.1 按号直查：74=65536/75=65536/76=131072/77=报错，修复后两行与真值一致；其余行 7.16 容器头+10.1 头双确认 | `scripts/gfx1030_hip_attr_probe.c` 已固化为仓库工件 |
 | sync launch | FULL | [e2e] vecadd/barrier/coords3d（hipModuleLaunchKernel 同 ABI）；sync 原生宏 ntid 三参已覆盖 | — |
-| async launch（cuda-async → 0.5.0 dlopen → shim） | **BLOCKED（调查中）** | 模块加载已通（2026-10-25 两修复：execution-arch gfx 路由——HIP CC 10.3 被误读 sm_103；ltoir 加 hsaco 文件工件路由——闭包工件原走 libNVVM 必拒）；现象=首个 async 闭包 launch 后 kernel 永不完成（strace：启动期 111 ioctl 后阻塞单等待，非自旋）。复现：`CUDA_OXIDE_TARGET=gfx1030 cargo oxide run host_closure`（adapt-rocm） | 下一步：非闭包 async 变体隔离 / rocprof 查 kernel 在跑否 / stream+event shim C 探针 |
+| async launch（cuda-async → 0.5.0 dlopen → shim） | FULL | [run] host_closure 例 Test 1-8+10-13 全过（12 闭包形状 × 4 条 launch 路径 = 48+ 真卡 launch；sync 原生宏 ntid 补齐+栈生命周期修复后）；shim stream 面独立 C 探针 1024/1024（stream create/async memcpy 双向/stream launch/sync）。**边界**：Test 9 非 move 引用捕获（闭包结构体含宿主栈指针，上游注释明示依赖 HMM）在 gfx1030+ROCm 10.1 HSA 内存故障于宿主栈地址——HMM 不可用，move 捕获等价语义已验证可用 | — |
+| 闭包 ABI（byval 单参数包，Fn/FnMut/FnOnce/const 泛型特化/repr(C)/混合尺寸捕获） | FULL | [run] 同上：8 形状全绿（Test 13 含 const-generic OFFSET 转发） | 引用捕获见 async 行 HMM 边界 |
 | stream/event/pool/managed 内存 | NOT TESTED | 符号在表 [static]；本机无运行断言 | 同上，逐面补 e2e |
 | host func / graph / multicast / cluster API | PARTIAL / UNSUPPORTED | host func BLOCKING 回落随 shim 保留；graph 族符号在 shim 表；multicast/cluster：RDNA2 无硬件，shim 明示 NOT_SUPPORTED [static] | host func 路径本机 e2e |
 
@@ -112,7 +113,7 @@
 1. **COv5×驱动耦合**：code object v6 被当前 amdgpu 驱动拒绝（partial 支持陷阱），驱动升级必须复验全套。
 3. **docker 缺组**：本机 zhuo 不在 docker 组（`sudo usermod -aG docker zhuo` 可解）；e2e 已回退宿主机直跑，不阻塞。
 4. **无 HIP 头**：ROCm 10.1 本机安装不含开发头；`amdrocm-runtime-dev10.1` 拆包至 `~/opt/rocm-headers/`（CPATH 接入），不动系统目录。
-5. **async 闭包 launch 挂死**（调查中，见 Runtime 节与研究档案 §4）。
+5. **HMM 不可用**：非 move 引用捕获闭包（结构体内宿主指针被 GPU 解引用）在 gfx1030+ROCm 无 HMM 下 HSA 故障；move 捕获等价语义已验证（host_closure Test 9 唯一受影响项）。
 6. **硬件能力边界**（RDNA2 事实，非缺陷）：无 MFMA/WMMA、无 TMA/TDM、无 cluster/multicast、fp8/fp4 无硬件——对应条目均给出软件等价或显式拒绝路径。
 
 ## 矩阵跟进项（下一步优先序）
