@@ -1936,7 +1936,9 @@ pub fn rewrite_ir_for_amdgcn(ll: &str) -> Result<String, String> {
     //    folding is a wrong-semantics bug (GPU hardware exception, not just
     //    wrong numbers). blockDim is host policy on AMDGPU, so all three
     //    become kernargs.
-    let mut text = rewrite_calls(ll, "llvm.nvvm.read.ptx.sreg.ntid.x", "or i32 %ntid_x, 0").0;
+    // [adapt-rocm] idempotent byval safety net (legal modules unchanged).
+    let mut text = rewrite_byval_kernel_params(ll);
+    text = rewrite_calls(&text, "llvm.nvvm.read.ptx.sreg.ntid.x", "or i32 %ntid_x, 0").0;
     text = rewrite_calls(&text, "llvm.nvvm.read.ptx.sreg.ntid.y", "or i32 %ntid_y, 0").0;
     text = rewrite_calls(&text, "llvm.nvvm.read.ptx.sreg.ntid.z", "or i32 %ntid_z, 0").0;
     text = append_ntid_kernarg_params(&text);
@@ -2086,6 +2088,277 @@ fn arg_operand(arg: &str) -> Option<&str> {
     parts.next().map(str::trim)
 }
 
+/// Unwraps `byval(<ty>)` kernel parameters to the bare by-value type.
+///
+/// [adapt-rocm] NVPTX allows `byval` on `ptx_kernel` parameters (grid-constant
+/// structs lower to it); the AMDGPU `amdgpu_kernel` calling convention
+/// REJECTS it ("Calling convention disallows byval") — large by-value
+/// parameters are first-class aggregates in the kernarg ABI instead (the
+/// same treatment closures already use, GPU-verified by host_closure).
+/// Runs in the PRE-`opt` half: `opt` itself is the rejecting verifier.
+/// Balanced-paren unwrap on `define` lines only.
+fn rewrite_byval_kernel_params(ll: &str) -> String {
+    if !ll.contains("byval(") {
+        return ll.to_string();
+    }
+    let lines: Vec<&str> = ll.lines().collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let is_def = line.starts_with("define ") && line.contains("byval(");
+        if !(is_def && line.trim_end().ends_with('{')) {
+            out.push(line.to_string());
+            i += 1;
+            continue;
+        }
+        let func_start = i;
+        let mut end = i + 1;
+        while end < lines.len() && lines[end] != "}" {
+            end += 1;
+        }
+        let body = &lines[func_start..=end.min(lines.len() - 1)];
+        out.extend(rewrite_byval_in_function(body));
+        i = end + 1;
+    }
+    let mut text = out.join("\n");
+    if ll.ends_with('\n') && !text.is_empty() {
+        text.push('\n');
+    }
+    text
+}
+
+/// One define..} span: promote each `ptr .. byval(T) align N %name` param,
+/// materialize a private copy + generic pointer, and rename body uses.
+fn rewrite_byval_in_function(body: &[&str]) -> Vec<String> {
+    // 1) parse byval sites from the define line: (name, type, align)
+    let define = body[0];
+    let mut sites: Vec<(String, String, String)> = Vec::new();
+    let mut rest = define;
+    while let Some(pos) = rest.find("byval(") {
+        let open = pos + "byval(".len();
+        let mut depth = 1usize;
+        let mut close = None;
+        let b = rest.as_bytes();
+        let mut j = open;
+        while j < b.len() {
+            match b[j] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(j);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        let Some(close) = close else { break };
+        let ty = rest[open..close].to_string();
+        let tail = &rest[close + 1..];
+        let align = tail
+            .find("align ")
+            .and_then(|a| {
+                let seg = &tail[a + "align ".len()..];
+                let digits: String = seg.chars().take_while(|c| c.is_ascii_digit()).collect();
+                (!digits.is_empty()).then_some(digits)
+            })
+            .unwrap_or_else(|| "8".to_string());
+        let name: String = tail
+            .trim_start()
+            .chars()
+            .skip_while(|c| !c.is_ascii_alphanumeric() && *c != '_')
+            .skip_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.' || *c == '$')
+            .collect();
+        // name arrives after attrs: find "%<ident>" token in the tail
+        let name = tail
+            .find('%')
+            .map(|p| {
+                tail[p + 1..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.' || *c == '$')
+                    .collect()
+            })
+            .unwrap_or(name);
+        sites.push((name, ty, align));
+        rest = tail;
+    }
+    if sites.is_empty() {
+        return body.iter().map(|l| l.to_string()).collect();
+    }
+    // 2) unwrapped define + init block + body rename
+    let mut out = Vec::with_capacity(body.len() + sites.len() * 3);
+    out.push(unwrap_byval(define));
+    // init 块插在首个块标签（如 entry:）之后；无标签则紧跟 define。
+    let label_at = body[1..]
+        .iter()
+        .position(|l| l.len() > 1 && l.trim_end().ends_with(':'))
+        .map(|p| p + 1);
+    let insert_at = label_at.unwrap_or(0); // body 索引（相对 body[0]=define）
+    let indent = "  ";
+    let mut init: Vec<String> = Vec::with_capacity(sites.len() * 3);
+    for (name, ty, align) in &sites {
+        init.push(format!(
+            "{indent}%{name}.addr = alloca {ty}, align {align}, addrspace(5)"
+        ));
+        init.push(format!(
+            "{indent}%{name}.p = addrspacecast ptr addrspace(5) %{name}.addr to ptr"
+        ));
+        init.push(format!("{indent}store {ty} %{name}, ptr addrspace(5) %{name}.addr, align {align}"));
+    }
+    // 先输出 define..标签（含），插入 init，再输出剩余体（重命名）
+    let head_end = if label_at.is_some() { insert_at + 1 } else { 1 };
+    for line in &body[1..head_end] {
+        out.push(line.to_string());
+    }
+    out.extend(init);
+    for line in &body[head_end..] {
+        let mut line = line.to_string();
+        for (name, _, _) in &sites {
+            line = replace_token(&line, &format!("%{name}"), &format!("%{name}.p"));
+        }
+        out.push(line);
+    }
+    out
+}
+
+/// Promotes one `ptr <pointer-attrs> byval(<T>)` parameter site to the
+/// by-value type `T`: the NVVM spelling types the param as `ptr` with the
+/// real struct in the `byval` attribute, while AMDGPU wants the struct
+/// itself as a first-class aggregate parameter. Pointer-only attributes
+/// (`nonnull`/`noalias`/`dereferenceable(N)`/…) belong to the dropped
+/// pointer and go with it; a trailing `align N` stays (valid on by-value
+/// params).
+fn unwrap_byval(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if line[i..].starts_with("byval(") {
+            let open = i + "byval(".len() - 1; // index of '('
+            let mut depth = 0usize;
+            let mut close = None;
+            for (j, &b) in bytes.iter().enumerate().skip(open) {
+                match b {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(j);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(close) = close {
+                trim_pointer_prefix(&mut out);
+                out.push_str(&line[open + 1..close]);
+                i = close + 1;
+                // `align N` is a pointer attribute — inapplicable to the
+                // promoted by-value param (the alignment lives on the
+                // materialized alloca instead).
+                let tail = &line[i..];
+                let trimmed = tail.trim_start();
+                if trimmed.starts_with("align ") {
+                    let digits: String = trimmed["align ".len()..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect();
+                    if !digits.is_empty() {
+                        i = line.len() - trimmed.len() + "align ".len() + digits.len();
+                    }
+                }
+                continue;
+            }
+        }
+        let ch = line[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Drops trailing pointer attributes and the `ptr` token they decorate from
+/// the already-emitted output (whitespace-separated, possibly parenthesized
+/// attributes like `captures(none)`).
+fn trim_pointer_prefix(out: &mut String) {
+    loop {
+        let trimmed_len = {
+            let t = out.trim_end();
+            t.len()
+        };
+        out.truncate(trimmed_len);
+        let trimmed = out.clone();
+        if trimmed.ends_with("ptr") {
+            out.truncate(trimmed.len() - "ptr".len());
+            let t2 = out.trim_end();
+            out.truncate(t2.len());
+            out.push(' ');
+            return;
+        }
+        // longest-match a pointer-only attribute token
+        let mut removed = false;
+        for attr in ["nonnull", "noalias", "nofree", "readonly", "writeonly",
+                     "readnone", "nocapture"] {
+            if let Some(pos) = trimmed.rfind(attr) {
+                // must be a whole trailing token (bounded by space on the left)
+                if pos + attr.len() == trimmed.len()
+                    && (pos == 0 || trimmed.as_bytes()[pos - 1] == b' ')
+                {
+                    out.truncate(pos);
+                    let t2 = out.trim_end();
+                    out.truncate(t2.len());
+                    removed = true;
+                    break;
+                }
+            }
+        }
+        if !removed {
+            if let Some(close) = trimmed.rfind(')') {
+                // parenthesized attr (dereferenceable(N), captures(..)):
+                // only when balanced to the very start of the tail token
+                let mut depth = 0usize;
+                let bytes = trimmed.as_bytes();
+                let mut start = None;
+                for (j, &b) in bytes.iter().enumerate().rev() {
+                    match b {
+                        b')' => depth += 1,
+                        b'(' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                start = Some(j);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(start) = start {
+                    let head = trimmed[..start].trim_end();
+                    let is_attr = head.rsplit(' ').next().is_some_and(|t| {
+                        t == "dereferenceable" || t == "dereferenceable_or_null"
+                            || t == "captures" || t == "alignment"
+                    });
+                    if is_attr && close + 1 == trimmed.len() {
+                        let cut = head.rfind(' ').map(|p| p + 1).unwrap_or(0);
+                        // keep the attr NAME boundary: remove name + (...)
+                        out.truncate(cut);
+                        let t2 = out.trim_end();
+                        out.truncate(t2.len());
+                        removed = true;
+                    }
+                }
+            }
+        }
+        if !removed {
+            return;
+        }
+    }
+}
+
 /// The pre-`opt` half of the prep pass: only the alloca → `addrspace(5)`
 /// rewrite (step 8), which `opt` requires just to *accept* an amdgcn-layout
 /// module.
@@ -2097,7 +2370,8 @@ fn arg_operand(arg: &str) -> Option<&str> {
 /// parameter to an as-yet-uninlined device function would leave its call
 /// sites at the old arity — a silently mismatched ABI.
 pub fn rewrite_allocas_for_amdgcn(ll: &str) -> Result<String, String> {
-    Ok(rewrite_allocas(ll))
+    // byval unwrap must precede `opt` (opt is the rejecting verifier).
+    Ok(rewrite_byval_kernel_params(&rewrite_allocas(ll)))
 }
 
 #[cfg(test)]

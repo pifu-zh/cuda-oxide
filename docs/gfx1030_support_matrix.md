@@ -45,7 +45,8 @@
 |---|---|---|---|
 | amdgpu_kernel 调用约定 + kernarg（标量/slice 两参包） | FULL | [e2e] pytest 两 GPU e2e；[run] vecadd | — |
 | ntid x/y/z 三形参（blockDim 三维，3-D block launch 语义） | FULL | [e2e] 本机 test_coords3d_3d_launch_end_to_end（block (4,3,2)，tid/ntid 六坐标编码 24/24 真卡核对，2026-10-20）+ [run] `cargo oxide run warp_reduce`（77 个 3-D 形状含 (3,5,3)/(8,8,8)，集成管线真卡全过） | — |
-| grid 常量/cluster 等高级 launch 特性 | UNSUPPORTED / NOT TESTED | cluster：RDNA2 无硬件（同 MFMA 依据）；grid_constant：上游 #1327 packed-as3 形态差异在 Python 维度有适配，集成维度 NOT TESTED | 逐例核对 batch 记录 |
+| grid_constant（byval 大参数 ABI） | **PARTIAL→编译级 SOLVED，运行时装载 BLOCKED** | [run] 2026-10-25：amdgpu_kernel 调用约定禁 byval（opt 拒绝"Calling convention disallows byval"）——prep pass 新增 byval 提升（ptr+指针属性+byval(T)→T 按值一等聚合 + 私 alloca 物化通用指针 + 体改名），cuda_module_contract 例编译全通（通用能力：任何大按值参数）；运行时卡在 contracted 通用模块的内嵌 bundle 装载（PTX-bundle 合并路径，gfx 无 PTX，NoModules）——与已修的文件工件路径同族的下一个面 | 下一步：embedded loader 增 hsaco 感知（同 ltoir 修法） |
+| cluster / multicast launch | UNSUPPORTED | RDNA2 无硬件（shim 显式 NOT_SUPPORTED） | — |
 | Code Object 装载（hipModuleLoadData） | FULL | [e2e] 两个 GPU e2e 走该路径；[run] vecadd | — |
 
 ## 4. GPU Runtime / 内存 / 传输 / Launch
@@ -80,8 +81,8 @@
 | LLVM 原子 RMW/CAS（global/shared，多内存序） | FULL | [hist] MP litmus release→acquire 200 轮 + atomics 例 GPU PASS；[e2e] 本机 pytest+batch | — |
 | fence + scope 映射（cta→workgroup，gl→agent，sys→系统） | FULL | [e2e] pytest 断言三 scope 产物；[hist] litmus | — |
 | Rust core::sync::atomic 内嵌 PTX-asm 族 → LLVM 原子 | FULL | [hist] GPU 验证；[e2e] pytest 12d/12e 全形态 | — |
-| 64 位原子 load/store（seqcst 折叠） | FULL | [e2e] pytest b64 形态；64 位 atomicrmw RMW 本机 NOT TESTED | 补 64 位 RMW 断言 |
-| 设备端 printf | NOT TESTED | HIP 支持存在；管线未验证 vprintf 路径 | 低优先探针 |
+| 64 位原子（load/store/atomicrmw RMW） | FULL | [e2e] pytest b64 形态；[run] atomics 例 24/24 真卡（含 Test 8 DeviceAtomicU64 fetch_add），2026-10-25 | — |
+| 设备端 printf | **IMPLEMENTABLE**（未实现，方案明确） | [run] printf 例失败（209）：.ll/hsaco 中 `vprintf` 未解析（NVVM 符号原样穿透）；AMD 侧 printf=ockl `__ockl_printf_begin/append_args/append_string_n` 族（本机 ockl.bc 导出表实证）——需 prep pass 把 vprintf 调用点展开为 ockl printf 序列（clang 前端在 HIP 源码级做的 lowering，我们需 IR 文本级展开 varargs 包） | 复现：`CUDA_OXIDE_TARGET=gfx1030 cargo oxide run printf` |
 
 ## 7. 泛型 / 结构体 / 跨 Crate / 宏与集成
 
@@ -101,7 +102,7 @@
 | 批量双维度验证（Python 改写管线 / Rust 集成管线） | FULL | [e2e] 本机 14/17+14/17 持平（3 例诚实排除：抽取器限制）；exit code + stale hsaco 两处假 PASS 源已修（2026-10-20） | — |
 | 一键验证+报告（scripts/verify_gfx1030.sh） | FULL | 本脚本：环境快照/5 门/汇总，时间戳归档 | 首跑归档随本矩阵提交 |
 | cargo-oxide doctor（工具链自检） | FULL | [run] 2026-10-25 "✅ Environment looks good!"（llc 经工具链 llvm-tools 解析；补齐 ~/opt/cuda13 的 libnvJitLink 后全绿——NV 专属件，gfx 路径本不依赖） | — |
-| 性能基线（rocprof/带宽/达标率） | NOT TESTED | 历史流程在 gpu-perf skill（主机 ROCm 7.14 时代）；10.1 时代未重建 | Phase D 后续：重建 L4 基线 |
+| 性能基线（带宽/计算锚点，Phase D 门） | FULL | [run] 2026-10-25 ROCm 10.1 直链 HIP 基准（scripts/gfx1030_perf_baseline.c，hipcc 编译、事件计时、已入 verify 电池）：理论 575 GB/s（GDDR6 16T/pin/clk 公式，对 spec 576）；H2D/D2H 14.1/14.2 GB/s（pageable；历史 pinned 参照 24.9/28.5）；D2D copy 820 GB/s（历史同口径 862 互证）；triad 3N 有效 486 GB/s=**85% spec**；FFMA 25.9 TFLOPS≈双发射峰 93%。rocprofv3 在位、应用可跑但其产物提取未配置（开放项） | 90% 达标线属优化工作门，非本记录门 |
 | 产物反汇编抽查（llvm-objdump） | FULL | [run] vecadd.hsaco：`vecadd` 符号在 .text + `vecadd.kd` 内核描述符 + 真 RDNA2 ISA（v_add_co_u32/global_load_dword/s_cbranch_execz），elf64-amdgpu | DWARF 调试信息仍未验证（NOT TESTED） |
 
 ## 配套研究档案
