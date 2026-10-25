@@ -35,7 +35,8 @@ sys.path.insert(0, str(REPO / "tests"))
 from translate_amdgcn import translate_nvvm_to_amdgcn  # noqa: E402
 
 # v1 同一批 17 例（examples-report.md）
-# [goal batch-expansion 2026-10-26] SWEEP_BATCH: 58 个新例经全管扫描
+# [goal batch-expansion 2026-10-26] SWEEP_BATCH: 56 个新例经全管扫描（另 2 例
+# printf/kernel_reference_validity 亦为扫描幸存者，共 58——见下分组注释）
 # （抽取→构建→改写→llc 全绿，/tmp/sweep_full.json 口径 a-p 段）按族并入。
 # 扫描中断于字母 p（shell 故障），q-z 段待续扫后追加。
 EXAMPLES = [
@@ -363,10 +364,11 @@ def main():
     ok = sum(1 for r in results.values() if r.get("status") == "pass")
     ll_ct = sum(1 for r in results.values()
                 if r.get("status") in ("pass", "llc_fail") or r.get("residual"))
-    summary = f"\nSUMMARY: llc-pass {ok} / 17; ll-produced {ll_ct} / 17"
+    n = len(EXAMPLES)
+    summary = f"\nSUMMARY: llc-pass {ok} / {n}; ll-produced {ll_ct} / {n}"
     if args.integrated:
         ipass = sum(1 for r in results.values() if r.get("integrated") == "pass")
-        summary += f"; integrated hsaco-pass {ipass} / 17"
+        summary += f"; integrated hsaco-pass {ipass} / {n}"
     print(summary)
 
     # [PORT gfx1030][review 2026-10-20] 编排层退出码：excluded 不算失败，

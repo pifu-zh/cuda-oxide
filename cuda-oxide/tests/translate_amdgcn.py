@@ -201,7 +201,10 @@ def translate_nvvm_to_amdgcn(ll_text: str) -> str:
 # ---------------------------------------------------------------------------
 
 # 已是 addrspace(5) 的 alloca 不再匹配（幂等性的关键：改写产物重跑不变）
-_ALLOCA_DEF_RE = re.compile(r"^(?P<indent>\s*)(?P<name>%[\w.$]+)\s*=\s*alloca\s+(?P<rest>[^->]*\S)\s*$")
+# [adapt-rocm] rest 不再排除 '>'：packed 结构体 <{ ... }> 与向量 <N x T> 是
+# 合法 alloca 元素类型，须与其他本地帧一样改写 addrspace(5)
+# （packed_aggregate_abi 的 <{ i8, i32 }> 曾被旧守卫跳过）。
+_ALLOCA_DEF_RE = re.compile(r"^(?P<indent>\s*)(?P<name>%[\w.$]+)\s*=\s*alloca\s+(?P<rest>[^-]*\S)\s*$")
 
 # typed-pointer IR（math_tan 类非 opt 形态）不支持：use 点是 `bitcast <ty>*
 # %name to ...`，把 alloca 改 addrspace(5) 后 bitcast 跨地址空间非法

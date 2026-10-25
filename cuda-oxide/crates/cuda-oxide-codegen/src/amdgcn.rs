@@ -202,7 +202,12 @@ fn rewrite_allocas_in_function(body: &[&str]) -> Vec<String> {
             continue;
         }
         let rest = trimmed[eq + " = alloca ".len()..].trim();
-        if rest.contains('-') || rest.contains('>') {
+        // [adapt-rocm] only '-' stays excluded (defensive; never seen in
+        // types). Packed structs `<{ ... }>` and vectors `<N x T>` are legal
+        // alloca element types and must reach addrspace(5) like every other
+        // local-frame slot (packed_aggregate_abi's `<{ i8, i32 }>` was
+        // skipped by the old '>' guard and died at opt).
+        if rest.contains('-') {
             continue;
         }
         // Script order: strip the trailing `, align N` FIRST, then split the
