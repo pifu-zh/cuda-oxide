@@ -97,6 +97,17 @@ impl MirToLlvmConversion for ReadPtxSregCtaidXOp {
         rewriter: &mut DialectConversionRewriter,
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
+        // [PORT gfx1030] Amdgcn backend: block id → LLVM's AMDGPU workgroup id
+        // (same-name callee swap; SSA references untouched — Phase-1 step 4).
+        if context::lowering_options(ctx).intrinsic_backend == IntrinsicBackend::Amdgcn {
+            return convert_zero_operand_scalar_direct(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                32,
+                "llvm_amdgcn_workgroup_id_x",
+            );
+        }
         convert_zero_operand_scalar_direct(
             ctx,
             rewriter,
@@ -115,6 +126,16 @@ impl MirToLlvmConversion for ReadPtxSregCtaidYOp {
         rewriter: &mut DialectConversionRewriter,
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
+        // [PORT gfx1030] See ReadPtxSregCtaidXOp.
+        if context::lowering_options(ctx).intrinsic_backend == IntrinsicBackend::Amdgcn {
+            return convert_zero_operand_scalar_direct(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                32,
+                "llvm_amdgcn_workgroup_id_y",
+            );
+        }
         convert_zero_operand_scalar_direct(
             ctx,
             rewriter,
@@ -133,6 +154,16 @@ impl MirToLlvmConversion for ReadPtxSregCtaidZOp {
         rewriter: &mut DialectConversionRewriter,
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
+        // [PORT gfx1030] See ReadPtxSregCtaidXOp.
+        if context::lowering_options(ctx).intrinsic_backend == IntrinsicBackend::Amdgcn {
+            return convert_zero_operand_scalar_direct(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                32,
+                "llvm_amdgcn_workgroup_id_z",
+            );
+        }
         convert_zero_operand_scalar_direct(
             ctx,
             rewriter,
@@ -152,7 +183,7 @@ impl MirToLlvmConversion for ReadPtxSregClockOp {
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
         match context::lowering_options(ctx).intrinsic_backend {
-            IntrinsicBackend::LlvmNvptx => convert_zero_operand_scalar_direct(
+            IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => convert_zero_operand_scalar_direct(
                 ctx,
                 rewriter,
                 self.get_operation(),
@@ -179,7 +210,7 @@ impl MirToLlvmConversion for ReadPtxSregClock64Op {
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
         match context::lowering_options(ctx).intrinsic_backend {
-            IntrinsicBackend::LlvmNvptx => convert_zero_operand_scalar_direct(
+            IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => convert_zero_operand_scalar_direct(
                 ctx,
                 rewriter,
                 self.get_operation(),
@@ -458,7 +489,7 @@ impl MirToLlvmConversion for ReadPtxSregDynamicSmemSizeOp {
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
         match context::lowering_options(ctx).intrinsic_backend {
-            IntrinsicBackend::LlvmNvptx => convert_sreg_read_inline(
+            IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => convert_sreg_read_inline(
                 ctx,
                 rewriter,
                 self.get_operation(),
@@ -489,7 +520,7 @@ impl MirToLlvmConversion for ReadPtxSregEnvReg1Op {
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
         match context::lowering_options(ctx).intrinsic_backend {
-            IntrinsicBackend::LlvmNvptx => convert_zero_operand_scalar_direct(
+            IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => convert_zero_operand_scalar_direct(
                 ctx,
                 rewriter,
                 self.get_operation(),
@@ -516,7 +547,7 @@ impl MirToLlvmConversion for ReadPtxSregEnvReg2Op {
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
         match context::lowering_options(ctx).intrinsic_backend {
-            IntrinsicBackend::LlvmNvptx => convert_zero_operand_scalar_direct(
+            IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => convert_zero_operand_scalar_direct(
                 ctx,
                 rewriter,
                 self.get_operation(),
@@ -543,7 +574,7 @@ impl MirToLlvmConversion for ReadPtxSregGlobaltimerOp {
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
         match context::lowering_options(ctx).intrinsic_backend {
-            IntrinsicBackend::LlvmNvptx => convert_zero_operand_scalar_direct(
+            IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => convert_zero_operand_scalar_direct(
                 ctx,
                 rewriter,
                 self.get_operation(),
@@ -626,7 +657,7 @@ impl MirToLlvmConversion for ReadPtxSregGridIdOp {
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
         match context::lowering_options(ctx).intrinsic_backend {
-            IntrinsicBackend::LlvmNvptx => convert_sreg_read_inline(
+            IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => convert_sreg_read_inline(
                 ctx,
                 rewriter,
                 self.get_operation(),
@@ -765,7 +796,7 @@ impl MirToLlvmConversion for ReadPtxSregNsmIdOp {
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
         match context::lowering_options(ctx).intrinsic_backend {
-            IntrinsicBackend::LlvmNvptx => convert_zero_operand_scalar_direct(
+            IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => convert_zero_operand_scalar_direct(
                 ctx,
                 rewriter,
                 self.get_operation(),
@@ -792,7 +823,7 @@ impl MirToLlvmConversion for ReadPtxSregNwarpIdOp {
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
         match context::lowering_options(ctx).intrinsic_backend {
-            IntrinsicBackend::LlvmNvptx => convert_zero_operand_scalar_direct(
+            IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => convert_zero_operand_scalar_direct(
                 ctx,
                 rewriter,
                 self.get_operation(),
@@ -819,7 +850,7 @@ impl MirToLlvmConversion for ReadPtxSregSmIdOp {
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
         match context::lowering_options(ctx).intrinsic_backend {
-            IntrinsicBackend::LlvmNvptx => convert_sreg_read_inline(
+            IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => convert_sreg_read_inline(
                 ctx,
                 rewriter,
                 self.get_operation(),
@@ -849,6 +880,17 @@ impl MirToLlvmConversion for ReadPtxSregTidXOp {
         rewriter: &mut DialectConversionRewriter,
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
+        // [PORT gfx1030] Amdgcn backend: thread id → LLVM's AMDGPU workitem id
+        // (same-name callee swap; SSA references untouched — Phase-1 step 4).
+        if context::lowering_options(ctx).intrinsic_backend == IntrinsicBackend::Amdgcn {
+            return convert_zero_operand_scalar_direct(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                32,
+                "llvm_amdgcn_workitem_id_x",
+            );
+        }
         convert_zero_operand_scalar_direct(
             ctx,
             rewriter,
@@ -867,6 +909,16 @@ impl MirToLlvmConversion for ReadPtxSregTidYOp {
         rewriter: &mut DialectConversionRewriter,
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
+        // [PORT gfx1030] See ReadPtxSregTidXOp.
+        if context::lowering_options(ctx).intrinsic_backend == IntrinsicBackend::Amdgcn {
+            return convert_zero_operand_scalar_direct(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                32,
+                "llvm_amdgcn_workitem_id_y",
+            );
+        }
         convert_zero_operand_scalar_direct(
             ctx,
             rewriter,
@@ -885,6 +937,16 @@ impl MirToLlvmConversion for ReadPtxSregTidZOp {
         rewriter: &mut DialectConversionRewriter,
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
+        // [PORT gfx1030] See ReadPtxSregTidXOp.
+        if context::lowering_options(ctx).intrinsic_backend == IntrinsicBackend::Amdgcn {
+            return convert_zero_operand_scalar_direct(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                32,
+                "llvm_amdgcn_workitem_id_z",
+            );
+        }
         convert_zero_operand_scalar_direct(
             ctx,
             rewriter,
@@ -904,7 +966,7 @@ impl MirToLlvmConversion for ReadPtxSregTotalSmemSizeOp {
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
         match context::lowering_options(ctx).intrinsic_backend {
-            IntrinsicBackend::LlvmNvptx => convert_sreg_read_inline(
+            IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => convert_sreg_read_inline(
                 ctx,
                 rewriter,
                 self.get_operation(),
@@ -935,7 +997,7 @@ impl MirToLlvmConversion for ReadPtxSregWarpIdOp {
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
         match context::lowering_options(ctx).intrinsic_backend {
-            IntrinsicBackend::LlvmNvptx => convert_sreg_read_inline(
+            IntrinsicBackend::LlvmNvptx | IntrinsicBackend::Amdgcn => convert_sreg_read_inline(
                 ctx,
                 rewriter,
                 self.get_operation(),

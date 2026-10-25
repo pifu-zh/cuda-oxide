@@ -889,7 +889,7 @@ fn native_u32_ldmatrix_stays_narrow_until_backend_boundary() -> Result<(), anyho
         );
         assert_eq!(address_space_cast, 0);
         match backend {
-            mir_lower::IntrinsicBackend::LlvmNvptx => {
+            mir_lower::IntrinsicBackend::LlvmNvptx | mir_lower::IntrinsicBackend::Amdgcn => {
                 assert_eq!(
                     int_to_ptr, 1,
                     "typed LLVM intrinsic requires one p3 boundary cast"
@@ -1141,7 +1141,7 @@ fn test_classic_ldmatrix_compatibility_ops_keep_exact_lowering() -> Result<(), a
             extract_count +=
                 usize::from(Operation::get_op::<llvm::ExtractValueOp>(op, &ctx).is_some());
             match backend {
-                mir_lower::IntrinsicBackend::LlvmNvptx => {
+                mir_lower::IntrinsicBackend::LlvmNvptx | mir_lower::IntrinsicBackend::Amdgcn => {
                     assert!(Operation::get_op::<llvm::InlineAsmOp>(op, &ctx).is_none());
                     let Some(call) = Operation::get_op::<llvm::CallOp>(op, &ctx) else {
                         continue;

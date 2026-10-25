@@ -49,6 +49,21 @@ impl MirToLlvmConversion for Barrier0Op {
                     vec![barrier_id],
                 )?;
             }
+            // [PORT gfx1030 Stage3-1] `llvm.amdgcn.s.barrier()` (no operands in
+            // current LLVM) is the AMDGPU workgroup barrier; the AMDGPU backend
+            // cannot select the NVVM barrier intrinsics. Convergent marking is
+            // handled by llvm-export's convergent-intrinsic list.
+            IntrinsicBackend::Amdgcn => {
+                let function_ty = llvm_types::FuncType::get(ctx, void_ty.into(), vec![], false);
+                call_intrinsic(
+                    ctx,
+                    rewriter,
+                    op,
+                    "llvm_amdgcn_s_barrier",
+                    function_ty,
+                    vec![],
+                )?;
+            }
             IntrinsicBackend::LibNvvm => {
                 inline_asm_convergent(
                     ctx,

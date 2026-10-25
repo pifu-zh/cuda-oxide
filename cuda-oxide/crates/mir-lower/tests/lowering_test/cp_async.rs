@@ -217,7 +217,7 @@ fn test_generated_cp_async_mbarrier_preserves_backend_and_address_routes()
         let ir = llvm_export::export::export_module_to_string(&ctx, &module)
             .map_err(|error| anyhow::anyhow!(error))?;
         match backend {
-            mir_lower::IntrinsicBackend::LlvmNvptx => {
+            mir_lower::IntrinsicBackend::LlvmNvptx | mir_lower::IntrinsicBackend::Amdgcn => {
                 assert_eq!(call_counts, [1; 4]);
                 assert_eq!(asm_counts, [0; 4]);
                 assert!(
