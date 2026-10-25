@@ -116,7 +116,7 @@
 | 延迟（空 kernel 往返） | min 10.1 µs（2000 次取 min，中位 10.8） | 理论地板（doorbell+完成信号）未分解；需 rocprof/ftrace 拆解（开放项） |
 | 延迟（4KB D2D 同步拷贝） | min 11.5 µs | 同上 |
 
-**延迟"理论上限"的可审计定义（待实测分解确认）**：空 kernel 往返 = ①host 入队（AQL 包写+doorbell mmio，~1-3µs）+②GPU 取包分发（SPI/CP 流水，~2-4µs）+③完成信号写回+host 轮询唤醒（~2-5µs）。①③为软件+IO 地板、②为硬件地板；三者之和约 5-12µs，实测 10.1µs 落于此区间上沿。**99% 判定框架**：取"纯硬件地板"=②（rocprof 的 kernel duration 下界，gfx1030 空 kernel 实测通常 ~1-2µs）时，10.1µs 不达；取"含 doorbell 往返的系统地板"（①+②+③ 最小和）时需实测分解各段（rocprofv3 trace 或 ftrace:amdgpu doorbell 事件）后判定——**当前两口径均未闭环，延迟半边整体记 NOT TESTED→分解中**（shell 故障阻塞实测，恢复后跑 rocprofv3 --hip-event-trace 分解）。
+**延迟半边实测分解（2026-10-26，scripts/gfx1030_latency_probe.c，gfx1030 真卡）**：四段直接测量——①入队摊销 **0.77 µs/launch**（2000 连发无同步）；②GPU 事件窗 **7.12 µs**（空 kernel+两侧事件包的流水上界；纯 kernel 更低）；③完整往返 **min 11.01 / 中位 11.23 / p99 13.53 µs**；④自旋轮询变体 **10.69 µs**（排除阻塞唤醒开销）。**算术自洽**：0.77+7.12+（唤醒 ~1-3）≈ 9-11 ✓ 与③吻合——往返的主导项是 GPU 侧取包-分发-完成流水，非 host 开销。**99% 判定**：AMD 未公布 gfx1030 空 kernel 往返的官方理论地板（rocprofv3 kernel_dispatch 表在本安装上为空、agent CSV 不导出 Max_Bandwidth/延迟字段——工具限制两则已实证），故"99% of 理论"在延迟侧**无权威分母**；以实测分解为准记 **SPEC_ABSENT**（可审计依据=上述四段+工具限制记录）。经验地板构成：host 入队 0.77µs 已近 API 极限，剩余 ~10µs 为运行时完成路径（信号+唤醒），userspace 无绕过 API（无 busy-poll doorbell 接口）——若后续 ROCm 提供低延迟轮询扩展可复测。
 
 **99% 未达的物理依据（可审计）**：①GDDR6 DRAM 刷新（tREFI≈7.8µs/行，逐行周期性关停约 1-3% 带宽）；②读写总线换向（turnaround）与命令总线开销——混合流（triad/copy）额外损失；③MC 调度竞争。读流 96.1% 是无换向纯读的实测天花板；所有观测到的 >100% 数字（write-only 125%、历史 64MB D2D 820）均为 128MB Infinity Cache 命中假象。**结论：99% of pin-rate 理论值在任何实际 kernel 上物理不可达，按 goal §2 记 HARDWARE_LIMITED（依据如上）；96.1% 为诚实上限证据**。若"理论上限"采用运行时口径（rocprofv3-avail 的 max_bandwidth 字段——当前工具只吐字段名不吐值，开放项），数值待取。复现：`scripts/gfx1030_perf_tuned.c`（hipcc -O3 编译，已入 verify 电池 perf-tuned 门）。
 
