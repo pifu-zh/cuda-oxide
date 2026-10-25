@@ -1028,7 +1028,7 @@ def test_barrier_mbarrier_software(tmp_path):
     assert ok, f"[阶段 变体抽取] 失败: {err}"
     env = dict(os.environ, CUDA_TOOLKIT_PATH=CUDA_TOOLKIT_PATH,
         # [adapt-rocm] pinned-stable unlocks -Z
-        RUSTC_BOOTSTRAP="1"),
+        RUSTC_BOOTSTRAP="1")
     proc = _run(["cargo", f"+{NIGHTLY}", "oxide", "build"], cwd=crate_dir, env=env,
                 timeout=600)
     assert proc.returncode == 0, (
@@ -1257,7 +1257,7 @@ def test_coords3d_3d_launch_end_to_end(tmp_path):
     _write_probe3d_crate(crate_dir)
     env = dict(os.environ, CUDA_TOOLKIT_PATH=CUDA_TOOLKIT_PATH,
         # [adapt-rocm] pinned-stable unlocks -Z
-        RUSTC_BOOTSTRAP="1"),
+        RUSTC_BOOTSTRAP="1")
     proc = _run(["cargo", f"+{NIGHTLY}", "oxide", "build"], cwd=crate_dir,
                 env=env, timeout=600)
     assert proc.returncode == 0, (
