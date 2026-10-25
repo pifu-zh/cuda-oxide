@@ -135,6 +135,21 @@ pub fn load_all_ptx_bundles_merged(
     ctx: &Arc<CudaContext>,
 ) -> Result<Arc<CudaModule>, EmbeddedModuleError> {
     let bundles = artifact_bundles_from_current_exe()?;
+    // [PORT gfx1030][adapt-rocm] On the amdgcn path the build embeds its
+    // single linked code object as a Cubin payload (rustc-codegen-cuda maps
+    // Hsaco onto ArtifactPayloadKind::Cubin) and there is no PTX to merge —
+    // the unified pipeline already linked every kernel of the binary into
+    // that one image. The PTX merge below would skip the bundle and surface
+    // NoModules; load the image directly instead, under the same
+    // CUDA_OXIDE_TARGET gfx routing key the backend selected.
+    if crate::launch::amdgcn_ntid_append_active() {
+        if let Some(image) = bundles
+            .iter()
+            .find_map(|bundle| bundle.payload(ArtifactPayloadKind::Cubin))
+        {
+            return ctx.load_module_from_image(image).map_err(From::from);
+        }
+    }
     let merged = merge_ptx_bundles(&bundles)?;
 
     let module = ctx.load_module_from_image(merged.as_bytes())?;

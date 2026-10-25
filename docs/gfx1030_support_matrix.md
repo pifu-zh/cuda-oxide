@@ -45,7 +45,7 @@
 |---|---|---|---|
 | amdgpu_kernel 调用约定 + kernarg（标量/slice 两参包） | FULL | [e2e] pytest 两 GPU e2e；[run] vecadd | — |
 | ntid x/y/z 三形参（blockDim 三维，3-D block launch 语义） | FULL | [e2e] 本机 test_coords3d_3d_launch_end_to_end（block (4,3,2)，tid/ntid 六坐标编码 24/24 真卡核对，2026-10-20）+ [run] `cargo oxide run warp_reduce`（77 个 3-D 形状含 (3,5,3)/(8,8,8)，集成管线真卡全过） | — |
-| grid_constant（byval 大参数 ABI） | **PARTIAL→编译级 SOLVED，运行时装载 BLOCKED** | [run] 2026-10-25：amdgpu_kernel 调用约定禁 byval（opt 拒绝"Calling convention disallows byval"）——prep pass 新增 byval 提升（ptr+指针属性+byval(T)→T 按值一等聚合 + 私 alloca 物化通用指针 + 体改名），cuda_module_contract 例编译全通（通用能力：任何大按值参数）；运行时卡在 contracted 通用模块的内嵌 bundle 装载（PTX-bundle 合并路径，gfx 无 PTX，NoModules）——与已修的文件工件路径同族的下一个面 | 下一步：embedded loader 增 hsaco 感知（同 ltoir 修法） |
+| grid_constant（byval 大参数 ABI） | FULL | [run] 2026-10-26 cuda_module_contract 例真卡全过（"SUCCESS: mixed ABI typed launch passed"，含 CPU 侧契约负例校验）：①prep pass byval 提升（amdgpu_kernel 禁 byval→按值一等聚合+私 alloca 物化，通用能力）；②embedded 装载 gfx 路由（load_all_ptx_bundles_merged 在 gfx 键下直载唯一 Cubin 载荷=已链全 kernel 的 hsaco，替代 PTX 合并的 NoModules） | — |
 | cluster / multicast launch | UNSUPPORTED | RDNA2 无硬件（shim 显式 NOT_SUPPORTED） | — |
 | Code Object 装载（hipModuleLoadData） | FULL | [e2e] 两个 GPU e2e 走该路径；[run] vecadd | — |
 
