@@ -5,8 +5,8 @@
 #
 # 用法: python3 tests/batch_gfx1030_examples.py [--skip-build] [--only NAME]
 #            [--integrated]
-# 产物: /tmp/batch_gfx1030/<example>/（device-only 变体 crate + .ll）
-#       /tmp/batch_gfx1030/report.json（逐例机器可读结果）
+# 产物: /home/zhuo/tmp-prof/batch_gfx1030/<example>/（device-only 变体 crate + .ll）
+#       /home/zhuo/tmp-prof/batch_gfx1030/report.json（逐例机器可读结果）
 #
 # v4 新增 --integrated：在 Python 改写管线（默认测量，产物 .amdgcn.ll 之上跑
 # llc）之外，追加测量"集成化管线"——CUDA_OXIDE_TARGET=gfx1030 直接走
@@ -268,7 +268,7 @@ def main():
     for name in EXAMPLES:
         if args.only and name != args.only:
             continue
-        d = Path("/tmp/batch_gfx1030") / name
+        d = Path("/home/zhuo/tmp-prof/batch_gfx1030") / name
         rec = {"example": name}
         if name in V1_EXCLUDED and not args.only:
             rec.update(status="excluded", reason=V1_EXCLUDED[name])
@@ -343,7 +343,7 @@ def main():
             if name in V1_EXCLUDED:
                 results[name]["integrated"] = "excluded"
                 continue
-            d = Path("/tmp/batch_gfx1030") / name
+            d = Path("/home/zhuo/tmp-prof/batch_gfx1030") / name
             if not (d / "src/main.rs").exists():
                 results[name]["integrated"] = "no_variant"
                 continue
@@ -359,7 +359,7 @@ def main():
                 )
                 print(f"[INTEGRATED FAIL] {name}: {results[name]['integrated_error']}")
 
-    Path("/tmp/batch_gfx1030/report.json").write_text(json.dumps(results, indent=2, ensure_ascii=False))
+    Path("/home/zhuo/tmp-prof/batch_gfx1030/report.json").write_text(json.dumps(results, indent=2, ensure_ascii=False))
     ok = sum(1 for r in results.values() if r.get("status") == "pass")
     ll_ct = sum(1 for r in results.values()
                 if r.get("status") in ("pass", "llc_fail") or r.get("residual"))
