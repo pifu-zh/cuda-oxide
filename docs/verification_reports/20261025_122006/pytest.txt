@@ -1,0 +1,24 @@
+============================= test session starts ==============================
+platform linux -- Python 3.14.8, pytest-9.1.1, pluggy-1.6.0 -- /usr/bin/python3
+cachedir: .pytest_cache
+rootdir: /home/zhuo/workspace/src/cuda-oxide
+plugins: typeguard-4.4.4
+collecting ... collected 15 items
+
+tests/test_gfx1030.py::test_ir_translate_no_nvvm_residual PASSED         [  6%]
+tests/test_gfx1030.py::test_ir_translate_alloca_addrspace PASSED         [ 13%]
+tests/test_gfx1030.py::test_ir_translate_barrier PASSED                  [ 20%]
+tests/test_gfx1030.py::test_ir_translate_shuffle PASSED                  [ 26%]
+tests/test_gfx1030.py::test_ir_translate_redux_add PASSED                [ 33%]
+tests/test_gfx1030.py::test_ir_translate_atomics PASSED                  [ 40%]
+tests/test_gfx1030.py::test_ir_translate_dotprod PASSED                  [ 46%]
+tests/test_gfx1030.py::test_ir_translate_counted_barrier PASSED          [ 53%]
+tests/test_gfx1030.py::test_ir_translate_ocml PASSED                     [ 60%]
+tests/test_gfx1030.py::test_ir_translate_mbarrier PASSED                 [ 66%]
+tests/test_gfx1030.py::test_ptx_also_generated PASSED                    [ 73%]
+tests/test_gfx1030.py::test_gfx1030_device_identity PASSED               [ 80%]
+tests/test_gfx1030.py::test_vecadd_end_to_end PASSED                     [ 86%]
+tests/test_gfx1030.py::test_barrier_mbarrier_software PASSED             [ 93%]
+tests/test_gfx1030.py::test_coords3d_3d_launch_end_to_end PASSED         [100%]
+
+======================== 15 passed in 60.95s (0:01:00) =========================

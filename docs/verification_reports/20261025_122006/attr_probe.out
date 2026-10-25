@@ -1,0 +1,8 @@
+hipInit(0) -> 0
+hipGetDevice -> 0 (device 0)
+attr 74 MaxSharedMemoryPerBlock?        rc=0 value=65536
+attr 75 SharedMemPerBlockOptin?         rc=0 value=65536
+attr 76 SharedMemPerMultiprocessor?     rc=0 value=131072
+attr 77 SingleToDoublePerfRatio?        rc=1 value=-12345
+attr 5 MaxThreadsPerBlock?              rc=0 value=2720000
+attr 23 WarpSize?                       rc=0 value=10

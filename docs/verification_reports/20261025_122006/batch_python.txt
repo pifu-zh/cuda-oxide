@@ -1,0 +1,19 @@
+[PASS] vecadd
+[PASS] map_sum
+[PASS] array_for_loop
+[PASS] unroll_bounds_check
+[PASS] checked_arith
+[PASS] device_closures
+[PASS] dotprod
+[PASS] sharedmem
+[PASS] barrier
+[PASS] counted_barrier
+[PASS] atomics
+[PASS] redux_sum
+[PASS] warp_reduce
+[PASS] math_tan
+[excluded] array_index: 抽取器 brace 计数被字符串内 {} 干扰
+[excluded] shared_memory_helper: kernel 体依赖跨模块宏 shared_memory_helper_lib::shared_probe_body!
+[excluded] const_generic: #[kernel] 宏展开产生 cuda_host 引用，device-only 变体无法满足
+
+SUMMARY: llc-pass 14 / 17; ll-produced 14 / 17

@@ -44,7 +44,7 @@
 | 功能 | 状态 | 证据 | 缺口/下一步 |
 |---|---|---|---|
 | amdgpu_kernel 调用约定 + kernarg（标量/slice 两参包） | FULL | [e2e] pytest 两 GPU e2e；[run] vecadd | — |
-| ntid x/y/z 三形参（blockDim 三维，3-D block launch 语义） | FULL | [e2e] e1770ba2 原验证（gfx1030 分支，HSA 异常案例转绿）+ 本机 pytest 含三参单测；**注意**：本机 e2e fixture 仍是 1-D launch，3-D 的本机直验尚未做 | 补一个 3-D launch 的本机 e2e（矩阵跟进项 #1） |
+| ntid x/y/z 三形参（blockDim 三维，3-D block launch 语义） | FULL | [e2e] 本机 test_coords3d_3d_launch_end_to_end（block (4,3,2)，tid/ntid 六坐标编码 24/24 真卡核对，2026-10-20）+ [run] `cargo oxide run warp_reduce`（77 个 3-D 形状含 (3,5,3)/(8,8,8)，集成管线真卡全过） | — |
 | grid 常量/cluster 等高级 launch 特性 | UNSUPPORTED / NOT TESTED | cluster：RDNA2 无硬件（同 MFMA 依据）；grid_constant：上游 #1327 packed-as3 形态差异在 Python 维度有适配，集成维度 NOT TESTED | 逐例核对 batch 记录 |
 | Code Object 装载（hipModuleLoadData） | FULL | [e2e] 两个 GPU e2e 走该路径；[run] vecadd | — |
 
@@ -63,7 +63,7 @@
 
 | 功能 | 状态 | 证据 | 缺口/下一步 |
 |---|---|---|---|
-| tid/ctaid x/y/z → workitem/workgroup id（1-D 语义） | FULL | [e2e] vecadd/barrier e2e；[probe] 设备身份测试确认 gfx1030 agent | 3-D 索引正确性随跟进项 #1 |
+| tid/ctaid x/y/z → workitem/workgroup id（含 3-D） | FULL | [e2e] vecadd/barrier e2e；[e2e] coords3d 三维索引（tid.y/z 硬件值+三形参 kernarg，24/24）；[probe] 设备身份测试确认 gfx1030 agent | — |
 | 全组 barrier（barrier0 → s.barrier） | FULL | [e2e] barrier_smoke 例 [hist] + 本机 batch | — |
 | 静态共享内存（LDS，undef 初始化契约） | FULL | [hist] sharedmem 例 GPU PASS；[e2e] pytest alloca/addrspace 测试 | — |
 | mbarrier（软件单字状态机：pending/expected/phase） | FULL | [e2e] 本机 test_barrier_mbarrier_software 三 kernel 语义断言全过（补重放 Step 16 后） | expect_tx 字节级（=vmcnt 部分排空等价）待实现 |
@@ -111,7 +111,7 @@
 
 ## 矩阵跟进项（下一步优先序）
 
-1. 3-D block launch 的本机 GPU e2e（ntid x/y/z 直验）
+1. ~~3-D block launch 的本机 GPU e2e~~（已完成 2026-10-20：coords3d e2e + warp_reduce 集成执行）
 2. async launch 路径本机运行断言
 3. ~~review P1 修复批~~（已完成 2026-10-20：dlopen 绝对路径 / mbcnt.lo+hi / counted-barrier 注入点+id 范围 / batch exit code+stale hsaco / host func BLOCKING / sync 原生宏经补重放覆盖）
 4. 性能基线重建（Phase D 性能门）

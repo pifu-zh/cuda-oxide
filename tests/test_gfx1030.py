@@ -136,6 +136,61 @@ def _run(cmd, **kw):
 # ---------------------------------------------------------------------------
 
 
+PROBE3D_MAIN_RS = """\
+//! [PORT gfx1030][goal] 3-D block launch 回归探针: coords3d kernel 读取
+//! tid/ntid 全部六个 sreg（三形参语义的完全体），把六个坐标值编码进一个
+//! u32，真卡断言逐一核对。对应补重放 e1770ba2（ntid kernarg x→x/y/z）。
+
+use cuda_device::{cuda_module, kernel, thread};
+
+#[cuda_module]
+mod kernels {
+    use super::*;
+
+    #[kernel]
+    pub fn coords3d(out: &mut [u32]) {
+        let tx = thread::threadIdx_x();
+        let ty = thread::threadIdx_y();
+        let tz = thread::threadIdx_z();
+        let nx = thread::blockDim_x();
+        let ny = thread::blockDim_y();
+        let nz = thread::blockDim_z();
+        // 三维坐标线性化（block (4,3,2)）：i = tz*ny*nx + ty*nx + tx
+        let i = ((tz * ny + ty) * nx + tx) as usize;
+        // tid 编进低 20 位，ntid 编进高 12 位
+        out[i] = tx | (ty << 8) | (tz << 16) | (nx << 20) | (ny << 24) | (nz << 28);
+    }
+}
+
+fn main() {
+    println!("probe3d host stub");
+}
+"""
+
+
+def _write_probe3d_crate(crate_dir: Path) -> None:
+    crate_dir.mkdir(parents=True, exist_ok=True)
+    (crate_dir / "Cargo.toml").write_text(
+        f"""\
+[package]
+name = "ox-gfx1030-probe3d"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# [PORT gfx1030][goal] device-only 3-D 探针: 刻意不依赖 cuda-core/cuda-host
+# (即 cuda-bindings), 构建不触发 CUDA toolkit 探测。
+
+[dependencies]
+cuda-device = {{ path = "{REPO_ROOT / 'crates' / 'cuda-device'}" }}
+
+[workspace]
+"""
+    )
+    (crate_dir / "src").mkdir(exist_ok=True)
+    (crate_dir / "src" / "main.rs").write_text(PROBE3D_MAIN_RS)
+
+
 @pytest.fixture(scope="module")
 def built_probe(tmp_path_factory):
     crate_dir = tmp_path_factory.mktemp("gfx1030-probe")
@@ -462,13 +517,15 @@ entry:
 
 
 def test_ir_translate_shuffle():
-    """Step 10/10c：shfl → ds_bpermute（*4 字节偏移）、laneid → mbcnt.lo、
+    """Step 10/10c：shfl → ds_bpermute（*4 字节偏移）、laneid → mbcnt.lo+hi、
     f64 PTX-asm 拆分 → 双 ds_bpermute（GPU 数值已验证四模式 + i32 + f64）。"""
     out = translate_nvvm_to_amdgcn(SAMPLE_SHFL_IR)
 
     assert "llvm.nvvm" not in out, "shfl/laneid intrinsic 残留"
-    # laneid → mbcnt.lo；shfl 结果写回原 SSA 名
-    assert "%lane = call i32 @llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)" in out
+    # laneid → mbcnt.lo+hi 两段（wave64 正确，wave32 下 hi 恒 0）；
+    # shfl 结果写回原 SSA 名
+    assert "%lane.lnlo = call i32 @llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)" in out
+    assert "%lane = call i32 @llvm.amdgcn.mbcnt.hi(i32 -1, i32 %lane.lnlo)" in out
     # NV lane 号 → AMD 字节偏移：shl src, 2（f32×4 + f64 拆分的 off 共 5）
     assert out.count("shl i32") == 5, "字节偏移转换缺失"
     assert out.count("@llvm.amdgcn.ds.bpermute") == 4 + 2, "f32×4 + f64 拆分×2"
@@ -1155,6 +1212,144 @@ int main() {
     }
     printf(bad == 0 ? "PASS: all %zu elements correct\\n" : "FAIL: %zu mismatches\\n",
            bad == 0 ? N : (size_t)bad);
+    return bad != 0;
+}
+"""
+
+
+# ---------------------------------------------------------------------------
+# 测试 5：3-D block launch E2E（补重放 e1770ba2 的 ntid x/y/z 三形参语义，
+# 真机数值断言：block (4,3,2)，kernel 读 tid/ntid 全部六个 sreg）
+# ---------------------------------------------------------------------------
+
+
+def test_coords3d_3d_launch_end_to_end(tmp_path):
+    """[PORT gfx1030][goal] 三维 block launch 端到端：coords3d kernel 把
+    tid.{x,y,z} 与 ntid.{x,y,z} 六个坐标编码进一个 u32 写出，host 探针在
+    block (4,3,2) / grid (1,1,1) 下逐一核对 24 个元素。
+
+    三个内核外断言把"语义正确"钉在 IR 层：
+      1. 改写后无 nvvm 残留（六个 sreg 全部被消费）；
+      2. kernel 签名恰好追加 i32 %ntid_x, %ntid_y, %ntid_z 三个形参
+         （三形参语义的直接证据——1-D 时代的折叠为此处的反例）；
+      3. 真卡数值 = 主机端独立参考实现（同一编码公式的 C 侧副本）。
+    """
+    if not _docker_available() and not _host_rocm_available():
+        pytest.skip(f"docker 容器 {DOCKER_CONTAINER} 与宿主机 ROCm 工具均不可用")
+    assert _gpu_available(), "rocm-smi 报告 GPU 不可用（GPU down 立即停）"
+
+    crate_dir = tmp_path / "ox-probe3d"
+    _write_probe3d_crate(crate_dir)
+    env = dict(os.environ, CUDA_TOOLKIT_PATH=CUDA_TOOLKIT_PATH)
+    proc = _run(["cargo", f"+{NIGHTLY}", "oxide", "build"], cwd=crate_dir,
+                env=env, timeout=600)
+    assert proc.returncode == 0, (
+        f"[阶段 .ll-产出: cargo oxide build] 失败 (rc={proc.returncode})\n"
+        f"--- 关键错误输出（尾20行）---\n{_tail(proc.stdout + proc.stderr)}\n"
+        f"--- 环境前提状态 ---\n{_env_diag()}"
+    )
+    opt_ll = sorted(crate_dir.glob("*.opt.ll")) or [
+        p for p in crate_dir.glob("*.ll") if not p.name.endswith(".opt.ll")
+    ]
+    assert opt_ll, f"未找到 .ll 产物: {list(crate_dir.iterdir())}"
+
+    translated = translate_nvvm_to_amdgcn(opt_ll[0].read_text())
+    assert "llvm.nvvm" not in translated, "3-D 探针改写后有 nvvm 残留"
+    # 三形参签名的直接证据（补重放 e1770ba2 的语义落点）。
+    # 注意不要用 [^)]* 跨参数匹配——参数属性 captures(none) 里有嵌套括号
+    # （与 prep pass 文档记录的是同一个坑）。
+    define_line = next(
+        (l for l in translated.splitlines()
+         if "define amdgpu_kernel void @coords3d(" in l), "")
+    assert "i32 %ntid_x, i32 %ntid_y, i32 %ntid_z)" in define_line, (
+        "[阶段 IR-三形参] coords3d 签名未追加 ntid_x/y/z 三形参\n"
+        f"--- define 行 ---\n{define_line}"
+    )
+    amdgcn_ll = crate_dir / "coords3d_amdgcn.ll"
+    amdgcn_ll.write_text(translated)
+
+    co = crate_dir / "coords3d_v5.co"
+    proc = _run([
+        str(LLC), "-march=amdgcn", "-mcpu=gfx1030",
+        "-amdhsa-code-object-version=5", "--filetype=obj",
+        str(amdgcn_ll), "-o", str(co),
+    ])
+    assert proc.returncode == 0, (
+        f"[阶段 llc→code-object] 失败 (rc={proc.returncode})\n"
+        f"--- 关键错误输出（尾20行）---\n{_tail(proc.stderr)}\n"
+        f"--- 环境前提状态 ---\n{_env_diag()}"
+    )
+
+    if _docker_available():
+        docker_cp(co, "coords3d_v5.co")
+        wd = CONTAINER_WORKDIR
+    else:
+        wd = crate_dir
+    host_cpp = crate_dir / "host_coords3d_test.cpp"
+    host_cpp.write_text(HOST_COORDS3D_CPP.replace("@CO_PATH@", "coords3d_linked.co"))
+    if _docker_available():
+        docker_cp(host_cpp, "host_coords3d_test.cpp")
+
+    proc = _link_compile_run(wd, "coords3d_v5.co", "coords3d_linked.co",
+                             host_cpp, "host_coords3d_test")
+    assert proc.returncode == 0, (
+        f"[阶段 链接/编译/运行] 失败 (rc={proc.returncode})\n"
+        f"--- 关键错误输出 stdout（尾20行）---\n{_tail(proc.stdout)}\n"
+        f"--- 关键错误输出 stderr（尾20行）---\n{_tail(proc.stderr)}\n"
+        f"--- 环境前提状态 ---\n{_env_diag()}"
+    )
+    assert "PASS: coords3d 24/24" in proc.stdout, (
+        f"[阶段 GPU-数值校验] 未 PASS\n--- stdout（尾20行）---\n{_tail(proc.stdout)}"
+    )
+
+
+# coords3d host 探针：block (4,3,2)（kernarg = ptr+len + ntid_x/y/z 三形参），
+# 期望值编码公式与 kernel 逐位一致（独立 C 侧参考实现）。
+HOST_COORDS3D_CPP = """\
+// [PORT gfx1030][goal] generated by tests/test_gfx1030.py (coords3d host probe)
+#include <hip/hip_runtime.h>
+#include <cstdio>
+#include <vector>
+#include <fstream>
+#define CK(x) do { hipError_t e = (x); if (e != hipSuccess) { \
+    printf("HIP error %s at %s:%d\\n", hipGetErrorString(e), __FILE__, __LINE__); return 1; } } while(0)
+
+int main() {
+    std::ifstream f("@CO_PATH@", std::ios::binary);
+    std::vector<char> img((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    printf("co bytes: %zu\\n", img.size());
+
+    const unsigned NX = 4, NY = 3, NZ = 2;   // block (4,3,2)
+    const unsigned N = NX * NY * NZ;         // 24 threads, grid (1,1,1)
+    std::vector<unsigned> h(N, 0);
+
+    unsigned *d;
+    CK(hipMalloc(&d, N * 4));
+    CK(hipMemset(d, 0, N * 4));
+
+    hipModule_t mod; CK(hipModuleLoadData(&mod, img.data()));
+    hipFunction_t fn; CK(hipModuleGetFunction(&fn, mod, "coords3d"));
+
+    // kernarg = (ptr out, i64 n, i32 ntid_x, i32 ntid_y, i32 ntid_z)
+    long long n = N;
+    unsigned ntx = NX, nty = NY, ntz = NZ;
+    void *kparams[] = { &d, &n, &ntx, &nty, &ntz };
+    CK(hipModuleLaunchKernel(fn, 1, 1, 1, NX, NY, NZ, 0, nullptr, kparams, nullptr));
+    CK(hipDeviceSynchronize());
+
+    CK(hipMemcpy(h.data(), d, N * 4, hipMemcpyDeviceToHost));
+    int bad = 0;
+    for (unsigned i = 0; i < N; i++) {
+        unsigned tx = i % NX, ty = (i / NX) % NY, tz = i / (NX * NY);
+        unsigned want = tx | (ty << 8) | (tz << 16)
+                      | (NX << 20) | (NY << 24) | (NZ << 28);
+        if (h[i] != want) {
+            if (bad < 5) printf("MISMATCH @%u: got %08x want %08x\\n", i, h[i], want);
+            bad++;
+        }
+    }
+    printf(bad == 0 ? "PASS: coords3d %u/%u (block %ux%ux%u)\\n" : "FAIL: %d mismatches\\n",
+           bad == 0 ? N : (unsigned)bad, N, NX, NY, NZ);
     return bad != 0;
 }
 """

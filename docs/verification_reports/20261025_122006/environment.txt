@@ -1,0 +1,47 @@
+== kernel ==
+Linux zhuo-MS-7D32 7.3.0-9-generic #9-Ubuntu SMP PREEMPT_DYNAMIC Mon Oct  5 10:38:02 UTC 2026 x86_64 GNU/Linux
+== GPU (amd-smi) ==
++------------------------------------------------------------------------------+
+| AMD-SMI            27.1.0+7da43026                                           |
+| OS kernel Version: 7.3.0-9-generic                                           |
+| ROCm Version:      10.1.0                                                    |
+| VBIOS Version:     605149                                                    |
+| Platform:          Linux Baremetal                                           |
+|-------------------------------------+----------------------------------------|
+| BDF                        GPU-Name | Mem-Uti   Temp   UEC       Power-Usage |
+| GPU  HIP-ID  OAM-ID  Partition-Mode | GFX-Uti    Fan               Mem-Usage |
+|=====================================+========================================|
+| 0000:03:00.0  AMD Radeon RX 6950 XT | 0 %      49 °C   0            37/250 W |
+|   0       0     N/A             N/A | 4 %      0.0 %           1445/16368 MB |
++-------------------------------------+----------------------------------------+
++------------------------------------------------------------------------------+
+| Processes:                                                                   |
+|  GPU      PID  Process Name     GTT_MEM  VRAM_MEM  MEM_USAGE   CU %     SDMA |
+|==============================================================================|
+|  No running processes found                                                  |
++------------------------------------------------------------------------------+
+== GPU (rocminfo gfx agents) ==
+  Marketing Name:          12th Gen Intel(R) Core(TM) i5-12490F
+  Vendor Name:             CPU                                
+  Marketing Name:          AMD Radeon RX 6950 XT              
+  Vendor Name:             AMD                                
+== ROCm ==
+lrwxrwxrwx 1 root root       16 Sep 26 05:23 /opt/rocm/lib/libamdhip64.so -> libamdhip64.so.7
+lrwxrwxrwx 1 root root       33 Sep 26 05:23 /opt/rocm/lib/libamdhip64.so.7 -> libamdhip64.so.7.16.26385-0000000
+== rustc (pinned) ==
+rustc 1.100.0-nightly (e457a7b0d 2026-08-27)
+== llc (toolchain llvm-tools) ==
+LLVM (http://llvm.org/):
+  LLVM version 23.1.0-rust-1.100.0-nightly
+== cargo-oxide ==
+cargo-oxide 0.2.1
+== repo ==
+fc01f459
+fc01f459 [PORT gfx1030][goal] review P1 batch: wave64-correct lanes, barrier envelopes, harness honesty
+a76b75b7 [PORT gfx1030][goal] support matrix + one-command verification harness
+f4762d8a [PORT gfx1030][goal] restore unroll_bounds_check + shared_memory_helper examples
+2ec08748 [PORT gfx1030][goal] test e2e: host-side fallback when the docker container is absent
+17d9e89b [PORT gfx1030][review] fix two device-attribute mappings (shared memory per block)
+3b2e05b2 [PORT gfx1030] generalize the ntid kernarg from x to x/y/z (3-D block launches)
+== python ==
+Python 3.14.8
