@@ -210,9 +210,11 @@ mod tests {
         ModuleExportState::new(
             ctx,
             false,
+            "ptx_kernel",
             DebugKind::Off,
             None,
             super::super::config::FunctionLocalStaticPlacement::CompileUnitGlobals,
+            false, // [PORT gfx1030] NVPTX 测试语义
         )
     }
 

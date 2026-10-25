@@ -16,6 +16,7 @@
 #![warn(missing_docs)]
 
 mod api;
+mod amdgcn;
 mod cutlass_backend;
 mod cutlass_compiler;
 mod error;
@@ -118,6 +119,8 @@ pub mod __private {
     pub use crate::cutlass_backend::{CutlassBackendConfig, DeviceBackend};
     #[doc(hidden)]
     pub use crate::error::PipelineError;
+    #[doc(hidden)]
+    pub use crate::amdgcn::{amdgcn_target, rewrite_ir_for_amdgcn};
     #[doc(hidden)]
     pub use crate::export::{DeviceExternAttrs, DeviceExternDecl};
     #[doc(hidden)]

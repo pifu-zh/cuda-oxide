@@ -15,7 +15,7 @@ use crate::cuda_module::model::{
     cuda_module_uniform_scalar,
 };
 use proc_macro2::TokenStream as TokenStream2;
-use quote::{format_ident, quote};
+use quote::{format_ident, quote, ToTokens};
 use syn::{GenericParam, Ident};
 
 pub(super) fn generate_cuda_module_kernel_signature(
@@ -506,6 +506,34 @@ fn generate_cuda_module_prepared_launch_method(kernel: &CudaModuleKernel) -> Tok
     }
 }
 
+/// [PORT gfx1030 PhaseB.1] The amdgcn ntid_x append for the async launch
+/// builders: `blockDim.x` becomes a trailing `i32 ntid_x` kernel parameter
+/// when the gfx routing is active (cuda-oxide-codegen/src/amdgcn.rs prep
+/// pass step 5; same contract as the sync launchers from Stage 2.b). The
+/// push must happen after every kernel argument — it has to be the last
+/// packet slot — and only behind the runtime gate; the driver consumes only
+/// the metadata-defined prefix of the parameter array, so kernels compiled
+/// without the extra parameter ignore the slot.
+///
+/// `config_expr` yields the effective `LaunchConfig` (`#config` for the raw
+/// forms, `#prepared.__raw_config()` for the contracted forms). The result
+/// is a token stream the callers hoist into a `let` before their `quote!`.
+fn cuda_module_async_ntid_append(launch: impl ToTokens, config_expr: impl ToTokens) -> TokenStream2 {
+    let ntid_x = internal_ident("__cuda_oxide_ntid_x");
+    let ntid_y = internal_ident("__cuda_oxide_ntid_y");
+    let ntid_z = internal_ident("__cuda_oxide_ntid_z");
+    quote! {
+        if ::cuda_host::launch::amdgcn_ntid_append_active() {
+            let #ntid_x: u32 = #config_expr.block_dim.0;
+            let #ntid_y: u32 = #config_expr.block_dim.1;
+            let #ntid_z: u32 = #config_expr.block_dim.2;
+            #launch.push_scalar_arg(#ntid_x);
+            #launch.push_scalar_arg(#ntid_y);
+            #launch.push_scalar_arg(#ntid_z);
+        }
+    }
+}
+
 pub(super) fn generate_cuda_module_async_launch_method(kernel: &CudaModuleKernel) -> TokenStream2 {
     if kernel.launch_contract.is_some() {
         generate_cuda_module_prepared_async_launch_method(kernel)
@@ -534,6 +562,7 @@ fn generate_cuda_module_legacy_async_launch_method(kernel: &CudaModuleKernel) ->
     let launch = internal_ident("__cuda_oxide_launch");
     let async_lifetime = cuda_module_async_lifetime();
     let cluster_dim = kernel.cluster_dim.map(|(x, y, z)| quote! { (#x, #y, #z) });
+    let ntid_append = cuda_module_async_ntid_append(&launch, &config);
     let set_cluster_dim = cluster_dim.map(|cluster_dim| {
         quote! {
             ::cuda_host::set_async_kernel_cluster_dim(&mut #launch, #cluster_dim);
@@ -566,6 +595,7 @@ fn generate_cuda_module_legacy_async_launch_method(kernel: &CudaModuleKernel) ->
             #set_cluster_dim
             #set_cooperative
             #(#arg_marshalling)*
+            #ntid_append
             // SAFETY: this method is unsafe and its caller must uphold the raw
             // launch configuration contract documented above.
             Ok(unsafe { #launch.finalize_unchecked(#config) })
@@ -609,6 +639,8 @@ fn generate_cuda_module_prepared_async_launch_method(kernel: &CudaModuleKernel) 
     let unchecked_cluster = cluster_dim.as_ref().map(|cluster_dim| {
         quote! { ::cuda_host::set_async_kernel_cluster_dim(&mut #launch, #cluster_dim); }
     });
+    let prepared_ntid_append = cuda_module_async_ntid_append(&launch, quote! { #prepared.__raw_config() });
+    let unchecked_ntid_append = cuda_module_async_ntid_append(&launch, &config);
     let prepared_cooperative = kernel.cooperative.then(|| {
         quote! { ::cuda_host::set_async_kernel_cooperative(&mut #launch, true); }
     });
@@ -664,6 +696,7 @@ fn generate_cuda_module_prepared_async_launch_method(kernel: &CudaModuleKernel) 
             #prepared_cluster
             #prepared_cooperative
             #(#prepared_marshalling)*
+            #prepared_ntid_append
             // SAFETY: PreparedLaunch validated this kernel-branded config and
             // the builder has not exposed a way to mutate it after finalization.
             let #launch = unsafe {
@@ -695,6 +728,7 @@ fn generate_cuda_module_prepared_async_launch_method(kernel: &CudaModuleKernel) 
             #unchecked_cluster
             #unchecked_cooperative
             #(#unchecked_marshalling)*
+            #unchecked_ntid_append
             // SAFETY: this method is unsafe and its caller must uphold the
             // contracted kernel's raw launch requirements documented above.
             Ok(unsafe { #launch.finalize_unchecked(#config) })
@@ -755,6 +789,7 @@ fn generate_cuda_module_legacy_owned_async_launch_method(
     let function = internal_ident("__cuda_oxide_function");
     let launch = internal_ident("__cuda_oxide_launch");
     let cluster_dim = kernel.cluster_dim.map(|(x, y, z)| quote! { (#x, #y, #z) });
+    let ntid_append = cuda_module_async_ntid_append(&launch, &config);
     let set_cluster_dim = cluster_dim.map(|cluster_dim| {
         quote! {
             ::cuda_host::set_async_kernel_cluster_dim(&mut #launch, #cluster_dim);
@@ -795,6 +830,7 @@ fn generate_cuda_module_legacy_owned_async_launch_method(
             #set_cluster_dim
             #set_cooperative
             #(#arg_marshalling)*
+            #ntid_append
             // SAFETY: this method is unsafe and its caller must uphold the raw
             // launch configuration contract documented above.
             let #launch: ::cuda_host::AsyncKernelLaunch<'static> =
@@ -862,6 +898,8 @@ fn generate_cuda_module_prepared_owned_async_launch_method(
     let launch = internal_ident("__cuda_oxide_launch");
     let owned = internal_ident("__cuda_oxide_owned");
     let cluster_dim = kernel.cluster_dim.map(|(x, y, z)| quote! { (#x, #y, #z) });
+    let prepared_ntid_append = cuda_module_async_ntid_append(&launch, quote! { #prepared.__raw_config() });
+    let unchecked_ntid_append = cuda_module_async_ntid_append(&launch, &config);
     let prepared_cluster = cluster_dim.as_ref().map(|cluster_dim| {
         quote! { ::cuda_host::set_async_kernel_cluster_dim(&mut #launch, #cluster_dim); }
     });
@@ -936,6 +974,7 @@ fn generate_cuda_module_prepared_owned_async_launch_method(
             #prepared_cluster
             #prepared_cooperative
             #(#prepared_marshalling)*
+            #prepared_ntid_append
             // SAFETY: PreparedLaunch validated this kernel-branded config and
             // the builder has not exposed a way to mutate it after finalization.
             let #launch: ::cuda_host::AsyncKernelLaunch<'static> = unsafe {
@@ -969,6 +1008,7 @@ fn generate_cuda_module_prepared_owned_async_launch_method(
             #unchecked_cluster
             #unchecked_cooperative
             #(#unchecked_marshalling)*
+            #unchecked_ntid_append
             // SAFETY: this method is unsafe and its caller must uphold the
             // contracted kernel's raw launch requirements documented above.
             let #launch: ::cuda_host::AsyncKernelLaunch<'static> =
@@ -1257,8 +1297,35 @@ fn cuda_module_launch_call(kernel: &CudaModuleKernel) -> TokenStream2 {
     let stream = internal_ident("__cuda_oxide_stream");
     let config = internal_ident("__cuda_oxide_config");
     let args = internal_ident("__cuda_oxide_args");
+    // [PORT gfx1030 Stage2.b] amdgcn kernels get their `blockDim.{x,y,z}`
+    // reads rewritten into trailing `i32 ntid_{x,y,z}` kernel parameters
+    // (AMDGPU has no blockDim sreg; cuda-oxide-codegen/src/amdgcn.rs prep
+    // pass step 5), so the host must supply all three as the last launch
+    // arguments. Appended before every generated sync launch; the driver
+    // consumes only the metadata-defined prefix of the parameter array, so
+    // kernels compiled without the extra parameters ignore the slots. The
+    // x/y/z generalization covers the #1311 3-D block shapes.
+    let ntid_x = internal_ident("__cuda_oxide_ntid_x");
+    let ntid_y = internal_ident("__cuda_oxide_ntid_y");
+    let ntid_z = internal_ident("__cuda_oxide_ntid_z");
+    let ntid_append = quote! {
+        #[allow(unused_mut, unused_variables)]
+        let mut #ntid_x: u32 = 0;
+        #[allow(unused_mut, unused_variables)]
+        let mut #ntid_y: u32 = 0;
+        #[allow(unused_mut, unused_variables)]
+        let mut #ntid_z: u32 = 0;
+        if ::cuda_host::launch::amdgcn_ntid_append_active() {
+            #ntid_x = #config.block_dim.0;
+            #ntid_y = #config.block_dim.1;
+            #ntid_z = #config.block_dim.2;
+            #args.push(::core::ptr::addr_of_mut!(#ntid_x) as *mut ::std::ffi::c_void);
+            #args.push(::core::ptr::addr_of_mut!(#ntid_y) as *mut ::std::ffi::c_void);
+            #args.push(::core::ptr::addr_of_mut!(#ntid_z) as *mut ::std::ffi::c_void);
+        }
+    };
     let cluster_dim = kernel.cluster_dim.map(|(x, y, z)| quote! { (#x, #y, #z) });
-    match (cluster_dim, kernel.cooperative) {
+    let launch = match (cluster_dim, kernel.cooperative) {
         (Some(cluster_dim), true) => quote! {
             unsafe {
                 ::cuda_core::launch_kernel_ex_cooperative_on_stream(
@@ -1309,7 +1376,11 @@ fn cuda_module_launch_call(kernel: &CudaModuleKernel) -> TokenStream2 {
                 )
             }
         },
-    }
+    };
+    quote! {{
+        #ntid_append
+        #launch
+    }}
 }
 
 /// Whether rustc must create distinct code for this generic parameter list.

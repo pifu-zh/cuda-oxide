@@ -119,8 +119,11 @@ pub(super) struct ModuleExportState<'a> {
     pub(super) function_abi_alignments: Vec<FunctionAbiAlignment>,
     /// Parameters carrying LLVM `byval` plus NVVM `grid_constant` semantics.
     pub(super) grid_constant_kernels: Vec<KernelGridConstants>,
-    /// Whether to print `ptx_kernel` on kernel definitions.
+    /// Whether to print the kernel calling convention on kernel definitions.
     pub(super) emit_ptx_kernel_keyword: bool,
+    /// [PORT gfx1030] Keyword printed when `emit_ptx_kernel_keyword` is true
+    /// (`ptx_kernel`, or `amdgpu_kernel` for the AMDGPU export config).
+    pub(super) kernel_callconv_keyword: &'static str,
     /// Track device function names for @llvm.used (standalone device fn compilation)
     pub(super) device_functions: Vec<String>,
     /// Defined globals retain external linkage because CUDA host code can
@@ -163,6 +166,8 @@ pub(super) struct ModuleExportState<'a> {
     pub(super) debug_function_local_static_placement: FunctionLocalStaticPlacement,
     /// NVVM textual dialect, or `None` for the ordinary PTX/llc path.
     pub(super) nvvm_ir_dialect: Option<NvvmIrDialect>,
+    /// [PORT gfx1030] Emit `undef` for address-space-3 globals (AMDGPU LDS).
+    pub(super) undef_shared_globals: bool,
     /// The single compile unit used for Stage 2 line-table debug info.
     pub(super) debug_compile_unit: Option<usize>,
     /// `DIFile` nodes keyed by the source path they describe.
@@ -234,9 +239,11 @@ impl<'a> ModuleExportState<'a> {
     pub(super) fn new(
         ctx: &'a pliron::context::Context,
         emit_ptx_kernel_keyword: bool,
+        kernel_callconv_keyword: &'static str,
         debug_kind: DebugKind,
         nvvm_ir_dialect: Option<NvvmIrDialect>,
         debug_function_local_static_placement: FunctionLocalStaticPlacement,
+        undef_shared_globals: bool,
     ) -> Self {
         Self {
             ctx,
@@ -247,6 +254,7 @@ impl<'a> ModuleExportState<'a> {
             function_abi_alignments: Vec::new(),
             grid_constant_kernels: Vec::new(),
             emit_ptx_kernel_keyword,
+            kernel_callconv_keyword,
             device_functions: Vec::new(),
             public_globals: Vec::new(),
             retained_globals: Vec::new(),
@@ -261,6 +269,7 @@ impl<'a> ModuleExportState<'a> {
             debug_kind,
             debug_function_local_static_placement,
             nvvm_ir_dialect,
+            undef_shared_globals,
             debug_compile_unit: None,
             debug_files: FxHashMap::default(),
             debug_subroutine_type: None,
@@ -323,6 +332,14 @@ impl<'a> ModuleExportState<'a> {
         // Block-level barriers
         name == "llvm.nvvm.barrier0"
             || name.starts_with("llvm.nvvm.barrier")
+            // [PORT gfx1030] AMDGPU workgroup barrier (Barrier0Op under
+            // IntrinsicBackend::Amdgcn)
+            || name == "llvm.amdgcn.s.barrier"
+            // [PORT gfx1030 Stage3-2] AMDGPU warp shuffles (LDS bpermute /
+            // permute / swizzle forms)
+            || name == "llvm.amdgcn.ds.bpermute"
+            || name == "llvm.amdgcn.ds.permute"
+            || name == "llvm.amdgcn.ds.swizzle"
             // mbarrier operations
             || name.starts_with("llvm.nvvm.mbarrier")
             // Warp shuffles (though LLVM usually handles these)

@@ -1323,9 +1323,11 @@ mod tests {
         let state = ModuleExportState::new(
             &ctx,
             true,
+            "ptx_kernel",
             super::super::config::DebugKind::LineTables,
             None,
             super::super::config::FunctionLocalStaticPlacement::CompileUnitGlobals,
+            false, // [PORT gfx1030] NVPTX 测试语义：不做 AS(3) undef 改写
         );
 
         let (path, pos) = state
@@ -1343,9 +1345,11 @@ mod tests {
         let mut state = ModuleExportState::new(
             &ctx,
             true,
+            "ptx_kernel",
             super::super::config::DebugKind::Full,
             None,
             super::super::config::FunctionLocalStaticPlacement::CompileUnitGlobals,
+            false, // [PORT gfx1030] NVPTX 测试语义：不做 AS(3) undef 改写
         );
         let info = global_info();
 

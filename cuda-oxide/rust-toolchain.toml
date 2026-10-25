@@ -1,5 +1,8 @@
 [toolchain]
-channel = "1.99.1"
+# [adapt-rocm] Upstream pins 1.99.1; resolved by channel name because the
+# versioned rustup dist path 404s on the tuna mirror. 1.99.1 IS current
+# stable at adaptation time (2026-10-25).
+channel = "stable"
 components = [
     "rust-src",
     "rustc-dev",
