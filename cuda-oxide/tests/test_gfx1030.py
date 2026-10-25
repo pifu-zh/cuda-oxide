@@ -126,6 +126,11 @@ cuda-device = {{ path = "{REPO_ROOT / 'crates' / 'cuda-device'}" }}
     )
     (crate_dir / "src").mkdir(exist_ok=True)
     (crate_dir / "src" / "main.rs").write_text(PROBE_MAIN_RS)
+    (crate_dir / ".cargo").mkdir(exist_ok=True)
+    (crate_dir / ".cargo" / "config.toml").write_text(
+        '''[env]
+RUSTC_BOOTSTRAP = "1"
+''')
 
 
 def _run(cmd, **kw):
@@ -190,6 +195,11 @@ cuda-device = {{ path = "{REPO_ROOT / 'crates' / 'cuda-device'}" }}
     )
     (crate_dir / "src").mkdir(exist_ok=True)
     (crate_dir / "src" / "main.rs").write_text(PROBE3D_MAIN_RS)
+    (crate_dir / ".cargo").mkdir(exist_ok=True)
+    (crate_dir / ".cargo" / "config.toml").write_text(
+        '''[env]
+RUSTC_BOOTSTRAP = "1"
+''')
 
 
 @pytest.fixture(scope="module")
@@ -197,7 +207,9 @@ def built_probe(tmp_path_factory):
     crate_dir = tmp_path_factory.mktemp("gfx1030-probe")
     _write_probe_crate(crate_dir)
 
-    env = dict(os.environ, CUDA_TOOLKIT_PATH=CUDA_TOOLKIT_PATH)
+    env = dict(os.environ, CUDA_TOOLKIT_PATH=CUDA_TOOLKIT_PATH,
+               # [adapt-rocm] pinned-stable toolchain unlocks -Z
+               RUSTC_BOOTSTRAP="1")
     proc = _run(["cargo", f"+{NIGHTLY}", "oxide", "build"], cwd=crate_dir, env=env)
     assert proc.returncode == 0, (
         f"[阶段 .ll-产出: cargo oxide build] 失败 (rc={proc.returncode})\n"
@@ -1014,7 +1026,9 @@ def test_barrier_mbarrier_software(tmp_path):
     crate_dir = tmp_path / "ox-barrier-e2e"
     ok, err = batch.build_variant("barrier", crate_dir)
     assert ok, f"[阶段 变体抽取] 失败: {err}"
-    env = dict(os.environ, CUDA_TOOLKIT_PATH=CUDA_TOOLKIT_PATH)
+    env = dict(os.environ, CUDA_TOOLKIT_PATH=CUDA_TOOLKIT_PATH,
+        # [adapt-rocm] pinned-stable unlocks -Z
+        RUSTC_BOOTSTRAP="1"),
     proc = _run(["cargo", f"+{NIGHTLY}", "oxide", "build"], cwd=crate_dir, env=env,
                 timeout=600)
     assert proc.returncode == 0, (
@@ -1241,7 +1255,9 @@ def test_coords3d_3d_launch_end_to_end(tmp_path):
 
     crate_dir = tmp_path / "ox-probe3d"
     _write_probe3d_crate(crate_dir)
-    env = dict(os.environ, CUDA_TOOLKIT_PATH=CUDA_TOOLKIT_PATH)
+    env = dict(os.environ, CUDA_TOOLKIT_PATH=CUDA_TOOLKIT_PATH,
+        # [adapt-rocm] pinned-stable unlocks -Z
+        RUSTC_BOOTSTRAP="1"),
     proc = _run(["cargo", f"+{NIGHTLY}", "oxide", "build"], cwd=crate_dir,
                 env=env, timeout=600)
     assert proc.returncode == 0, (

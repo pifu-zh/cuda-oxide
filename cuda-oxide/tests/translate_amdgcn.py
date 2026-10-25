@@ -211,12 +211,17 @@ _TYPED_IR_RE = re.compile(r"bitcast\s+[^;\n]*\*\s*%")
 
 
 def _split_top_level_commas(s: str):
-    """按括号深度切顶层逗号（<>/[]/() 内的逗号不算）。"""
+    """按括号深度切顶层逗号（<>/[]/(){}/ 内的逗号不算）。
+
+    [adapt-rocm] {} 补齐：上游新闭包 lower 出嵌套聚合 `{ { ptr }, i32,
+    [4 x i8] }`——内层 `}` 收掉后深度归 0，逗号被误切出 >2 段，整个
+    struct alloca 被跳过（llc verifier 报 addrspace(5) 缺失）。与 Rust
+    prep pass 的同名函数（Stage3-1 已含 {}）对齐。"""
     parts, depth, start = [], 0, 0
     for i, ch in enumerate(s):
-        if ch in "<[(":
+        if ch in "<[{(":
             depth += 1
-        elif ch in ">])":
+        elif ch in ">]})":
             depth -= 1
         elif ch == "," and depth == 0:
             parts.append(s[start:i].strip())

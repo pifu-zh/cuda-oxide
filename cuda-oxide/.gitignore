@@ -39,3 +39,4 @@ crates/dialect-mir/src/passes/
 crates/rustc-codegen-cuda/examples/*/bench/venv/
 crates/rustc-codegen-cuda/examples/gemm_sol/bench/cublaslt_bench
 crates/rustc-codegen-cuda/examples/gemm_sol_final/bench/cublaslt_bench
+__pycache__/

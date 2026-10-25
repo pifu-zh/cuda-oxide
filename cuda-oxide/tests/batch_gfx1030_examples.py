@@ -23,7 +23,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-REPO = Path("/home/zhuo/workspace/src/cuda-oxide")
+REPO = Path(__file__).resolve().parents[1]  # [adapt-rocm] cuda-oxide/
 EX = REPO / "crates/rustc-codegen-cuda/examples"
 # [adapt-rocm] 上游编译器已迁到 stable 1.99.1（rustc-dev on stable）
 NIGHTLY = "stable"
@@ -99,7 +99,18 @@ def extract_top_level_items(src: str):
     i = 0
     while i < len(lines):
         line = lines[i]
-        if re.match(r"^(pub\s+)?(const|static|type)\b", line):
+        # [adapt-rocm] struct/enum 纳入：上游 sharedmem 把 `pub struct V4(...)`
+        # 提到 crate 顶层、kernels mod 经 use super::* 引用——缺了它抽取变体
+        # 编译失败（E0425）。brace 结构以 "}" 收尾（深度归零），元组结构以
+        # ";" 收尾，两种收尾都处理。
+        if re.match(r"^(pub\s+)?(const|static|type|struct|enum)\b", line):
+            # 定义行上方连续的 #[..] 属性行随定义一起带走
+            # （derive(Copy) 不带走 → E0507，sharedmem V4 实证）
+            start = i
+            while start > 0 and re.match(r"^\s*#\[", lines[start - 1]):
+                start -= 1
+            i = start
+            line = lines[i]
             depth = 0
             buf = []
             while i < len(lines):
@@ -107,7 +118,7 @@ def extract_top_level_items(src: str):
                 depth += sum(lines[i].count(c) for c in "{[(")
                 depth -= sum(lines[i].count(c) for c in "}])")
                 i += 1
-                if lines[i - 1].rstrip().endswith(";") and depth <= 0:
+                if depth <= 0 and lines[i - 1].rstrip().endswith((";", "}")):
                     break
             items.append("\n".join(buf))
         else:
@@ -206,7 +217,10 @@ def main():
                     help="追加集成化管线（CUDA_OXIDE_TARGET=gfx1030 直出 hsaco）测量")
     args = ap.parse_args()
 
-    env = dict(os.environ, CUDA_TOOLKIT_PATH=os.path.expanduser("~/opt/cuda13"))
+    env = dict(os.environ,
+               # [adapt-rocm] pinned-stable toolchain unlocks -Z
+               CUDA_TOOLKIT_PATH=os.path.expanduser("~/opt/cuda13"),
+               RUSTC_BOOTSTRAP="1")
     results = {}
 
     for name in EXAMPLES:
@@ -228,6 +242,9 @@ def main():
                 results[name] = rec
                 print(f"[extract-fail] {name}: {err}")
                 continue
+            (d / ".cargo").mkdir(exist_ok=True)
+            (d / ".cargo" / "config.toml").write_text(
+                '[env]\nRUSTC_BOOTSTRAP = "1"\n')
             proc = run(["cargo", f"+{NIGHTLY}", "oxide", "build"], cwd=d, env=env)
             if proc.returncode != 0:
                 rec.update(status="build_fail",
