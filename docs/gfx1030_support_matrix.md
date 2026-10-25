@@ -1,8 +1,8 @@
 # gfx1030 功能支持矩阵（ROCm + Rust for RX 6950 XT）
 
-**仓库**: pifu-zh/cuda-oxide @ replay-develop（2026-10-20 起含补重放 46ba3f6a/3b2e05b2 与 review 修复 17d9e89b/2ec08748）
+**仓库**: pifu-zh/cuda-oxide @ adapt-rocm（上游基线 fc747196f=+365 commits 新布局；HIP 接入=host-hip/cuda-hip-shim cdylib 以 libcuda.so.1 形态经 LD_LIBRARY_PATH 投喂上游 0.5.0 dlopen 加载器，[patch] 时代终结）
 **硬件**: AMD Radeon RX 6950 XT（Navi 21 / gfx1030 / RDNA2，wave64 硬件、wave32 编译默认）
-**软件**: Ubuntu 26.10 · amdgpu 内核驱动 · ROCm 10.1.0-3（amdrocm 包，HIP runtime .so.7.16）· rustc 1.100.0-nightly (2026-08-28) + llvm-tools（llc，LLVM 21）· cargo-oxide 0.2.1
+**软件**: Ubuntu 26.10 · amdgpu 内核驱动 · ROCm 10.1.0-3 · rustc **1.99.1 stable**（上游已迁 stable+RUSTC_BOOTSTRAP；llc=工具链 llvm-tools LLVM 23.1.1）
 
 ## 状态词汇与证据分级
 
@@ -55,9 +55,10 @@
 | host-hip 替身 crate（dlopen libamdhip64，204 个被引符号全覆盖） | FULL | [static] 子代理逐符号对账（cuda-core/async 引用面）+ 本机 vecadd/barrier 实跑 | 两处属性映射错行已修（17d9e89b，实机取证） |
 | hipMalloc/Memcpy/Free 基础内存路径 | FULL | [e2e] GPU e2e 即该路径 | — |
 | 属性查询（16 行映射表） | FULL | [probe] 本机 ROCm 10.1 按号直查：74=65536/75=65536/76=131072/77=报错，修复后两行与真值一致；其余行 7.16 容器头+10.1 头双确认 | `scripts/gfx1030_hip_attr_probe.c` 已固化为仓库工件 |
-| sync launch / async builder（cuda_launch_async!、cuda_module 各 9+ 变体） | PARTIAL | [e2e] sync（pytest e2e 用 hipModuleLaunchKernel 同 ABI）；sync 原生宏 ntid 已随 e1770ba2 补重放覆盖 | async 路径本机 e2e（矩阵跟进项 #2） |
+| sync launch | FULL | [e2e] vecadd/barrier/coords3d（hipModuleLaunchKernel 同 ABI）；sync 原生宏 ntid 三参已覆盖 | — |
+| async launch（cuda-async → 0.5.0 dlopen → shim） | **BLOCKED（调查中）** | 模块加载已通（2026-10-25 两修复：execution-arch gfx 路由——HIP CC 10.3 被误读 sm_103；ltoir 加 hsaco 文件工件路由——闭包工件原走 libNVVM 必拒）；现象=首个 async 闭包 launch 后 kernel 永不完成（strace：启动期 111 ioctl 后阻塞单等待，非自旋）。复现：`CUDA_OXIDE_TARGET=gfx1030 cargo oxide run host_closure`（adapt-rocm） | 下一步：非闭包 async 变体隔离 / rocprof 查 kernel 在跑否 / stream+event shim C 探针 |
 | stream/event/pool/managed 内存 | NOT TESTED | 符号在表 [static]；本机无运行断言 | 同上，逐面补 e2e |
-| host func / graph / multicast / cluster API | PARTIAL / UNSUPPORTED | v2 host func BLOCKING 已修（回落 cuLaunchHostFunc，2026-10-20）；graph/multicast：RDNA2 无硬件或明示 NOT_SUPPORTED stub [static] | host func 路径本机 e2e |
+| host func / graph / multicast / cluster API | PARTIAL / UNSUPPORTED | host func BLOCKING 回落随 shim 保留；graph 族符号在 shim 表；multicast/cluster：RDNA2 无硬件，shim 明示 NOT_SUPPORTED [static] | host func 路径本机 e2e |
 
 ## 5. 线程 / 工作组 / 索引 / 同步 / 共享内存
 
@@ -98,21 +99,26 @@
 | pytest 回归套件（IR 改写 10 + 设备身份 + GPU e2e 2） | FULL | [e2e] 本机 14/14 | docker 容器路径回退宿主机（已入树） |
 | 批量双维度验证（Python 改写管线 / Rust 集成管线） | FULL | [e2e] 本机 14/17+14/17 持平（3 例诚实排除：抽取器限制）；exit code + stale hsaco 两处假 PASS 源已修（2026-10-20） | — |
 | 一键验证+报告（scripts/verify_gfx1030.sh） | FULL | 本脚本：环境快照/5 门/汇总，时间戳归档 | 首跑归档随本矩阵提交 |
-| cargo-oxide doctor（工具链自检） | NOT TESTED | llc 解析逻辑存在（CUDA_OXIDE_LLC→rustlib→PATH） | 本机跑一次 doctor |
+| cargo-oxide doctor（工具链自检） | FULL | [run] 2026-10-25 "✅ Environment looks good!"（llc 经工具链 llvm-tools 解析；补齐 ~/opt/cuda13 的 libnvJitLink 后全绿——NV 专属件，gfx 路径本不依赖） | — |
 | 性能基线（rocprof/带宽/达标率） | NOT TESTED | 历史流程在 gpu-perf skill（主机 ROCm 7.14 时代）；10.1 时代未重建 | Phase D 后续：重建 L4 基线 |
-| 设备端调试信息（DWARF/llvm-objdump 核对） | NOT TESTED | llvm-tools 有 objdump；未跑 | 反汇编抽查 hsaco |
+| 产物反汇编抽查（llvm-objdump） | FULL | [run] vecadd.hsaco：`vecadd` 符号在 .text + `vecadd.kd` 内核描述符 + 真 RDNA2 ISA（v_add_co_u32/global_load_dword/s_cbranch_execz），elf64-amdgpu | DWARF 调试信息仍未验证（NOT TESTED） |
 
-## 已知限制与阻塞（跨条目）
+## 配套研究档案
+
+硬件能力差距与软件替代方案（含 soft-TMA 深度案例与 NOT FEASIBLE 证据基线）见 [research/gfx1030-substitution-catalogue.md](research/gfx1030-substitution-catalogue.md)。
+
+## 已知限制与阻塞（跨条线）
 
 1. **COv5×驱动耦合**：code object v6 被当前 amdgpu 驱动拒绝（partial 支持陷阱），驱动升级必须复验全套。
 3. **docker 缺组**：本机 zhuo 不在 docker 组（`sudo usermod -aG docker zhuo` 可解）；e2e 已回退宿主机直跑，不阻塞。
 4. **无 HIP 头**：ROCm 10.1 本机安装不含开发头；`amdrocm-runtime-dev10.1` 拆包至 `~/opt/rocm-headers/`（CPATH 接入），不动系统目录。
-5. **硬件能力边界**（RDNA2 事实，非缺陷）：无 MFMA/WMMA、无 TMA/TDM、无 cluster/multicast、fp8/fp4 无硬件——对应条目均给出软件等价或显式拒绝路径。
+5. **async 闭包 launch 挂死**（调查中，见 Runtime 节与研究档案 §4）。
+6. **硬件能力边界**（RDNA2 事实，非缺陷）：无 MFMA/WMMA、无 TMA/TDM、无 cluster/multicast、fp8/fp4 无硬件——对应条目均给出软件等价或显式拒绝路径。
 
 ## 矩阵跟进项（下一步优先序）
 
 1. ~~3-D block launch 的本机 GPU e2e~~（已完成 2026-10-20：coords3d e2e + warp_reduce 集成执行）
-2. async launch 路径本机运行断言
+2. ~~async launch 路径本机运行断言~~ → 转 BLOCKED 调查（见 Runtime 节；研究档案 §4 开放项 #1）
 3. ~~review P1 修复批~~（已完成 2026-10-20：dlopen 绝对路径 / mbcnt.lo+hi / counted-barrier 注入点+id 范围 / batch exit code+stale hsaco / host func BLOCKING / sync 原生宏经补重放覆盖）
 4. 性能基线重建（Phase D 性能门）
 5. batch 面从 17 例向 190+ 扩展（按族分批）

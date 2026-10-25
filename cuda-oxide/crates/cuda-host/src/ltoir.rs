@@ -829,6 +829,35 @@ pub fn load_kernel_module(
     let ll = dir.join(format!("{name}.ll"));
     let ltoir = dir.join(format!("{name}.ltoir"));
 
+    // [PORT gfx1030][adapt-rocm] On the AMDGPU path the build writes the
+    // linked code object into the ptx slot as `<name>.hsaco` (same build
+    // freshness as the sibling `.ll`, which records the gfx target). The
+    // `.ll` itself is NVVM-flavored source for the NVIDIA compiler; the
+    // rule-1 NVVM-IR route below would feed it to libNVVM with
+    // `-arch=gfx1030`, which rejects the arch outright. Route to the hsaco
+    // as a final image (cubin-equivalent) under the same CUDA_OXIDE_TARGET
+    // gfx key that selected the backend.
+    if std::env::var("CUDA_OXIDE_TARGET")
+        .ok()
+        .and_then(|target| target.parse::<CudaArch>().ok())
+        .is_some_and(|arch| arch.is_amdgcn())
+    {
+        let hsaco = dir.join(format!("{name}.hsaco"));
+        if hsaco
+            .try_exists()
+            .map_err(|source| LtoirError::Io {
+                path: hsaco.clone(),
+                source,
+            })?
+        {
+            return Ok(ctx.load_module_from_file(
+                hsaco
+                    .to_str()
+                    .expect("kernel artifact path is not valid UTF-8"),
+            )?);
+        }
+    }
+
     let has_recorded_nvvm_target =
         emitted_target_path(&ll)
             .try_exists()
@@ -988,7 +1017,25 @@ pub fn target_arch() -> Result<String, LtoirError> {
 
 /// Query the physical execution GPU. Target-related environment variables
 /// describe the input artifact, not the GPU that will execute it.
+///
+/// [PORT gfx1030][adapt-rocm] On the AMDGPU path the compute-capability
+/// query is meaningless for family detection: HIP reports the GCN arch
+/// number (gfx1030 -> major 10, minor 3), which this function's
+/// `sm_{major}{minor}` formatting would read as NVIDIA sm_103 — a different
+/// family and a lower capability than the emitted gfx1030 artifact, so
+/// `execution_route` rejects the load ("newer GPU cannot run on an older
+/// GPU"). When the gfx routing is active, the same `CUDA_OXIDE_TARGET`
+/// variable that selected the amdgcn backend names the executing device
+/// (the HIP shim only loads on this machine's gfx1030), so return it
+/// directly; the sm_ fallback below stays byte-identical for NVIDIA hosts.
 pub(crate) fn execution_arch_for_context(ctx: &CudaContext) -> Result<CudaArch, LtoirError> {
+    if let Ok(explicit) = std::env::var("CUDA_OXIDE_TARGET") {
+        if let Ok(arch) = explicit.parse::<CudaArch>()
+            && arch.is_amdgcn()
+        {
+            return Ok(arch);
+        }
+    }
     let (major, minor) = ctx.compute_capability()?;
     format!("sm_{major}{minor}")
         .parse::<CudaArch>()
