@@ -69,6 +69,18 @@ EXAMPLES = [
     # --- SWEEP_BATCH（编译级过、运行时另见矩阵行） ---
     "printf",  # llc 级过（vprintf 未定义符号存活到链接）；运行时 209 见矩阵
     "kernel_reference_validity",  # llc 级过（grid_constant 形态）
+    # --- SWEEP_BATCH q-z 段（2026-10-26 续扫 26 例：slice/tuple/enum 语义族、
+    # shared/volatile/unaligned 访存族；194/194 扫描收官，总 pass 87） ---
+    "reborrow", "ref_operand_mul", "repr_u32_enum_stride", "select_unpredictable",
+    "shared_debug", "shared_ptr_transmute", "shared_slice_unsize",
+    "shared_stage_select", "slice_from_raw_parts_cast", "slice_get_mut",
+    "slice_index_bounds_check", "slice_iterators", "slice_reslice",
+    "split_at_mut", "step_by", "struct_constant_provenance",
+    "switchint_128bit", "transmute_scalar_struct", "tuple_array_provenance",
+    "tuple_constant_provenance", "tuple_field_lookup", "unaligned_memory",
+    "uninit_const", "unroll_smoke", "volatile_memory", "warp_sums",
+    # tcgen05 = sweep_error：Blackwell tensor-core 例（llc 崩溃路径），
+    # 属 HARDWARE_LIMITED 范畴，不入批
 ]
 
 # v1 已知排除原因（照抄 examples-report.md，保持口径一致）
