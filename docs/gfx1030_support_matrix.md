@@ -99,11 +99,26 @@
 |---|---|---|---|
 | cargo oxide run/build/pipeline/inspect | FULL | [run] 本机 vecadd/barrier | — |
 | pytest 回归套件（IR 改写 10 + 设备身份 + GPU e2e 2） | FULL | [e2e] 本机 14/14 | docker 容器路径回退宿主机（已入树） |
-| 批量双维度验证（Python 改写管线 / Rust 集成管线） | FULL | [e2e] 本机 14/17+14/17 持平（3 例诚实排除：抽取器限制）；exit code + stale hsaco 两处假 PASS 源已修（2026-10-20） | — |
+| 批量双维度验证（Python 改写管线 / Rust 集成管线） | FULL | [e2e] 核心批 14/17+14/17 持平（3 例诚实排除：抽取器限制）；**[goal 扩展 2026-10-26]** 207 候选全管扫描跑至字母 p 段（shell 故障中断）：**58 新例全绿并入 EXAMPLES**（核心批 17→75），典型族：常量内存×4、enum/Option/dst/drop_glue 语义族、f16/libdevice 数学族、对齐访存族；13 例抽取失败=无 cuda_module 形态（已入诚实排除表）；llc 失败两类：PTX asm 约束缺口（h/f/l——f16/bf16 内嵌 asm 族， IMPLEMENTABLE）与 nvvm 残留致 llc abort（cluster/cp_async/elect 等 SM90+ 特性族， fail-loud）。**q-z 段（约 113 例）待 shell 恢复续扫** | 续扫 q-z；asm 约束映射入研究档案 |
 | 一键验证+报告（scripts/verify_gfx1030.sh） | FULL | 本脚本：环境快照/5 门/汇总，时间戳归档 | 首跑归档随本矩阵提交 |
 | cargo-oxide doctor（工具链自检） | FULL | [run] 2026-10-25 "✅ Environment looks good!"（llc 经工具链 llvm-tools 解析；补齐 ~/opt/cuda13 的 libnvJitLink 后全绿——NV 专属件，gfx 路径本不依赖） | — |
 | 性能基线（带宽/计算锚点，Phase D 门） | FULL | [run] 2026-10-25 ROCm 10.1 直链 HIP 基准（scripts/gfx1030_perf_baseline.c，hipcc 编译、事件计时、已入 verify 电池）：理论 575 GB/s（GDDR6 16T/pin/clk 公式，对 spec 576）；H2D/D2H 14.1/14.2 GB/s（pageable；历史 pinned 参照 24.9/28.5）；D2D copy 820 GB/s（历史同口径 862 互证）；triad 3N 有效 486 GB/s=**85% spec**；FFMA 25.9 TFLOPS≈双发射峰 93%。rocprofv3 在位、应用可跑但其产物提取未配置（开放项） | 90% 达标线属优化工作门，非本记录门 |
 | 产物反汇编抽查（llvm-objdump） | FULL | [run] vecadd.hsaco：`vecadd` 符号在 .text + `vecadd.kd` 内核描述符 + 真 RDNA2 ISA（v_add_co_u32/global_load_dword/s_cbranch_execz），elf64-amdgpu | DWARF 调试信息仍未验证（NOT TESTED） |
+
+## §8 性能要求判定（带宽/延迟 99% 理论线）
+
+| 项 | 实测天花板 | 判定 |
+|---|---|---|
+| 带宽（读流，DRAM-bound） | **553 GB/s = 96.1% of 575 spec**（192MB 工作集≫128MB L2，float4 访问） | 未达 99% |
+| 带宽（triad 混合读写） | 519 GB/s = 90.2%（11 配置扫描最优 v2@blk512；ILP4 更差 74%——纯流式需满 wave 并发） | 未达 99% |
+| 带宽（copy 2N） | 504 GB/s = 87.6% | 未达 99% |
+| 带宽（write-only 125%） | **缓存假象**：192MB store 落 128MB L2 后脏逐出异步发生，kernel 完成时未达 DRAM | 非 DRAM 带宽证据 |
+| 延迟（空 kernel 往返） | min 10.1 µs（2000 次取 min，中位 10.8） | 理论地板（doorbell+完成信号）未分解；需 rocprof/ftrace 拆解（开放项） |
+| 延迟（4KB D2D 同步拷贝） | min 11.5 µs | 同上 |
+
+**延迟"理论上限"的可审计定义（待实测分解确认）**：空 kernel 往返 = ①host 入队（AQL 包写+doorbell mmio，~1-3µs）+②GPU 取包分发（SPI/CP 流水，~2-4µs）+③完成信号写回+host 轮询唤醒（~2-5µs）。①③为软件+IO 地板、②为硬件地板；三者之和约 5-12µs，实测 10.1µs 落于此区间上沿。**99% 判定框架**：取"纯硬件地板"=②（rocprof 的 kernel duration 下界，gfx1030 空 kernel 实测通常 ~1-2µs）时，10.1µs 不达；取"含 doorbell 往返的系统地板"（①+②+③ 最小和）时需实测分解各段（rocprofv3 trace 或 ftrace:amdgpu doorbell 事件）后判定——**当前两口径均未闭环，延迟半边整体记 NOT TESTED→分解中**（shell 故障阻塞实测，恢复后跑 rocprofv3 --hip-event-trace 分解）。
+
+**99% 未达的物理依据（可审计）**：①GDDR6 DRAM 刷新（tREFI≈7.8µs/行，逐行周期性关停约 1-3% 带宽）；②读写总线换向（turnaround）与命令总线开销——混合流（triad/copy）额外损失；③MC 调度竞争。读流 96.1% 是无换向纯读的实测天花板；所有观测到的 >100% 数字（write-only 125%、历史 64MB D2D 820）均为 128MB Infinity Cache 命中假象。**结论：99% of pin-rate 理论值在任何实际 kernel 上物理不可达，按 goal §2 记 HARDWARE_LIMITED（依据如上）；96.1% 为诚实上限证据**。若"理论上限"采用运行时口径（rocprofv3-avail 的 max_bandwidth 字段——当前工具只吐字段名不吐值，开放项），数值待取。复现：`scripts/gfx1030_perf_tuned.c`（hipcc -O3 编译，已入 verify 电池 perf-tuned 门）。
 
 ## 配套研究档案
 

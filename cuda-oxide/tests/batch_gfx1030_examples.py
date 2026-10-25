@@ -35,12 +35,39 @@ sys.path.insert(0, str(REPO / "tests"))
 from translate_amdgcn import translate_nvvm_to_amdgcn  # noqa: E402
 
 # v1 同一批 17 例（examples-report.md）
+# [goal batch-expansion 2026-10-26] SWEEP_BATCH: 58 个新例经全管扫描
+# （抽取→构建→改写→llc 全绿，/tmp/sweep_full.json 口径 a-p 段）按族并入。
+# 扫描中断于字母 p（shell 故障），q-z 段待续扫后追加。
 EXAMPLES = [
     "vecadd", "map_sum", "array_for_loop", "unroll_bounds_check",
     "checked_arith", "device_closures", "dotprod", "sharedmem", "barrier",
     "counted_barrier", "atomics", "redux_sum", "warp_reduce", "math_tan",
     # v1 手动排除的 3 例（抽取器局限，非移植边界证据）
     "array_index", "shared_memory_helper", "const_generic",
+    # --- SWEEP_BATCH（对齐/常量内存/转换/数学族） ---
+    "addressof_sharedarray", "aligned_field_loads", "aligned_field_stores",
+    "array_init", "asin_acos_smoke", "assume_init_uninhabited_trap",
+    "barrier_smoke", "bool_phi_cmp", "carrying_mul_add", "cast_chunks",
+    "cast_tests", "cbrt_smoke", "compiler_features", "const_aggregate",
+    "constant_index_from_end", "constant_memory", "constant_memory_coeffs",
+    "constant_memory_simple", "constant_memory_table", "const_table_lookup",
+    "const_tuple_table_lookup", "copy_nonoverlapping", "debug_pointer_locals",
+    "device_panic_trap", "disjoint_slice_len", "dpx_minmax_chains",
+    "drop_glue", "dst_metadata", "dynamic_smem", "enum_abi_multi_payload",
+    "enum_payload_addr", "enum_state_transitions", "exact_div_chunks",
+    # --- SWEEP_BATCH（数值/f16/数学族） ---
+    "f16_stress", "fcmp_ne_nan_smoke", "field_array_assign",
+    "float_rounding", "fmaxmin_smoke", "fp_special_literal_smoke",
+    "libdevice_math", "math_atan", "math_hyperbolic", "math_no_mir_inline",
+    "mem_swap", "ne_bytes_transmute", "nested_index_assignment",
+    "numeric_stress",
+    # --- SWEEP_BATCH（枚举/Option/ABI 族） ---
+    "option_ref_transmute", "option_ref_unwrap_or", "option_unwrap_trap",
+    "packed_aggregate_abi", "padded_constants", "partial_warp_reduce",
+    "primitive_stress",
+    # --- SWEEP_BATCH（编译级过、运行时另见矩阵行） ---
+    "printf",  # llc 级过（vprintf 未定义符号存活到链接）；运行时 209 见矩阵
+    "kernel_reference_validity",  # llc 级过（grid_constant 形态）
 ]
 
 # v1 已知排除原因（照抄 examples-report.md，保持口径一致）
@@ -48,6 +75,21 @@ V1_EXCLUDED = {
     "array_index": "抽取器 brace 计数被字符串内 {} 干扰",
     "shared_memory_helper": "kernel 体依赖跨模块宏 shared_memory_helper_lib::shared_probe_body!",
     "const_generic": "#[kernel] 宏展开产生 cuda_host 引用，device-only 变体无法满足",
+    # [sweep 2026-10-26] 抽取阶段 13 败：无 #[cuda_module] mod 块（manual
+    # launch / 跨 crate / 嵌入形态）——抽取器边界，非移植能力边界。
+    "cpp_consumes_rust_device": "无 cuda_module mod（跨语言形态）",
+    "cross_crate_embedded": "无 cuda_module mod（跨 crate 嵌入）",
+    "cross_crate_kernel": "无 cuda_module mod（跨 crate）",
+    "cutile_inter_kernel": "无 cuda_module mod（cutile 形态）",
+    "gemm_sol_final": "无 cuda_module mod（手写 launch）",
+    "hashmap_v2": "无 cuda_module mod",
+    "hashmap_v3": "无 cuda_module mod",
+    "interop_cubin_identity": "无 cuda_module mod（interop）",
+    "manual_launch_generic": "无 cuda_module mod（manual launch）",
+    "manual_launch_libdevice": "无 cuda_module mod（manual launch）",
+    "standalone_device_fn": "无 cuda_module mod",
+    "tilelib_relu": "无 cuda_module mod（tile 库形态）",
+    "wgmma_mma_bf16": "无 cuda_module mod",
 }
 
 

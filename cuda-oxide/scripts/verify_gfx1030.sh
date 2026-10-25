@@ -104,6 +104,23 @@ else
   FAIL=$((FAIL+1)); FAILED+=("perf-baseline"); log "  FAILED (perf_baseline.txt / perf_compile.txt)"
 fi
 
+# --- 4c. tuned bandwidth/latency ceiling (goal section 8) ----------------------
+# Records the tuned ceiling: best-of config scan (vector width x block size),
+# L2-bypassing working set (576 MB per triad pass), direction probes, and
+# latency floors. Records + archives; the 99% target verdict is documented in
+# the support matrix with its physical basis.
+PERF2_BIN="$REPORT/perf_tuned"
+if CPATH="$HOME/opt/rocm-headers" /opt/rocm/bin/hipcc -O3 -D__HIP_PLATFORM_AMD__=1 \
+     --offload-arch=gfx1030 scripts/gfx1030_perf_tuned.c -o "$PERF2_BIN" \
+     > "$REPORT/perf_tuned_compile.txt" 2>&1 \
+   && timeout 400 "$PERF2_BIN" > "$REPORT/perf_tuned.txt" 2>&1 \
+   && grep -q "BEST triad" "$REPORT/perf_tuned.txt" \
+   && grep -q "round trip" "$REPORT/perf_tuned.txt"; then
+  PASS=$((PASS+1)); log "gate: perf-tuned PASS (see perf_tuned.txt)"
+else
+  FAIL=$((FAIL+1)); FAILED+=("perf-tuned"); log "  FAILED (perf_tuned.txt)"
+fi
+
 # --- 5. literal acceptance: cargo oxide run vecadd -----------------------------
 run_gate "literal-vecadd" "vecadd_run.txt" \
   env CUDA_OXIDE_TARGET=gfx1030 cargo oxide run vecadd
