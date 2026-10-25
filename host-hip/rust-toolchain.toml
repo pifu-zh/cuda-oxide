@@ -1,0 +1,7 @@
+# [adapt-rocm] The HIP shim crate is toolchain-independent (plain stable Rust
+# + libloading); pin it to the locally installed stable so shim builds never
+# trigger a rustup download (the root workspace pins 1.98.0 for the host
+# crates, which this detached crate does not need).
+[toolchain]
+channel = "stable"
+profile = "minimal"

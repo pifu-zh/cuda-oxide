@@ -1,0 +1,34 @@
+# [PORT gfx1030][adapt-rocm] A cu*-ABI shared-library shim backed by HIP.
+#
+# Upstream cuda-bindings 0.5.0 resolves the CUDA driver at run time by
+# dlopening `libcuda.so.1` and looking symbols up BY NAME (bindgen-generated
+# per-symbol shims, missing symbols degrade to None). This crate compiles the
+# audited cu*→hip* mapping (formerly the [patch.crates-io] stand-in) into a
+# cdylib that is installed as `libcuda.so.1` on an LD_LIBRARY_PATH-scoped
+# directory, so the unmodified upstream loader transparently drives HIP.
+#
+# No CUDA toolkit at build time; runtime-only dependency on libamdhip64.
+[package]
+name = "cuda-hip-shim"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "[PORT gfx1030] libcuda.so.1-shaped cdylib implementing the CUDA driver surface over HIP (dlopen libamdhip64)"
+publish = false
+
+[workspace]
+
+[lib]
+name = "cuda_hip_shim"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+# Vendored from the local cargo cache: the tuna sparse-index update stalls on
+# this network; a path dep keeps the shim build fully offline.
+libloading = { path = "vendor/libloading" }
+
+[profile.release]
+# Shim for a driver: extern "C" cannot unwind anyway; make it explicit and
+# keep the artifact small.
+panic = "abort"
