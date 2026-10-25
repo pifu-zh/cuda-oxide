@@ -1,0 +1,47 @@
+== kernel ==
+Linux zhuo-MS-7D32 7.3.0-9-generic #9-Ubuntu SMP PREEMPT_DYNAMIC Mon Oct  5 10:38:02 UTC 2026 x86_64 GNU/Linux
+== GPU (amd-smi) ==
++------------------------------------------------------------------------------+
+| AMD-SMI            27.1.0+7da43026                                           |
+| OS kernel Version: 7.3.0-9-generic                                           |
+| ROCm Version:      10.1.0                                                    |
+| VBIOS Version:     605149                                                    |
+| Platform:          Linux Baremetal                                           |
+|-------------------------------------+----------------------------------------|
+| BDF                        GPU-Name | Mem-Uti   Temp   UEC       Power-Usage |
+| GPU  HIP-ID  OAM-ID  Partition-Mode | GFX-Uti    Fan               Mem-Usage |
+|=====================================+========================================|
+| 0000:03:00.0  AMD Radeon RX 6950 XT | 0 %      38 °C   0            23/250 W |
+|   0       0     N/A             N/A | 2 %      0.0 %            761/16368 MB |
++-------------------------------------+----------------------------------------+
++------------------------------------------------------------------------------+
+| Processes:                                                                   |
+|  GPU      PID  Process Name     GTT_MEM  VRAM_MEM  MEM_USAGE   CU %     SDMA |
+|==============================================================================|
+|  No running processes found                                                  |
++------------------------------------------------------------------------------+
+== GPU (rocminfo gfx agents) ==
+  Marketing Name:          12th Gen Intel(R) Core(TM) i5-12490F
+  Vendor Name:             CPU                                
+  Marketing Name:          AMD Radeon RX 6950 XT              
+  Vendor Name:             AMD                                
+== ROCm ==
+lrwxrwxrwx 1 root root       16 Sep 26 05:23 /opt/rocm/lib/libamdhip64.so -> libamdhip64.so.7
+lrwxrwxrwx 1 root root       33 Sep 26 05:23 /opt/rocm/lib/libamdhip64.so.7 -> libamdhip64.so.7.16.26385-0000000
+== rustc (pinned) ==
+rustc 1.99.1 (58cf8f9c3 2026-10-13)
+== llc (toolchain llvm-tools) ==
+LLVM (http://llvm.org/):
+  LLVM version 23.1.1-rust-1.99.1-stable
+== cargo-oxide ==
+cargo-oxide 0.2.1
+== repo ==
+a71f3c363
+a71f3c363 [adapt-rocm] fix tuple-typed env from the RUSTC_BOOTSTRAP regex pass
+f5f37fc89 [adapt-rocm] test harness adaptations for the new base
+f99b8a7fe [adapt-rocm] restore ox-amdgcn-probe + barrier_smoke probe examples
+fec30048d [adapt-rocm] port the gfx1030 adaptation onto upstream fc747196f
+3a92d91ec [adapt-rocm] port: target-spec gfx family, mir-lower Amdgcn backend arms, host ntid append
+cafd5e314 [adapt-rocm] HIP shim crate: cu*-ABI cdylib for upstream cuda-bindings 0.5.0
+== python ==
+Python 3.14.8

@@ -1,0 +1,35 @@
+[PASS] vecadd
+[PASS] map_sum
+[PASS] array_for_loop
+[PASS] unroll_bounds_check
+[PASS] checked_arith
+[PASS] device_closures
+[PASS] dotprod
+[PASS] sharedmem
+[PASS] barrier
+[PASS] counted_barrier
+[PASS] atomics
+[PASS] redux_sum
+[PASS] warp_reduce
+[PASS] math_tan
+[excluded] array_index: 抽取器 brace 计数被字符串内 {} 干扰
+[excluded] shared_memory_helper: kernel 体依赖跨模块宏 shared_memory_helper_lib::shared_probe_body!
+[excluded] const_generic: #[kernel] 宏展开产生 cuda_host 引用，device-only 变体无法满足
+
+=== integrated pipeline (CUDA_OXIDE_TARGET=gfx1030 -> hsaco) ===
+[INTEGRATED PASS] vecadd: ox_batch_vecadd.hsaco
+[INTEGRATED PASS] map_sum: ox_batch_map_sum.hsaco
+[INTEGRATED PASS] array_for_loop: ox_batch_array_for_loop.hsaco
+[INTEGRATED PASS] unroll_bounds_check: ox_batch_unroll_bounds_check.hsaco
+[INTEGRATED PASS] checked_arith: ox_batch_checked_arith.hsaco
+[INTEGRATED PASS] device_closures: ox_batch_device_closures.hsaco
+[INTEGRATED PASS] dotprod: ox_batch_dotprod.hsaco
+[INTEGRATED PASS] sharedmem: ox_batch_sharedmem.hsaco
+[INTEGRATED PASS] barrier: ox_batch_barrier.hsaco
+[INTEGRATED PASS] counted_barrier: ox_batch_counted_barrier.hsaco
+[INTEGRATED PASS] atomics: ox_batch_atomics.hsaco
+[INTEGRATED PASS] redux_sum: ox_batch_redux_sum.hsaco
+[INTEGRATED PASS] warp_reduce: ox_batch_warp_reduce.hsaco
+[INTEGRATED PASS] math_tan: ox_batch_math_tan.hsaco
+
+SUMMARY: llc-pass 14 / 17; ll-produced 14 / 17; integrated hsaco-pass 14 / 17

@@ -16,9 +16,19 @@ STAMP="$(date +%Y%m%d_%H%M%S)"
 REPORT="$REPORT_ROOT/$STAMP"
 mkdir -p "$REPORT"
 cd "$(dirname "$0")/.."
-REPO="$PWD"
+REPO="$PWD"  # [adapt-rocm] = cuda-oxide/
 
 log() { echo "[verify-gfx1030] $*"; }
+
+# [adapt-rocm] shared build/runtime environment: pinned-stable -Z unlock,
+# CUDA-13 headers for cuda-bindings bindgen, and the HIP shim installed as
+# libcuda.so.1 for the upstream dlopen loader.
+export RUSTC_BOOTSTRAP=1
+export CUDA_TOOLKIT_PATH="$HOME/opt/cuda13"
+SHIM_LIB="$(cd "$(dirname "$0")/../../host-hip/cuda-hip-shim" 2>/dev/null && pwd)/shim-lib"
+if [ -d "$SHIM_LIB" ]; then
+  export LD_LIBRARY_PATH="$SHIM_LIB:${LD_LIBRARY_PATH:-}"
+fi
 
 # --- 0. environment snapshot -------------------------------------------------
 {
@@ -28,9 +38,9 @@ log() { echo "[verify-gfx1030] $*"; }
   rocminfo 2>/dev/null | grep -A2 'Marketing' | grep -E 'Name|gfx' | head -8
   echo "== ROCm ==";          ls -l /opt/rocm/lib/libamdhip64.so* 2>/dev/null | head -2
   echo "== rustc (pinned) =="
-  rustc +nightly-2026-08-28 --version 2>&1
+  rustc +stable --version 2>&1
   echo "== llc (toolchain llvm-tools) =="
-  "$HOME/.rustup/toolchains/nightly-2026-08-28-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/bin/llc" --version 2>&1 | head -2
+  "$HOME/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/bin/llc" --version 2>&1 | head -2
   echo "== cargo-oxide ==";   cargo-oxide --version 2>&1
   echo "== repo ==";          git -C "$REPO" rev-parse --short HEAD
   git -C "$REPO" log --oneline -6
