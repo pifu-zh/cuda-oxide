@@ -2421,7 +2421,8 @@ fn rewrite_packed_math(text: &str) -> String {
     if !text.contains("asm ") {
         return text.to_string();
     }
-    let mut ctr: u64 = 0;
+    static PM_CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let ctr = PM_CTR.fetch_add(1000, std::sync::atomic::Ordering::Relaxed);
     let mut out: Vec<String> = Vec::with_capacity(text.lines().count());
     for line in text.lines() {
         let trimmed = line.trim_start();
@@ -2430,8 +2431,7 @@ fn rewrite_packed_math(text: &str) -> String {
             continue;
         }
         let indent = &line[..line.len() - trimmed.len()];
-        ctr += 1;
-        let np = format!("_pm{ctr}_"); // unique prefix
+        let np = format!("_pm{ctr}_"); // unique prefix (1000-block per call)
         let res = trimmed.split(' ').next().unwrap_or("");
 
         // Extract operand list: everything between the outermost ( and )
@@ -2582,6 +2582,59 @@ fn rewrite_packed_math(text: &str) -> String {
                 out.push(format!("{indent}%{np}x1 = zext i16 %{np}b1 to i32"));
                 out.push(format!("{indent}%{np}xs = shl i32 %{np}x1, 16"));
                 out.push(format!("{indent}{res} = or i32 %{np}x0, %{np}xs"));
+                continue;
+            }
+        }
+        // -- cvt.rn/rz[.relu].bf16x2.f32 "=r,f,f"(float lo, float hi)
+        //    两 f32 → packed bf16x2（RNE 或 RTZ，可选 relu clamp）
+        if opcode.starts_with("cvt.rn.bf16x2") || opcode.starts_with("cvt.rz.bf16x2") {
+            let is_rz = opcode.contains("rz");
+            let is_relu = opcode.contains("relu");
+            let fls: Vec<&str> = ops_text.split("float ").skip(1)
+                .map(|s| s.split(',').next().unwrap_or("").trim()).collect();
+            if fls.len() == 2 {
+                // fls[0] = lo half source, fls[1] = hi half source
+                for (tag, src) in [("lo", fls[0]), ("hi", fls[1])] {
+                    if src.starts_with('%') {
+                        out.push(format!("{indent}%{np}f{tag} = bitcast float {src} to i32"));
+                    } else {
+                        out.push(format!("{indent}%{np}f{tag} = fadd float {src}, 0.0"));
+                        out.push(format!("{indent}%{np}f{tag} = bitcast float %{np}f{tag} to i32"));
+                    }
+                    if is_relu {
+                        out.push(format!("{indent}%{np}z{tag} = icmp slt i32 %{np}f{tag}, 0"));
+                        out.push(format!("{indent}%{np}f{tag} = select i1 %{np}z{tag}, i32 0, i32 %{np}f{tag}"));
+                    }
+                    if is_rz {
+                        out.push(format!("{indent}%{np}h{tag} = lshr i32 %{np}f{tag}, 16"));
+                    } else {
+                        // RNE: bits + 0x7FFF + lsb(bits>>16), then >>16
+                        out.push(format!("{indent}%{np}r{tag}.ls1 = lshr i32 %{np}f{tag}, 16"));
+                        out.push(format!("{indent}%{np}r{tag}.ls2 = and i32 %{np}r{tag}.ls1, 1"));
+                        out.push(format!("{indent}%{np}r{tag}.rnd = add i32 %{np}r{tag}.ls2, 32767"));
+                        out.push(format!("{indent}%{np}r{tag}.rn = add i32 %{np}f{tag}, %{np}r{tag}.rnd"));
+                        out.push(format!("{indent}%{np}h{tag} = lshr i32 %{np}r{tag}.rn, 16"));
+                    }
+                }
+                out.push(format!("{indent}%{np}hs = shl i32 %{np}hhi, 16"));
+                out.push(format!("{indent}{res} = or i32 %{np}hlo, %{np}hs"));
+                continue;
+            }
+        }
+        // -- cvt.rn/rz[.relu].f16x2.f32 relu 变体（已有 f16x2 非 relu 处理器）
+        if (opcode.starts_with("cvt.rn.relu.f16x2") || opcode.starts_with("cvt.rz.relu.f16x2")) {
+            let fls: Vec<&str> = ops_text.split("float ").skip(1)
+                .map(|s| s.split(',').next().unwrap_or("").trim()).collect();
+            if fls.len() == 2 {
+                for (tag, src) in [("lo", fls[0]), ("hi", fls[1])] {
+                    out.push(format!("{indent}%{np}h{tag} = fptrunc float {src} to half"));
+                    out.push(format!("{indent}%{np}z{tag} = fcmp olt half %{np}h{tag}, 0.0"));
+                    out.push(format!("{indent}%{np}h{tag} = select i1 %{np}z{tag}, half 0.0, half %{np}h{tag}"));
+                    out.push(format!("{indent}%{np}b{tag} = bitcast half %{np}h{tag} to i16"));
+                    out.push(format!("{indent}%{np}x{tag} = zext i16 %{np}b{tag} to i32"));
+                }
+                out.push(format!("{indent}%{np}xs = shl i32 %{np}xhi, 16"));
+                out.push(format!("{indent}{res} = or i32 %{np}xlo, %{np}xs"));
                 continue;
             }
         }
