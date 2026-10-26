@@ -2564,9 +2564,7 @@ fn rewrite_packed_math(text: &str) -> String {
                 sq.push(format!("{indent}%{np}hi16 = lshr i32 %{np}hi32.rn, 16"));
                 sq.push(format!("{indent}%{np}hi16s = shl i32 %{np}hi16, 16"));
                 sq.push(format!("{indent}{res} = or i32 %{np}lo16, %{np}hi16s"));
-                if !text.contains("declare float @llvm.fma.f32") {
-                    out.push("declare float @llvm.fma.f32(float, float, float)".to_string());
-                }
+                // declare 在函数尾部统一插入（在 return 前）
                 out.extend(sq);
                 continue;
             }
@@ -2624,7 +2622,26 @@ fn rewrite_packed_math(text: &str) -> String {
         }
         out.push(line.to_string());
     }
-    out.join("\n")
+    {
+        let mut text = out.join("\n");
+        // 统一插入 declares（首 define 前）
+        if text.contains("@llvm.fma.f32") && !text.contains("declare float @llvm.fma.f32") {
+            if let Some(idx) = text.find("\ndefine ") {
+                text = format!("{}\ndeclare float @llvm.fma.f32(float, float, float){}", &text[..idx], &text[idx..]);
+            }
+        }
+        if text.contains("@llvm.amdgcn.exp2.f32") && !text.contains("declare float @llvm.amdgcn.exp2.f32") {
+            if let Some(idx) = text.find("\ndefine ") {
+                text = format!("{}\ndeclare float @llvm.amdgcn.exp2.f32(float){}", &text[..idx], &text[idx..]);
+            }
+        }
+        if text.contains("@llvm.fma.v2f32") && !text.contains("declare <2 x float> @llvm.fma.v2f32") {
+            if let Some(idx) = text.find("\ndefine ") {
+                text = format!("{}\ndeclare <2 x float> @llvm.fma.v2f32(<2 x float>, <2 x float>, <2 x float>){}", &text[..idx], &text[idx..]);
+            }
+        }
+        text
+    }
 }
 
 /// Matches a leading `%[\w.$]+` SSA name and returns `(name, rest)`.
