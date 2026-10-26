@@ -2587,7 +2587,7 @@ fn rewrite_packed_math(text: &str) -> String {
         }
         // -- cvt.rn/rz[.relu].bf16x2.f32 "=r,f,f"(float lo, float hi)
         //    两 f32 → packed bf16x2（RNE 或 RTZ，可选 relu clamp）
-        if opcode.starts_with("cvt.rn.bf16x2") || opcode.starts_with("cvt.rz.bf16x2") {
+        if (opcode.starts_with("cvt.rn") || opcode.starts_with("cvt.rz")) && opcode.contains("bf16x2") {
             let is_rz = opcode.contains("rz");
             let is_relu = opcode.contains("relu");
             let fls: Vec<&str> = ops_text.split("float ").skip(1)
@@ -2603,16 +2603,17 @@ fn rewrite_packed_math(text: &str) -> String {
                     }
                     if is_relu {
                         out.push(format!("{indent}%{np}z{tag} = icmp slt i32 %{np}b{tag}, 0"));
-                        out.push(format!("{indent}%{np}b{tag} = select i1 %{np}z{tag}, i32 0, i32 %{np}b{tag}"));
+                        out.push(format!("{indent}%{np}b{tag}z = select i1 %{np}z{tag}, i32 0, i32 %{np}b{tag}"));
                     }
+                    let bz = if is_relu { format!("%{np}b{tag}z") } else { format!("%{np}b{tag}") };
                     if is_rz {
-                        out.push(format!("{indent}%{np}h{tag} = lshr i32 %{np}b{tag}, 16"));
+                        out.push(format!("{indent}%{np}h{tag} = lshr i32 {bz}, 16"));
                     } else {
                         // RNE: bits + 0x7FFF + lsb(bits>>16), then >>16
-                        out.push(format!("{indent}%{np}r{tag}.ls1 = lshr i32 %{np}b{tag}, 16"));
+                        out.push(format!("{indent}%{np}r{tag}.ls1 = lshr i32 {bz}, 16"));
                         out.push(format!("{indent}%{np}r{tag}.ls2 = and i32 %{np}r{tag}.ls1, 1"));
                         out.push(format!("{indent}%{np}r{tag}.rnd = add i32 %{np}r{tag}.ls2, 32767"));
-                        out.push(format!("{indent}%{np}r{tag}.rn = add i32 %{np}b{tag}, %{np}r{tag}.rnd"));
+                        out.push(format!("{indent}%{np}r{tag}.rn = add i32 {bz}, %{np}r{tag}.rnd"));
                         out.push(format!("{indent}%{np}h{tag} = lshr i32 %{np}r{tag}.rn, 16"));
                     }
                 }
@@ -2647,7 +2648,7 @@ fn rewrite_packed_math(text: &str) -> String {
             out.push(format!("{indent}%{np}t = fptrunc float %{np}e to half"));
             out.push(format!("{indent}{res} = bitcast half %{np}t to i16"));
             if !text.contains("declare float @llvm.amdgcn.exp2.f32") {
-                out.push("declare float @llvm.amdgcn.exp2.f32(float)".to_string());
+                // exp2 declare 尾部统一插入
             }
             continue;
         }
