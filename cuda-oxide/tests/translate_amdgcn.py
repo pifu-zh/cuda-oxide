@@ -198,6 +198,10 @@ def translate_nvvm_to_amdgcn(ll_text: str) -> str:
     #     hostcall buffer；hipModuleLoadData 路径 ~/tmp-prof/printf_mod 实证）
     text = _rewrite_vprintf(text)
 
+    # 17b. [adapt-rocm] PTX packed-math asm → 合法 IR（bf16x2/f16x2/f32x2/
+    #      b16 原子；nvls/mma 硬件缺失保留原样留给 llc）
+    text = _rewrite_packed_math(text)
+
     return text
 
 
@@ -1270,6 +1274,277 @@ def _rewrite_vprintf(text: str) -> str:
             f"!amdgpu_printf_kind = !{{!{md}}}\n"
         )
     return text
+
+
+# ---------------------------------------------------------------------------
+# [adapt-rocm] Step 17b: PTX packed-math asm → AMDGPU 合法形态。
+#
+# 取证（llc 逐指令探针，2026-10-26）：
+# - gfx1030 无 v_pk_bf16（"instruction not supported on this GPU"）→ bf16x2
+#   走软件等价：bf16→f32 是低 16 位补零（移位），运算后 RNE 回缩；
+# - v_pk_f16/v_cvt_pkrtz_f16_f32 存在但约束须 v（"h/f/l" 是 PTX 约束词汇，
+#   AMDGPU 内嵌 asm 不识别）；展开到 LLVM IR 完全绕开约束问题；
+# - f32x2 打包（i64 装 2×f32）RDNA2 无对应 → <2 x float> 向量拆包；
+# - b16 原子 ld/st → LLVM 原子 i16 访问（RDNA2 有 16 位访存）；
+# - multimem.*（NVLink SHARP）与 mma fp8 块缩放 = 硬件事实缺失，
+#   保留原 asm 让 llc 显式拒绝（HARDWARE_LIMITED，不入本步）。
+# 信封：仅展开下列已枚举的编译器产物形态；其余保留原样留给 llc。
+# ---------------------------------------------------------------------------
+
+_PM_ASM_RE = re.compile(
+    r'^(?P<indent>\s*)(?P<res>%[\w.$]+) = (?:tail )?call '
+    r'(?:i32|i16|i64) asm (?:sideeffect )?"(?P<body>[^"]+)", "'
+    r'(?P<cons>[^"]+)"\((?P<ops>[^)]*)\)'
+)
+
+_GLOBAL_CONST_RE = re.compile(
+    r'@(?P<name>[\w.$]+) = (?:private |internal )?(?:unnamed_addr )?'
+    r'addrspace\(1\) constant'
+)
+
+
+def _rne_f32_to_bf16(indent, vbits, seq):
+    """f32 位型 → bf16 位型（RNE）：bits + 0x7FFF + lsb(bits>>16) 再 >>16。"""
+    lsb = f"{vbits}.lsb"
+    rnd = f"{vbits}.rnd"
+    out = f"{vbits}.bf"
+    seq.append(f"{indent}%{lsb} = lshr i32 {vbits}, 16")
+    seq.append(f"{indent}%{lsb} = and i32 %{lsb}, 1")
+    seq.append(f"{indent}%{rnd} = add i32 %{lsb}, 32767")
+    seq.append(f"{indent}%{vbits}.r = add i32 {vbits}, %{rnd}")
+    seq.append(f"{indent}%{out} = lshr i32 {vbits}.r, 16")
+    return out
+
+
+def _bf16_to_f32(indent, v32, seq):
+    """i32 的低 16 位视为 bf16 → f32 位型（补零展宽，精确）。"""
+    hi = f"{v32}.h"
+    seq.append(f"{indent}%{hi} = shl i32 {v32}, 16")
+    return hi
+
+
+def _emit_bf16_binop(indent, res, op, a, b, seq):
+    """bf16x2 二则运算（add/sub/mul）：逐半展宽→f32 op→RNE 回缩。"""
+    prefix = res.lstrip('%') + ".p_"
+    for tag, v in (("a", a), ("b", b)):
+        seq.append(f"{indent}%{prefix}lo{tag} = and i32 {v}, 65535")
+        seq.append(f"{indent}%{prefix}lo{tag}b = shl i32 %{prefix}lo{tag}, 16")
+        seq.append(f"{indent}%{prefix}hi{tag} = lshr i32 {v}, 16")
+        seq.append(f"{indent}%{prefix}fa{tag} = bitcast i32 %{prefix}lo{tag}b to float")
+        seq.append(f"{indent}%{prefix}fb{tag} = bitcast i32 %{prefix}hi{tag} to float")
+    flop = {"add.rn.bf16x2": "fadd", "sub.rn.bf16x2": "fsub",
+            "mul.rn.bf16x2": "fmul"}[op]
+    seq.append(f"{indent}%{prefix}flo = {flop} float %{prefix}faa, %{prefix}fba")
+    seq.append(f"{indent}%{prefix}fhi = {flop} float %{prefix}fab, %{prefix}fbb")
+    seq.append(f"{indent}%{prefix}l32 = bitcast float %{prefix}flo to i32")
+    seq.append(f"{indent}%{prefix}h32 = bitcast float %{prefix}fhi to i32")
+    lo16 = _rne_f32_to_bf16(indent, f"%{prefix}l32", seq)
+    hi16 = _rne_f32_to_bf16(indent, f"%{prefix}h32", seq)
+    seq.append(f"{indent}%{prefix}hi16s = shl i32 %{hi16}, 16")
+    seq.append(f"{indent}{res} = or i32 %{lo16}, %{prefix}hi16s")
+
+
+def _emit_bf16_minmax(indent, res, op, a, b, seq):
+    """min/max.bf16x2：逐半展宽→fcmp→select（结果精确，无需舍入）。"""
+    prefix = res.lstrip('%') + ".p_"
+    cond = "olt" if op.startswith("min") else "ogt"
+    for tag, v in (("a", a), ("b", b)):
+        seq.append(f"{indent}%{prefix}lo{tag} = and i32 {v}, 65535")
+        seq.append(f"{indent}%{prefix}lo{tag}b = shl i32 %{prefix}lo{tag}, 16")
+        seq.append(f"{indent}%{prefix}hi{tag} = lshr i32 {v}, 16")
+        seq.append(f"{indent}%{prefix}fa{tag} = bitcast i32 %{prefix}lo{tag}b to float")
+        seq.append(f"{indent}%{prefix}fb{tag} = bitcast i32 %{prefix}hi{tag} to float")
+    seq.append(f"{indent}%{prefix}c = fcmp {cond} float %{prefix}faa, %{prefix}fba")
+    seq.append(f"{indent}%{prefix}slo = select i1 %{prefix}c, i32 %{prefix}a.lo16, i32 %{prefix}b.lo16")
+    seq.append(f"{indent}%{prefix}c2 = fcmp {cond} float %{prefix}fab, %{prefix}fbb")
+    seq.append(f"{indent}%{prefix}shi = select i1 %{prefix}c2, i32 %{prefix}a.hi, i32 %{prefix}b.hi")
+    seq.append(f"{indent}%{prefix}shs = shl i32 %{prefix}shi, 16")
+    seq.append(f"{indent}{res} = or i32 %{prefix}slo, %{prefix}shs")
+
+
+def _rewrite_packed_math(text: str) -> str:
+    if "asm " not in text:
+        return text
+    lines = text.split("\n")
+    out = []
+    # void 形态（st.release 等无结果赋值的 asm）
+    _VOID_ST_RE = re.compile(
+        r'^(?P<indent>\s*)tail call void asm sideeffect '
+        r'"st\.release\.gpu\.b16 \[\$0\], \$1;", '
+        r'"l,h,~\{memory\}"\(ptr (?P<ptr>%[\w.$]+), i16 (?P<val>%[\w.$]+)\)'
+    )
+    used = False
+    for line in lines:
+        mv = _VOID_ST_RE.match(line)
+        if mv:
+            out.append(f"{mv.group('indent')}store atomic i16 {mv.group('val')}, ptr {mv.group('ptr')} release, align 2")
+            continue
+        m = _PM_ASM_RE.match(line)
+        if not m:
+            out.append(line)
+            continue
+        indent, res, body, cons, ops = m.groups()
+        body = body.rstrip(';')  # PTX asm 体尾分号——比较统一无分号
+        body = body.strip()
+        # ---- b16 原子 ld/st（atomic_f16 族）----
+        if body == "ld.acquire.gpu.b16 $0, [$1]":
+            pm = re.match(r'ptr (nonnull )?(%[\w.$]+)', ops.strip())
+            if pm:
+                out.append(f"{indent}{res} = load atomic i16, ptr {pm.group(2)} acquire, align 2")
+                continue
+        if body == "st.release.gpu.b16 [$0], $1":
+            vm = re.match(r'ptr (?:nonnull )?(%[\w.$]+), i16 (%[\w.$]+)', ops.strip())
+            if vm:
+                out.append(f"{indent}store atomic i16 {vm.group(2)}, ptr {vm.group(1)} release, align 2")
+                continue
+        # ---- abs/neg.bf16x2：整字掩码（精确）----
+        if body == "abs.bf16x2 $0, $1":
+            ops = re.findall(r'i32 (%[\w.$]+)', ops)
+            if len(ops) == 1:
+                out.append(f"{indent}{res} = and i32 {ops[0]}, 2147418111")
+                continue
+        if body == "neg.bf16x2 $0, $1":
+            ops = re.findall(r'i32 (%[\w.$]+)', ops)
+            if len(ops) == 1:
+                out.append(f"{indent}{res} = xor i32 {ops[0]}, -2147450880")
+                continue
+        # ---- add/sub/mul/min/max.bf16x2 "=r,r,r"(i32, i32) ----
+        opcode = body.split(' ')[0] if body else ''
+        binops = {"add.rn.bf16x2", "sub.rn.bf16x2", "mul.rn.bf16x2",
+                  "min.bf16x2", "max.bf16x2"}
+        if opcode in binops:
+            ops = re.findall(r'i32 (%[\w.$]+)', ops)
+            if len(ops) == 2:
+                seq = []
+                if opcode in ("min.bf16x2", "max.bf16x2"):
+                    _emit_bf16_minmax(indent, res, opcode, ops[0], ops[1], seq)
+                else:
+                    _emit_bf16_binop(indent, res, opcode, ops[0], ops[1], seq)
+                out.extend(seq)
+                continue
+        # ---- fma.rn.bf16x2 "=r,r,r,r"(i32, i32, i32) ----
+        if opcode.startswith("fma.rn.bf16x2"):
+            ops = re.findall(r'i32 (%[\w.$]+)', ops)
+            if len(ops) == 3:
+                seq = []
+                prefix = res.lstrip('%') + ".p_"
+                # a(乘数1)/b(乘数2) 展宽，c 加数展宽
+                for tag, v in (("a", ops[0]), ("b", ops[1]), ("c", ops[2])):
+                    seq.append(f"{indent}%{prefix}lo{tag} = and i32 {v}, 65535")
+                    seq.append(f"{indent}%{prefix}lo{tag}b = shl i32 %{prefix}lo{tag}, 16")
+                    seq.append(f"{indent}%{prefix}hi{tag} = lshr i32 {v}, 16")
+                    seq.append(f"{indent}%{prefix}fa{tag} = bitcast i32 %{prefix}lo{tag}b to float")
+                    seq.append(f"{indent}%{prefix}fb{tag} = bitcast i32 %{prefix}hi{tag} to float")
+                # f32 FMA：乘加单舍入（与 bf16 fma 语义一致）
+                seq.append(f"{indent}%{prefix}flo = call float @llvm.fma.f32(float %{prefix}faa, float %{prefix}fab, float %{prefix}fac)")
+                seq.append(f"{indent}%{prefix}fhi = call float @llvm.fma.f32(float %{prefix}fab, float %{prefix}fbb, float %{prefix}fbc)")
+                seq.append(f"{indent}%{prefix}l32 = bitcast float %{prefix}flo to i32")
+                seq.append(f"{indent}%{prefix}h32 = bitcast float %{prefix}fhi to i32")
+                lo16 = _rne_f32_to_bf16(indent, f"%{prefix}l32", seq)
+                hi16 = _rne_f32_to_bf16(indent, f"%{prefix}h32", seq)
+                seq.append(f"{indent}%{prefix}hs = shl i32 %{hi16}, 16")
+                seq.append(f"{indent}{res} = or i32 %{lo16}, %{prefix}hs")
+                # fma 声明
+                # declares 由尾部统一追加
+                out.extend(seq)
+                continue
+        # ---- cvt.rn/rz[.relu].bf16x2.f32 "=r,f,f"(float lo, float hi) ----
+        mcv = re.match(r"cvt\.(rn|rz)\.(relu\.)?bf16x2\.f32 \$0, \$2, \$1", body)
+        if mcv:
+            fls = re.findall(r'float (%[\w.$]+|[-0-9.e+]+)', ops)
+            if len(fls) == 2:
+                seq = []
+                prefix = res.lstrip('%') + ".p_"
+                rz, relu = mcv.group(1) == "rz", bool(mcv.group(2))
+                for tag, v in (("lo", fls[1]), ("hi", fls[0])):
+                    if v.startswith('%'):
+                        seq.append(f"{indent}%{prefix}b{tag} = bitcast float {v} to i32")
+                    else:
+                        # 字面量 float → 位型
+                        seq.append(f"{indent}%{prefix}f{tag} = fadd float {v}, 0.000000e+00")
+                        seq.append(f"{indent}%{prefix}b{tag} = bitcast float %{prefix}f{tag} to i32")
+                    if relu:
+                        seq.append(f"{indent}%{prefix}z{tag} = icmp slt i32 %{prefix}b{tag}, 0")
+                        seq.append(f"{indent}%{prefix}bz{tag} = select i1 %{prefix}z{tag}, i32 0, i32 %{prefix}b{tag}")
+                    bz = f"%{prefix}b{tag}z" if relu else f"%{prefix}b{tag}"
+                    if rz:
+                        seq.append(f"{indent}%{prefix}h{tag} = lshr i32 {bz}, 16")
+                    else:
+                        h = _rne_f32_to_bf16(indent, bz, seq)
+                        seq.append(f"{indent}%{prefix}h{tag} = or i32 %{h}, 0")
+                seq.append(f"{indent}%{prefix}hs = shl i32 %{prefix}hhi, 16")
+                seq.append(f"{indent}{res} = or i32 %{prefix}hlo, %{prefix}hs")
+                out.extend(seq)
+                continue
+        # ---- cvt.rn/rz[.relu].f16x2.f32 "=r,f,f" ----
+        mcf = re.match(r"cvt\.(rn|rz)\.(relu\.)?f16x2\.f32 \$0, \$2, \$1", body)
+        if mcf:
+            fls = re.findall(r'float (%[\w.$]+|[-0-9.e+]+)', ops)
+            if len(fls) == 2:
+                seq = []
+                prefix = res.lstrip('%') + ".p_"
+                rz, relu = mcf.group(1) == "rz", bool(mcf.group(2))
+                for tag, v in (("lo", fls[1]), ("hi", fls[0])):
+                    if v.startswith('%'):
+                        seq.append(f"{indent}%{prefix}h{tag} = fptrunc float {v} to half")
+                    else:
+                        seq.append(f"{indent}%{prefix}hf{tag} = fadd float {v}, 0.0")
+                        seq.append(f"{indent}%{prefix}h{tag} = fptrunc float %{prefix}hf{tag} to half")
+                    if relu:
+                        seq.append(f"{indent}%{prefix}hz{tag} = fcmp olt half %{prefix}h{tag}, 0.0")
+                        seq.append(f"{indent}%{prefix}h{tag} = select i1 %{prefix}hz{tag}, half 0.0, half %{prefix}h{tag}")
+                    seq.append(f"{indent}%{prefix}b{tag} = bitcast half %{prefix}h{tag} to i16")
+                    seq.append(f"{indent}%{prefix}x{tag} = zext i16 %{prefix}b{tag} to i32")
+                    seq.append(f"{indent}%{prefix}x{tag} = zext i16 %{prefix}b{tag} to i32")
+                seq.append(f"{indent}%{prefix}hs = shl i32 %{prefix}xhi, 16")
+                seq.append(f"{indent}{res} = or i32 %{prefix}xlo, %{prefix}hs")
+                out.extend(seq)
+                continue
+        # ---- ex2.approx.f16 "=h,h"(i16) ----
+        if body == "ex2.approx.f16 $0, $1":
+            op = re.findall(r'i16 (%[\w.$]+)', ops)
+            if len(op) == 1:
+                seq = []
+                prefix = res.lstrip('%') + ".p_"
+                seq.append(f"{indent}%{prefix}h = bitcast i16 {op[0]} to half")
+                seq.append(f"{indent}%{prefix}f = fpext half %{prefix}h to float")
+                seq.append(f"{indent}%{prefix}e = call float @llvm.amdgcn.exp2.f32(float %{prefix}f)")
+                seq.append(f"{indent}%{prefix}t = fptrunc float %{prefix}e to half")
+                seq.append(f"{indent}{res} = bitcast half %{prefix}t to i16")
+                if "declare float @llvm.amdgcn.exp2.f32" not in text:
+                    text = text.replace("\ndefine ", "\n" + "declare float @llvm.amdgcn.exp2.f32(float)\ndefine ", 1)
+                out.extend(seq)
+                continue
+        # ---- add/sub.rn[.ftz].f32x2 "=l,l,l"(i64, i64) → <2 x float> 向量 ----
+        mf32 = re.match(r"(add|sub|mul)\.rn(\.ftz)?\.f32x2 \$0, \$1, \$2", body)
+        if mf32:
+            ops = re.findall(r'i64 (%[\w.$]+)', ops)
+            if len(ops) == 2:
+                seq = []
+                prefix = res.lstrip('%') + ".p_"
+                flop = {"add": "fadd", "sub": "fsub", "mul": "fmul"}[mf32.group(1)]
+                seq.append(f"{indent}%{prefix}va = bitcast i64 {ops[0]} to <2 x float>")
+                seq.append(f"{indent}%{prefix}vb = bitcast i64 {ops[1]} to <2 x float>")
+                seq.append(f"{indent}%{prefix}vs = {flop} <2 x float> %{prefix}va, %{prefix}vb")
+                seq.append(f"{indent}{res} = bitcast <2 x float> %{prefix}vs to i64")
+                out.extend(seq)
+                continue
+        out.append(line)
+    if True:  # 展开统计：asm 残留计数器已足够
+        joined = "\n".join(out)
+        decls = []
+        if "@llvm.fma.f32" in joined and "declare float @llvm.fma.f32" not in text:
+            decls.append("declare float @llvm.fma.f32(float, float, float)")
+        if "@llvm.amdgcn.exp2.f32" in joined and "declare float @llvm.amdgcn.exp2.f32" not in text:
+            decls.append("declare float @llvm.amdgcn.exp2.f32(float)")
+        if decls:
+            idx = joined.find("\ndefine ")
+            if idx >= 0:
+                joined = joined[:idx] + "\n" + "\n".join(decls) + joined[idx:]
+            out = joined.split("\n")
+            out = joined.split("\n")
+
+    return "\n".join(out)
 
 
 # Step 15: libdevice __nv_* → ocml __ocml_*
