@@ -1362,6 +1362,8 @@ def _emit_bf16_minmax(indent, res, op, a, b, seq):
     seq.append(f"{indent}{res} = or i32 %{prefix}slo, %{prefix}shs")
 
 
+_PM_COUNTER = [0]  # 唯一名计数器（跨调用递增）
+
 def _rewrite_packed_math(text: str) -> str:
     if "asm " not in text:
         return text
@@ -1427,7 +1429,8 @@ def _rewrite_packed_math(text: str) -> str:
             ops = re.findall(r'i32 (%[\w.$]+)', ops)
             if len(ops) == 3:
                 seq = []
-                prefix = res.lstrip('%') + ".p_"
+                _PM_COUNTER[0] += 1
+                prefix = res.lstrip('%') + f".{_PM_COUNTER[0]}_"
                 # a(乘数1)/b(乘数2) 展宽，c 加数展宽
                 for tag, v in (("a", ops[0]), ("b", ops[1]), ("c", ops[2])):
                     seq.append(f"{indent}%{prefix}lo{tag} = and i32 {v}, 65535")
@@ -1454,7 +1457,8 @@ def _rewrite_packed_math(text: str) -> str:
             fls = re.findall(r'float (%[\w.$]+|[-0-9.e+]+)', ops)
             if len(fls) == 2:
                 seq = []
-                prefix = res.lstrip('%') + ".p_"
+                _PM_COUNTER[0] += 1
+                prefix = res.lstrip('%') + f".{_PM_COUNTER[0]}_"
                 rz, relu = mcv.group(1) == "rz", bool(mcv.group(2))
                 for tag, v in (("lo", fls[1]), ("hi", fls[0])):
                     if v.startswith('%'):
@@ -1482,7 +1486,8 @@ def _rewrite_packed_math(text: str) -> str:
             fls = re.findall(r'float (%[\w.$]+|[-0-9.e+]+)', ops)
             if len(fls) == 2:
                 seq = []
-                prefix = res.lstrip('%') + ".p_"
+                _PM_COUNTER[0] += 1
+                prefix = res.lstrip('%') + f".{_PM_COUNTER[0]}_"
                 rz, relu = mcf.group(1) == "rz", bool(mcf.group(2))
                 for tag, v in (("lo", fls[1]), ("hi", fls[0])):
                     if v.startswith('%'):
@@ -1505,7 +1510,8 @@ def _rewrite_packed_math(text: str) -> str:
             op = re.findall(r'i16 (%[\w.$]+)', ops)
             if len(op) == 1:
                 seq = []
-                prefix = res.lstrip('%') + ".p_"
+                _PM_COUNTER[0] += 1
+                prefix = res.lstrip('%') + f".{_PM_COUNTER[0]}_"
                 seq.append(f"{indent}%{prefix}h = bitcast i16 {op[0]} to half")
                 seq.append(f"{indent}%{prefix}f = fpext half %{prefix}h to float")
                 seq.append(f"{indent}%{prefix}e = call float @llvm.amdgcn.exp2.f32(float %{prefix}f)")
@@ -1516,12 +1522,13 @@ def _rewrite_packed_math(text: str) -> str:
                 out.extend(seq)
                 continue
         # ---- add/sub.rn[.ftz].f32x2 "=l,l,l"(i64, i64) → <2 x float> 向量 ----
-        mf32 = re.match(r"(add|sub|mul)\.rn(\.ftz)?\.f32x2 \$0, \$1, \$2", body)
+        mf32 = re.match(r"(add|sub|mul|fma)\.rn(\.ftz)?\.f32x2 \$0, \$1, \$2(, \$3)?", body)
         if mf32:
-            ops = re.findall(r'i64 (%[\w.$]+)', ops)
+            ops = re.findall(r'i64 ([%\w.$]+|\d+)', ops)
             if len(ops) == 2:
                 seq = []
-                prefix = res.lstrip('%') + ".p_"
+                _PM_COUNTER[0] += 1
+                prefix = res.lstrip('%') + f".{_PM_COUNTER[0]}_"
                 flop = {"add": "fadd", "sub": "fsub", "mul": "fmul"}[mf32.group(1)]
                 seq.append(f"{indent}%{prefix}va = bitcast i64 {ops[0]} to <2 x float>")
                 seq.append(f"{indent}%{prefix}vb = bitcast i64 {ops[1]} to <2 x float>")
