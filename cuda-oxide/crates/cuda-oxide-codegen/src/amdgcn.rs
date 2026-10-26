@@ -2421,8 +2421,7 @@ fn rewrite_packed_math(text: &str) -> String {
     if !text.contains("asm ") {
         return text.to_string();
     }
-    static PM_CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let ctr = PM_CTR.fetch_add(1000, std::sync::atomic::Ordering::Relaxed);
+    let mut ctr: u64 = 0;
     let mut out: Vec<String> = Vec::with_capacity(text.lines().count());
     for line in text.lines() {
         let trimmed = line.trim_start();
@@ -2431,7 +2430,8 @@ fn rewrite_packed_math(text: &str) -> String {
             continue;
         }
         let indent = &line[..line.len() - trimmed.len()];
-        let np = format!("_pm{ctr}_"); // unique prefix (1000-block per call)
+        ctr += 1;
+        let np = format!("_pm{ctr}_"); // unique per asm line
         let res = trimmed.split(' ').next().unwrap_or("");
 
         // Extract operand list: everything between the outermost ( and )
@@ -2599,20 +2599,20 @@ fn rewrite_packed_math(text: &str) -> String {
                         out.push(format!("{indent}%{np}f{tag} = bitcast float {src} to i32"));
                     } else {
                         out.push(format!("{indent}%{np}f{tag} = fadd float {src}, 0.0"));
-                        out.push(format!("{indent}%{np}f{tag} = bitcast float %{np}f{tag} to i32"));
+                        out.push(format!("{indent}%{np}b{tag} = bitcast float %{np}f{tag} to i32"));
                     }
                     if is_relu {
-                        out.push(format!("{indent}%{np}z{tag} = icmp slt i32 %{np}f{tag}, 0"));
-                        out.push(format!("{indent}%{np}f{tag} = select i1 %{np}z{tag}, i32 0, i32 %{np}f{tag}"));
+                        out.push(format!("{indent}%{np}z{tag} = icmp slt i32 %{np}b{tag}, 0"));
+                        out.push(format!("{indent}%{np}b{tag} = select i1 %{np}z{tag}, i32 0, i32 %{np}b{tag}"));
                     }
                     if is_rz {
-                        out.push(format!("{indent}%{np}h{tag} = lshr i32 %{np}f{tag}, 16"));
+                        out.push(format!("{indent}%{np}h{tag} = lshr i32 %{np}b{tag}, 16"));
                     } else {
                         // RNE: bits + 0x7FFF + lsb(bits>>16), then >>16
-                        out.push(format!("{indent}%{np}r{tag}.ls1 = lshr i32 %{np}f{tag}, 16"));
+                        out.push(format!("{indent}%{np}r{tag}.ls1 = lshr i32 %{np}b{tag}, 16"));
                         out.push(format!("{indent}%{np}r{tag}.ls2 = and i32 %{np}r{tag}.ls1, 1"));
                         out.push(format!("{indent}%{np}r{tag}.rnd = add i32 %{np}r{tag}.ls2, 32767"));
-                        out.push(format!("{indent}%{np}r{tag}.rn = add i32 %{np}f{tag}, %{np}r{tag}.rnd"));
+                        out.push(format!("{indent}%{np}r{tag}.rn = add i32 %{np}b{tag}, %{np}r{tag}.rnd"));
                         out.push(format!("{indent}%{np}h{tag} = lshr i32 %{np}r{tag}.rn, 16"));
                     }
                 }
@@ -2629,8 +2629,8 @@ fn rewrite_packed_math(text: &str) -> String {
                 for (tag, src) in [("lo", fls[0]), ("hi", fls[1])] {
                     out.push(format!("{indent}%{np}h{tag} = fptrunc float {src} to half"));
                     out.push(format!("{indent}%{np}z{tag} = fcmp olt half %{np}h{tag}, 0.0"));
-                    out.push(format!("{indent}%{np}h{tag} = select i1 %{np}z{tag}, half 0.0, half %{np}h{tag}"));
-                    out.push(format!("{indent}%{np}b{tag} = bitcast half %{np}h{tag} to i16"));
+                    out.push(format!("{indent}%{np}h{tag}r = select i1 %{np}z{tag}, half 0.0, half %{np}h{tag}"));
+                    out.push(format!("{indent}%{np}b{tag} = bitcast half %{np}h{tag}r to i16"));
                     out.push(format!("{indent}%{np}x{tag} = zext i16 %{np}b{tag} to i32"));
                 }
                 out.push(format!("{indent}%{np}xs = shl i32 %{np}xhi, 16"));
@@ -2662,9 +2662,7 @@ fn rewrite_packed_math(text: &str) -> String {
                 if is_fma && args.len() >= 3 {
                     out.push(format!("{indent}%{np}vc = bitcast i64 {} to <2 x float>", args[2]));
                     out.push(format!("{indent}%{np}vs = call <2 x float> @llvm.fma.v2f32(<2 x float> %{np}va, <2 x float> %{np}vb, <2 x float> %{np}vc)"));
-                    if !text.contains("declare <2 x float> @llvm.fma.v2f32") {
-                        out.push("declare <2 x float> @llvm.fma.v2f32(<2 x float>, <2 x float>, <2 x float>)".to_string());
-                    }
+                    // declare 尾部统一插入
                 } else {
                     let flop = match opcode.split('.').next() { Some("add") => "fadd", Some("sub") => "fsub", _ => "fmul" };
                     out.push(format!("{indent}%{np}vs = {flop} <2 x float> %{np}va, %{np}vb"));
@@ -2676,8 +2674,26 @@ fn rewrite_packed_math(text: &str) -> String {
         out.push(line.to_string());
     }
     {
+        let mut text = {
         let mut text = out.join("\n");
-        // 统一插入 declares（首 define 前）
+        // 尾部统一插入 declares（首 define 前）
+        if text.contains("@llvm.fma.v2f32") && !text.contains("declare <2 x float> @llvm.fma.v2f32") {
+            if let Some(i) = text.find("\ndefine ") {
+                text = format!("{}\ndeclare <2 x float> @llvm.fma.v2f32(<2 x float>, <2 x float>, <2 x float>){}", &text[..i], &text[i..]);
+            }
+        }
+        if text.contains("@llvm.amdgcn.exp2.f32") && !text.contains("declare float @llvm.amdgcn.exp2.f32") {
+            if let Some(i) = text.find("\ndefine ") {
+                text = format!("{}\ndeclare float @llvm.amdgcn.exp2.f32(float){}", &text[..i], &text[i..]);
+            }
+        }
+        if text.contains("@llvm.fma.f32") && !text.contains("declare float @llvm.fma.f32") {
+            if let Some(i) = text.find("\ndefine ") {
+                text = format!("{}\ndeclare float @llvm.fma.f32(float, float, float){}", &text[..i], &text[i..]);
+            }
+        }
+        text
+    };   // 统一插入 declares（首 define 前）
         if text.contains("@llvm.fma.f32") && !text.contains("declare float @llvm.fma.f32") {
             if let Some(idx) = text.find("\ndefine ") {
                 text = format!("{}\ndeclare float @llvm.fma.f32(float, float, float){}", &text[..idx], &text[idx..]);
