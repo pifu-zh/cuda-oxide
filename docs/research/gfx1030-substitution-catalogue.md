@@ -75,6 +75,21 @@
 | thread-block cluster / switch multicast | RDNA2 无（上游 CUDA 13 同样硬件门控） | HARDWARE_LIMITED；shim 显式 NOT_SUPPORTED |
 | 直通 LDS 宽度 | [probe] 汇编器拒 dwordx2/x4（仅 b32） | 硬件事实（soft-TMA 78.4% 上限的根因之一） |
 
+### 2.5b 设备端 printf（vprintf → ockl hostcall）——2026-10-26 新增
+
+| 项 | 内容 |
+|---|---|
+| 原始功能 | NVVM `vprintf(fmt, args)`（CUDA：参数包 marshaling 到缓冲区，host 侧格式化） |
+| 原实现依据 | clang HIP 前端在源码级 lowering；NVVM IR 里就是 vprintf 调用+declare |
+| gfx1030 缺口 | AMDGPU 无 vprintf 符号（hsaco `U vprintf` 未解析）；ROCm printf 走 **hostcall 协议** |
+| 上游机制（取证） | 模块元数据 `amdgpu_printf_kind="hostcall"` → 运行时经 implicit kernarg 注入 hostcall buffer；ockl.bc 提供 `__ockl_printf_begin(i64)→i64` / `_append_string_n(h,ptr,len,islast)` / `_append_args(h,nargs,7×i64,islast)`（llvm-dis 反推 ABI） |
+| 替代方案 | prep pass IR 级展开：fmt 须溯源到模块级 addrspace(1) constant（addrspacecast 或 {ptr,i64} 链）；args 须为 alloca（字段 i32/i8/i16→zext、i64 直通、f64→bitcast、f32→fpext+bitcast、[4×i8] packed load，共 7 槽）或 inttoptr-0（无参）；ockl.bc+oclc 三配置（isa_version_<n>/abi_version_600/finite_only_off）链接 |
+| 分类 | INSTRUCTION COMPOSITION + ALTERNATIVE BACKEND（hostcall 服务协议） |
+| 正确性验证 | [run] printf 例 8 测试族全过（"=== ALL PRINTF TESTS PASSED ==="），含 varargs 打包、线程索引输出、返回值语义（arg count 非 char count） |
+| 成本 | 每 printf 调用 ~10 条指令展开 + hostcall 往返（host 侧格式化）；7 参数上限 |
+| 剩余不确定性 | 动态 fmt 字符串（非常量全局）在信封外（保留 vprintf 链接期显式失败）；>7 参数 printf 需多轮 append_args（未实现，本批无此形态） |
+| 值得实现？ | 是——解锁全部 GPU 侧调试输出这一通用能力；99 例批中 printf 族直接受益 |
+
 ### 2.6 闭包引用捕获（HMM 依赖）——本轮新增
 
 | 项 | 内容 |
