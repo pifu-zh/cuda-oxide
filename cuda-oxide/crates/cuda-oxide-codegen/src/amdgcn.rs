@@ -2425,7 +2425,7 @@ fn rewrite_packed_math(text: &str) -> String {
     let mut out: Vec<String> = Vec::with_capacity(text.lines().count());
     for line in text.lines() {
         let trimmed = line.trim_start();
-        if !trimmed.contains("asm ") || !trimmed.starts_with('%') {
+        if !trimmed.contains("asm ") {
             out.push(line.to_string());
             continue;
         }
@@ -2460,12 +2460,12 @@ fn rewrite_packed_math(text: &str) -> String {
         if body == "ld.acquire.gpu.b16 $0, [$1]" {
             if let Some(ptr) = ops_text.strip_prefix("ptr ") {
                 out.push(format!("{indent}%{np}v = load atomic i16, ptr {ptr} acquire, align 2"));
-                out.push(format!("{indent}{res} = bitcast i16 %{np}_v to i16"));
+                out.push(format!("{indent}{res} = bitcast i16 %{np}v to i16"));
                 continue;
             }
         }
         // -- b16 atomic store: st.release.gpu.b16 [$0], $1; "l,h"(ptr %p, i16 %v)
-        if body == "st.release.gpu.b16 [$0], $1" && res.is_empty() {
+        if body == "st.release.gpu.b16 [$0], $1" && trimmed.contains("void") {
             let parts: Vec<&str> = ops_text.split(", i16 ").collect();
             if parts.len() == 2 {
                 let ptr = parts[0].strip_prefix("ptr ").unwrap_or(parts[0]);
