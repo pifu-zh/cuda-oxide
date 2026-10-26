@@ -1308,11 +1308,11 @@ def _rne_f32_to_bf16(indent, vbits, seq):
     lsb = f"{vbits}.lsb"
     rnd = f"{vbits}.rnd"
     out = f"{vbits}.bf"
-    seq.append(f"{indent}%{lsb} = lshr i32 {vbits}, 16")
-    seq.append(f"{indent}%{lsb} = and i32 %{lsb}, 1")
-    seq.append(f"{indent}%{rnd} = add i32 %{lsb}, 32767")
-    seq.append(f"{indent}%{vbits}.r = add i32 {vbits}, %{rnd}")
-    seq.append(f"{indent}%{out} = lshr i32 {vbits}.r, 16")
+    seq.append(f"{indent}{vbits}.ls1 = lshr i32 {vbits}, 16")
+    seq.append(f"{indent}{vbits}.ls2 = and i32 {vbits}.ls1, 1")
+    seq.append(f"{indent}{vbits}.rnd = add i32 {vbits}.ls2, 32767")
+    seq.append(f"{indent}{vbits}.rn = add i32 {vbits}, {vbits}.rnd")
+    seq.append(f"{indent}{vbits}.bf = lshr i32 {vbits}.rn, 16")
     return out
 
 
@@ -1325,7 +1325,8 @@ def _bf16_to_f32(indent, v32, seq):
 
 def _emit_bf16_binop(indent, res, op, a, b, seq):
     """bf16x2 二则运算（add/sub/mul）：逐半展宽→f32 op→RNE 回缩。"""
-    prefix = res.lstrip('%') + ".p_"
+    _PM_COUNTER[0] += 1
+    prefix = f"_pm{_PM_COUNTER[0]}_"
     for tag, v in (("a", a), ("b", b)):
         seq.append(f"{indent}%{prefix}lo{tag} = and i32 {v}, 65535")
         seq.append(f"{indent}%{prefix}lo{tag}b = shl i32 %{prefix}lo{tag}, 16")
@@ -1340,13 +1341,14 @@ def _emit_bf16_binop(indent, res, op, a, b, seq):
     seq.append(f"{indent}%{prefix}h32 = bitcast float %{prefix}fhi to i32")
     lo16 = _rne_f32_to_bf16(indent, f"%{prefix}l32", seq)
     hi16 = _rne_f32_to_bf16(indent, f"%{prefix}h32", seq)
-    seq.append(f"{indent}%{prefix}hi16s = shl i32 %{hi16}, 16")
-    seq.append(f"{indent}{res} = or i32 %{lo16}, %{prefix}hi16s")
+    seq.append(f"{indent}%{prefix}hi16s = shl i32 {hi16}, 16")
+    seq.append(f"{indent}{res} = or i32 {lo16}, %{prefix}hi16s")
 
 
 def _emit_bf16_minmax(indent, res, op, a, b, seq):
     """min/max.bf16x2：逐半展宽→fcmp→select（结果精确，无需舍入）。"""
-    prefix = res.lstrip('%') + ".p_"
+    _PM_COUNTER[0] += 1
+    prefix = f"_pm{_PM_COUNTER[0]}_"
     cond = "olt" if op.startswith("min") else "ogt"
     for tag, v in (("a", a), ("b", b)):
         seq.append(f"{indent}%{prefix}lo{tag} = and i32 {v}, 65535")
@@ -1355,9 +1357,9 @@ def _emit_bf16_minmax(indent, res, op, a, b, seq):
         seq.append(f"{indent}%{prefix}fa{tag} = bitcast i32 %{prefix}lo{tag}b to float")
         seq.append(f"{indent}%{prefix}fb{tag} = bitcast i32 %{prefix}hi{tag} to float")
     seq.append(f"{indent}%{prefix}c = fcmp {cond} float %{prefix}faa, %{prefix}fba")
-    seq.append(f"{indent}%{prefix}slo = select i1 %{prefix}c, i32 %{prefix}a.lo16, i32 %{prefix}b.lo16")
+    seq.append(f"{indent}%{prefix}slo = select i1 %{prefix}c, i32 %{prefix}loa, i32 %{prefix}lob")
     seq.append(f"{indent}%{prefix}c2 = fcmp {cond} float %{prefix}fab, %{prefix}fbb")
-    seq.append(f"{indent}%{prefix}shi = select i1 %{prefix}c2, i32 %{prefix}a.hi, i32 %{prefix}b.hi")
+    seq.append(f"{indent}%{prefix}shi = select i1 %{prefix}c2, i32 %{prefix}hia, i32 %{prefix}hib")
     seq.append(f"{indent}%{prefix}shs = shl i32 %{prefix}shi, 16")
     seq.append(f"{indent}{res} = or i32 %{prefix}slo, %{prefix}shs")
 
@@ -1425,12 +1427,12 @@ def _rewrite_packed_math(text: str) -> str:
                 out.extend(seq)
                 continue
         # ---- fma.rn.bf16x2 "=r,r,r,r"(i32, i32, i32) ----
-        if opcode.startswith("fma.rn.bf16x2"):
+        if opcode.startswith("fma.rn") and "bf16x2" in opcode:  # 含 fma.rn.relu.bf16x2
             ops = re.findall(r'i32 (%[\w.$]+)', ops)
             if len(ops) == 3:
                 seq = []
                 _PM_COUNTER[0] += 1
-                prefix = res.lstrip('%') + f".{_PM_COUNTER[0]}_"
+                prefix = f"_pm{_PM_COUNTER[0]}_"
                 # a(乘数1)/b(乘数2) 展宽，c 加数展宽
                 for tag, v in (("a", ops[0]), ("b", ops[1]), ("c", ops[2])):
                     seq.append(f"{indent}%{prefix}lo{tag} = and i32 {v}, 65535")
@@ -1445,8 +1447,8 @@ def _rewrite_packed_math(text: str) -> str:
                 seq.append(f"{indent}%{prefix}h32 = bitcast float %{prefix}fhi to i32")
                 lo16 = _rne_f32_to_bf16(indent, f"%{prefix}l32", seq)
                 hi16 = _rne_f32_to_bf16(indent, f"%{prefix}h32", seq)
-                seq.append(f"{indent}%{prefix}hs = shl i32 %{hi16}, 16")
-                seq.append(f"{indent}{res} = or i32 %{lo16}, %{prefix}hs")
+                seq.append(f"{indent}%{prefix}hs = shl i32 {hi16}, 16")
+                seq.append(f"{indent}{res} = or i32 {lo16}, %{prefix}hs")
                 # fma 声明
                 # declares 由尾部统一追加
                 out.extend(seq)
@@ -1458,7 +1460,7 @@ def _rewrite_packed_math(text: str) -> str:
             if len(fls) == 2:
                 seq = []
                 _PM_COUNTER[0] += 1
-                prefix = res.lstrip('%') + f".{_PM_COUNTER[0]}_"
+                prefix = f"_pm{_PM_COUNTER[0]}_"
                 rz, relu = mcv.group(1) == "rz", bool(mcv.group(2))
                 for tag, v in (("lo", fls[1]), ("hi", fls[0])):
                     if v.startswith('%'):
@@ -1469,13 +1471,13 @@ def _rewrite_packed_math(text: str) -> str:
                         seq.append(f"{indent}%{prefix}b{tag} = bitcast float %{prefix}f{tag} to i32")
                     if relu:
                         seq.append(f"{indent}%{prefix}z{tag} = icmp slt i32 %{prefix}b{tag}, 0")
-                        seq.append(f"{indent}%{prefix}bz{tag} = select i1 %{prefix}z{tag}, i32 0, i32 %{prefix}b{tag}")
+                        seq.append(f"{indent}%{prefix}b{tag}z = select i1 %{prefix}z{tag}, i32 0, i32 %{prefix}b{tag}")
                     bz = f"%{prefix}b{tag}z" if relu else f"%{prefix}b{tag}"
                     if rz:
                         seq.append(f"{indent}%{prefix}h{tag} = lshr i32 {bz}, 16")
                     else:
                         h = _rne_f32_to_bf16(indent, bz, seq)
-                        seq.append(f"{indent}%{prefix}h{tag} = or i32 %{h}, 0")
+                        seq.append(f"{indent}%{prefix}h{tag} = or i32 {h}, 0")
                 seq.append(f"{indent}%{prefix}hs = shl i32 %{prefix}hhi, 16")
                 seq.append(f"{indent}{res} = or i32 %{prefix}hlo, %{prefix}hs")
                 out.extend(seq)
@@ -1487,7 +1489,7 @@ def _rewrite_packed_math(text: str) -> str:
             if len(fls) == 2:
                 seq = []
                 _PM_COUNTER[0] += 1
-                prefix = res.lstrip('%') + f".{_PM_COUNTER[0]}_"
+                prefix = f"_pm{_PM_COUNTER[0]}_"
                 rz, relu = mcf.group(1) == "rz", bool(mcf.group(2))
                 for tag, v in (("lo", fls[1]), ("hi", fls[0])):
                     if v.startswith('%'):
@@ -1495,11 +1497,12 @@ def _rewrite_packed_math(text: str) -> str:
                     else:
                         seq.append(f"{indent}%{prefix}hf{tag} = fadd float {v}, 0.0")
                         seq.append(f"{indent}%{prefix}h{tag} = fptrunc float %{prefix}hf{tag} to half")
+                    h_ref = f"%{prefix}h{tag}"
                     if relu:
                         seq.append(f"{indent}%{prefix}hz{tag} = fcmp olt half %{prefix}h{tag}, 0.0")
-                        seq.append(f"{indent}%{prefix}h{tag} = select i1 %{prefix}hz{tag}, half 0.0, half %{prefix}h{tag}")
-                    seq.append(f"{indent}%{prefix}b{tag} = bitcast half %{prefix}h{tag} to i16")
-                    seq.append(f"{indent}%{prefix}x{tag} = zext i16 %{prefix}b{tag} to i32")
+                        seq.append(f"{indent}%{prefix}hr{tag} = select i1 %{prefix}hz{tag}, half 0.0, half %{prefix}h{tag}")
+                        h_ref = f"%{prefix}hr{tag}"
+                    seq.append(f"{indent}%{prefix}b{tag} = bitcast half {h_ref} to i16")
                     seq.append(f"{indent}%{prefix}x{tag} = zext i16 %{prefix}b{tag} to i32")
                 seq.append(f"{indent}%{prefix}hs = shl i32 %{prefix}xhi, 16")
                 seq.append(f"{indent}{res} = or i32 %{prefix}xlo, %{prefix}hs")
@@ -1511,7 +1514,7 @@ def _rewrite_packed_math(text: str) -> str:
             if len(op) == 1:
                 seq = []
                 _PM_COUNTER[0] += 1
-                prefix = res.lstrip('%') + f".{_PM_COUNTER[0]}_"
+                prefix = f"_pm{_PM_COUNTER[0]}_"
                 seq.append(f"{indent}%{prefix}h = bitcast i16 {op[0]} to half")
                 seq.append(f"{indent}%{prefix}f = fpext half %{prefix}h to float")
                 seq.append(f"{indent}%{prefix}e = call float @llvm.amdgcn.exp2.f32(float %{prefix}f)")
@@ -1525,14 +1528,20 @@ def _rewrite_packed_math(text: str) -> str:
         mf32 = re.match(r"(add|sub|mul|fma)\.rn(\.ftz)?\.f32x2 \$0, \$1, \$2(, \$3)?", body)
         if mf32:
             ops = re.findall(r'i64 ([%\w.$]+|\d+)', ops)
-            if len(ops) == 2:
+            if len(ops) in (2, 3):
                 seq = []
                 _PM_COUNTER[0] += 1
-                prefix = res.lstrip('%') + f".{_PM_COUNTER[0]}_"
-                flop = {"add": "fadd", "sub": "fsub", "mul": "fmul"}[mf32.group(1)]
+                prefix = f"_pm{_PM_COUNTER[0]}_"
+                is_fma = mf32.group(1) == "fma"
                 seq.append(f"{indent}%{prefix}va = bitcast i64 {ops[0]} to <2 x float>")
                 seq.append(f"{indent}%{prefix}vb = bitcast i64 {ops[1]} to <2 x float>")
-                seq.append(f"{indent}%{prefix}vs = {flop} <2 x float> %{prefix}va, %{prefix}vb")
+                if is_fma:
+                    seq.append(f"{indent}%{prefix}vc = bitcast i64 {ops[2]} to <2 x float>")
+                    seq.append(f"{indent}%{prefix}vs = call <2 x float> @llvm.fma.v2f32(<2 x float> %{prefix}va, <2 x float> %{prefix}vb, <2 x float> %{prefix}vc)")
+                    needs_fma_decl = True
+                else:
+                    flop = {"add": "fadd", "sub": "fsub", "mul": "fmul"}[mf32.group(1)]
+                    seq.append(f"{indent}%{prefix}vs = {flop} <2 x float> %{prefix}va, %{prefix}vb")
                 seq.append(f"{indent}{res} = bitcast <2 x float> %{prefix}vs to i64")
                 out.extend(seq)
                 continue
@@ -1542,6 +1551,8 @@ def _rewrite_packed_math(text: str) -> str:
         decls = []
         if "@llvm.fma.f32" in joined and "declare float @llvm.fma.f32" not in text:
             decls.append("declare float @llvm.fma.f32(float, float, float)")
+        if "@llvm.fma.v2f32" in joined and "declare <2 x float> @llvm.fma.v2f32" not in text:
+            decls.append("declare <2 x float> @llvm.fma.v2f32(<2 x float>, <2 x float>, <2 x float>)")
         if "@llvm.amdgcn.exp2.f32" in joined and "declare float @llvm.amdgcn.exp2.f32" not in text:
             decls.append("declare float @llvm.amdgcn.exp2.f32(float)")
         if decls:
