@@ -193,6 +193,11 @@ def translate_nvvm_to_amdgcn(ll_text: str) -> str:
     #     "异步等待退化为软件同步" 路线，见 _rewrite_mbarriers）
     text = _rewrite_mbarriers(text)
 
+    # 17. [adapt-rocm] vprintf(NVVM) → __ockl_printf_*（hostcall printf）：
+    #     展开 + 模块元数据 amdgpu_printf_kind="hostcall"（运行时按此注入
+    #     hostcall buffer；hipModuleLoadData 路径 ~/tmp-prof/printf_mod 实证）
+    text = _rewrite_vprintf(text)
+
     return text
 
 
@@ -1000,6 +1005,273 @@ def _rewrite_cb_in_function(body: "list[str]") -> "tuple[list[str], set, bool]":
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# [adapt-rocm] Step 17: vprintf(NVVM) → __ockl_printf_*（hostcall printf 服务）
+#
+# ROCm 的设备 printf 走 hostcall 协议：模块元数据 amdgpu_printf_kind=
+# "hostcall" 时运行时经 implicit kernarg 注入 buffer（hipModuleLoadData 路径
+# 实证工作：~/tmp-prof/printf_mod 探针 64 线程输出全对）。调用点展开：
+#   %h   = call i64 @__ockl_printf_begin(i64 0)
+#   %s   = call i64 @__ockl_printf_append_string_n(i64 %h, ptr %fmt, i64 <strlen>, i32 0)
+#   %r   = call i64 @__ockl_printf_append_args(i64 %h, i32 N, 7×i64 槽, i32 1)
+#   原结果名 = trunc i64 %r to i32
+# ABI 来源：ockl.bc llvm-dis（begin(i64)->i64；append_args(handle,nargs,
+# 7×i64,islast)；append_string_n(handle,ptr,len,islast)）。
+# 信封：fmt 指针须可溯源到模块级 addrspace(1) constant 全局（解析字节算
+# strlen）；args 指针须是 {promoted-field...} 结构体 alloca（GEP 逐字段加
+# 载，按字段类型升 i64：i32→zext / i64 原样 / f64→bitcast / f32→fpext+bitcast）
+# 或 inttoptr i64 0（无参）。信封外形态保留 vprintf 调用，链接期显式失败。
+# ---------------------------------------------------------------------------
+
+_VPRINTF_CALL_RE = re.compile(
+    r"^(?P<indent>\s*)(?P<res>%[\w.$]+) = (?:tail )?call i32 @vprintf\("
+    r"ptr (?P<fmt>%[\w.$]+), ptr (?P<args>[^)]+)\)"
+)
+
+_GLOBAL_DEF_RE = re.compile(
+    r"@(?P<name>[\w.$]+) = (?:private |internal )?(?:unnamed_addr )?"
+    r"addrspace\(1\) constant \[(?P<n>\d+) x i8\] c\"(?P<bytes>(?:\\[0-9A-Fa-f]{2}|\\\\|\"|[^\"])*?)\""
+)
+
+_PTR_ORIGIN_RE = re.compile(
+    r"^\s*(?P<name>%[\w.$]+) = addrspacecast ptr addrspace\(1\) "
+    r"@(?P<g>[\w.$]+) to ptr\s*$"
+)
+
+_ALLOCA_TYPE_RE = re.compile(
+    # <{...}> = packed 结构体（packed_aggregate_abi 族 printf args）——
+    # ty 捕获保留完整 <> 包裹形态（GEP 类型须与 alloca 一致）
+    r"^\s*(?P<name>%[\w.$]+) = alloca (?P<ty><?\{.*?\}>?)(?:,|\s|$)"
+)
+
+
+def _parse_global_bytes(raw: str) -> bytes:
+    """LLVM c"\\53\\70..." 字节串字面量 → bytes。"""
+    out = bytearray()
+    i = 0
+    while i < len(raw):
+        if raw[i] == "\\" and i + 3 <= len(raw):
+            out.append(int(raw[i + 1:i + 3], 16))
+            i += 3
+        else:
+            out.append(ord(raw[i]))
+            i += 1
+    return bytes(out)
+
+
+def _split_struct_fields(ty: str):
+    """'{ i64, i64, double }' → ['i64','i64','double']（顶层逗号切分）。"""
+    inner = ty.strip()
+    if inner.startswith("<"):
+        inner = inner[1:]
+    if inner.endswith(">"):
+        inner = inner[:-1]
+    if inner.startswith("{"):
+        inner = inner[1:]
+    if inner.endswith("}"):
+        inner = inner[:-1]
+    fields, depth, cur = [], 0, ""
+    for ch in inner:
+        if ch in "{[(":
+            depth += 1
+        elif ch in "}])":
+            depth -= 1
+        if ch == "," and depth == 0:
+            fields.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        fields.append(cur.strip())
+    return fields
+
+
+def _emit_arg_slots(indent, args_ptr, args_ty, fields, base, seq):
+    """逐字段 GEP+load+升 i64；未知字段类型返回 None（信封外）。"""
+    vals = []
+    for i, ft in enumerate(fields[:7]):  # append_args 固定 7 槽
+        g, v = f"{base}g{i}", f"{base}v{i}"
+        seq.append(
+            f"{indent}%{g} = getelementptr inbounds {args_ty}, "
+            f"ptr {args_ptr}, i32 0, i32 {i}"
+        )
+        if ft == "i32":
+            seq.append(f"{indent}%{v} = load i32, ptr %{g}, align 4")
+            seq.append(f"{indent}%{v}i = zext i32 %{v} to i64")
+            vals.append(f"i64 %{v}i")
+        elif ft == "i8":
+            seq.append(f"{indent}%{v} = load i8, ptr %{g}, align 1")
+            seq.append(f"{indent}%{v}i = zext i8 %{v} to i32")
+            seq.append(f"{indent}%{v}l = zext i32 %{v}i to i64")
+            vals.append(f"i64 %{v}l")
+        elif ft == "i16":
+            seq.append(f"{indent}%{v} = load i16, ptr %{g}, align 2")
+            seq.append(f"{indent}%{v}i = zext i16 %{v} to i32")
+            seq.append(f"{indent}%{v}l = zext i32 %{v}i to i64")
+            vals.append(f"i64 %{v}l")
+        elif ft == "i64":
+            seq.append(f"{indent}%{v} = load i64, ptr %{g}, align 8")
+            vals.append(f"i64 %{v}")
+        elif ft == "double":
+            seq.append(f"{indent}%{v} = load double, ptr %{g}, align 8")
+            seq.append(f"{indent}%{v}b = bitcast double %{v} to i64")
+            vals.append(f"i64 %{v}b")
+        elif ft == "[4 x i8]":
+            # 4 字节数组：按 i32 一次装入（align 1 显式标注，packed alloca 允许）
+            seq.append(f"{indent}%{v} = load i32, ptr %{g}, align 1")
+            seq.append(f"{indent}%{v}l = zext i32 %{v} to i64")
+            vals.append(f"i64 %{v}l")
+        elif ft == "float":
+            seq.append(f"{indent}%{v} = load float, ptr %{g}, align 4")
+            seq.append(f"{indent}%{v}x = fpext float %{v} to double")
+            seq.append(f"{indent}%{v}b = bitcast double %{v}x to i64")
+            vals.append(f"i64 %{v}b")
+        else:
+            return None
+    while len(vals) < 7:
+        vals.append("i64 0")
+    return vals
+
+
+def _rewrite_vprintf(text: str) -> str:
+    if "@vprintf(" not in text:
+        return text
+    lines = text.split("\n")
+
+    globals_bytes = {}
+    for m in _GLOBAL_DEF_RE.finditer(text):
+        try:
+            globals_bytes[m.group("name")] = _parse_global_bytes(m.group("bytes"))
+        except ValueError:
+            pass
+
+    ptr_origin = {}
+    for ln in lines:
+        m = _PTR_ORIGIN_RE.match(ln)
+        if m:
+            ptr_origin[m.group("name")] = m.group("g")
+    # 传递闭包：extractvalue{ptr,i64} %X,0 与 insertvalue(ptr %X) 链上的
+    # fmt 指针要能溯到全局（真实形态 v22←v21←v20←v19=cast@G）。
+    _PROP_RE = re.compile(
+        r"^\s*(?P<name>%[\w.$]+) = (?:extractvalue \{ ptr(?:, i64)? \} "
+        r"(?P<ev>%[\w.$]+), 0|insertvalue \{ ptr(?:, i64)? \}(?: [^,]+)?, "
+        r"ptr (?P<iv>%[\w.$]+), 0)"
+    )
+    # 第二形态：insertvalue { ptr, i64 } %prev, i64 N, 1（i64 字段后插，
+    # ptr 已在 %prev 里）——同函数多个 vprintf 共享 prev 链时出现。
+    _PROP2_RE = re.compile(
+        r"^\s*(?P<name>%[\w.$]+) = insertvalue \{ ptr, i64 \} "
+        r"(?P<iv2>%[\w.$]+), i64 \d+, 1\s*$"
+    )
+    changed = True
+    while changed:
+        changed = False
+        for ln in lines:
+            m = _PROP_RE.match(ln) or _PROP2_RE.match(ln)
+            if not m:
+                continue
+            gd = m.groupdict()
+            src_name = (
+                gd.get("ev") or gd.get("iv") or gd.get("iv2")
+            )
+            if src_name in ptr_origin and m.group("name") not in ptr_origin:
+                ptr_origin[m.group("name")] = ptr_origin[src_name]
+                changed = True
+
+    alloca_ty = {}
+    for ln in lines:
+        m = _ALLOCA_TYPE_RE.match(ln)
+        if m:
+            alloca_ty[m.group("name")] = m.group("ty")
+
+    # 无参形态：args 操作数是 SSA 名，其定义为 inttoptr i64 0 to ptr。
+    null_args = set(
+        m.group(1)
+        for m in re.finditer(
+            r"^\s*(%[\w.$]+) = inttoptr i64 0 to ptr\s*$", text, re.M
+        )
+    )
+
+    used = False
+    out = []
+    for ln in lines:
+        m = _VPRINTF_CALL_RE.match(ln)
+        if not m:
+            out.append(ln)
+            continue
+        indent, res, fmt, args = (
+            m.group("indent"), m.group("res"), m.group("fmt"), m.group("args")
+        )
+        g = ptr_origin.get(fmt)
+        if g is None or g not in globals_bytes:
+            out.append(ln)  # 动态 fmt：信封外
+            continue
+        blob = globals_bytes[g]
+        nul = blob.find(b"\x00")
+        strlen = nul if nul >= 0 else len(blob)
+        args = args.strip()
+        if (
+            args.startswith("i64 0")
+            or args == "null"
+            or (args.startswith("%") and args in null_args)
+        ):
+            fields, args_ptr = [], None
+        else:
+            # alloca 步（Step 8）会把 use 改名为 <name>.ac（addrspacecast 的
+            # 通用指针）；类型查原名，GEP 直接用 .ac 指针。
+            base_args = args[:-3] if args.endswith(".ac") else args
+            args_ty = alloca_ty.get(base_args)
+            if args_ty is None:
+                out.append(ln)
+                continue
+            fields = _split_struct_fields(args_ty)
+            args_ptr = args
+        base = res.lstrip("%") + ".pf_"
+        seq = [f"{indent}%{base}h = call i64 @__ockl_printf_begin(i64 0)",
+               f"{indent}%{base}f = addrspacecast ptr addrspace(1) @{g} to ptr",
+               f"{indent}%{base}s = call i64 @__ockl_printf_append_string_n("
+               f"i64 %{base}h, ptr %{base}f, i64 {strlen}, i32 0)"]
+        if args_ptr is not None:
+            vals = _emit_arg_slots(indent, args_ptr, args_ty, fields, base, seq)
+            if vals is None:
+                out.append(ln)
+                continue
+        else:
+            vals = ["i64 0"] * 7
+        seq.append(
+            f"{indent}%{base}r = call i64 @__ockl_printf_append_args("
+            f"i64 %{base}h, i32 {len(fields)}, {', '.join(vals)}, i32 1)"
+        )
+        seq.append(f"{indent}{res} = trunc i64 %{base}r to i32")
+        out.extend(seq)
+        used = True
+
+    text = "\n".join(out)
+    if not used:
+        return text
+    text = re.sub(r"declare i32 @vprintf\([^)]*\)\n?", "", text)
+    decls = (
+        "declare i64 @__ockl_printf_begin(i64)\n"
+        "declare i64 @__ockl_printf_append_args("
+        "i64, i32, i64, i64, i64, i64, i64, i64, i64, i32)\n"
+        "declare i64 @__ockl_printf_append_string_n(i64, ptr, i64, i32)\n"
+    )
+    if "declare i64 @__ockl_printf_begin" not in text:
+        idx = text.find("\ndefine ")
+        text = text[:idx] + "\n" + decls + text[idx:]
+    if "!amdgpu_printf_kind" not in text:
+        md = 0
+        for mm in re.finditer(r"^\s*!(\d+) = ", text, re.M):
+            md = max(md, int(mm.group(1)) + 1)
+        if not text.endswith("\n"):
+            text += "\n"
+        text += (
+            f'!{md} = !{{i32 1, !"amdgpu_printf_kind", !"hostcall"}}\n'
+            f"!amdgpu_printf_kind = !{{!{md}}}\n"
+        )
+    return text
+
+
 # Step 15: libdevice __nv_* → ocml __ocml_*
 # ---------------------------------------------------------------------------
 #

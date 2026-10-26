@@ -445,6 +445,26 @@ fn discover_amdgcn_lld(
     ))
 }
 
+/// [adapt-rocm][printf] Locate a bitcode file under the ROCm install's
+/// amdgcn bitcode directories (ocml/ockl/oclc live there in ROCm 10.x).
+fn find_rocm_bitcode(name: &str) -> Option<std::path::PathBuf> {
+    let rocm = std::env::var("ROCM_PATH")
+        .map(|v| std::path::PathBuf::from(v))
+        .unwrap_or_else(|_| std::path::PathBuf::from("/opt/rocm"));
+    for base in [
+        rocm.join("core/lib/llvm/amdgcn/bitcode"),
+        rocm.join("llvm/amdgcn/bitcode"),
+        rocm.join("amdgcn/bitcode"),
+        rocm.join("lib/llvm/amdgcn/bitcode"),
+    ] {
+        let candidate = base.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// [PORT gfx1030] Generates a linked gfx… code object from the exported IR.
 ///
 /// Pipeline (each stage Phase-1 verified on gfx1030 with a numeric check):
@@ -514,6 +534,96 @@ fn generate_amdgcn_code_object(
     })?;
     let rewritten = crate::amdgcn::rewrite_ir_for_amdgcn(&optimized_text)
         .map_err(PipelineError::PtxGeneration)?;
+
+    // 3b. [PORT gfx1030][goal printf] ockl 链接：vprintf 展开产生的
+    //     __ockl_printf_* 调用由 ockl.bc 提供（hipcc 同源；ocml 数学走另一条
+    //     链接）。ockl 依赖 oclc 配置（__oclc_ISA_version / finite_only /
+     //     incorrectly_cased specials），与 ocml 链接配方同族。
+    let rewritten = if rewritten.contains("__ockl_printf") {
+        let ockl_bc = find_rocm_bitcode("ockl.bc").ok_or_else(|| {
+            PipelineError::PtxGeneration(
+                "printf: __ockl_* calls present but ockl.bc not found under                  ROCm bitcode dirs (set ROCM_PATH)"
+                    .to_string(),
+            )
+        })?;
+        // oclc 配置三件套：ISA 版本 + ABI 版本（ockl 的 __oclc_ABI_version
+        // 未解析符号来源）+ finite_only（ockl/ocml 均依赖）
+        let isa_num = gfx.trim_start_matches("gfx");
+        let oclc_isa = find_rocm_bitcode(&format!("oclc_isa_version_{isa_num}.bc"))
+            .ok_or_else(|| {
+                PipelineError::PtxGeneration(format!(
+                    "printf: oclc_isa_version_{isa_num}.bc not found for the ockl link"
+                ))
+            })?;
+        let oclc_abi = find_rocm_bitcode("oclc_abi_version_600.bc")
+            .or_else(|| find_rocm_bitcode("oclc_abi_version_500.bc"))
+            .or_else(|| find_rocm_bitcode("oclc_abi_version_400.bc"))
+            .ok_or_else(|| {
+                PipelineError::PtxGeneration(
+                    "printf: oclc_abi_version_*.bc not found for the ockl link"
+                        .to_string(),
+                )
+            })?;
+        let oclc_finite = find_rocm_bitcode("oclc_finite_only_off.bc").ok_or_else(
+            || {
+                PipelineError::PtxGeneration(
+                    "printf: oclc_finite_only_off.bc not found for the ockl link"
+                        .to_string(),
+                )
+            },
+        )?;
+        let linked = match &toolchain.llvm_link {
+            Some(tool) => tool.path.clone(),
+            None => {
+                return Err(PipelineError::PtxGeneration(
+                    "printf: llvm-link required for the ockl link but not found"
+                        .to_string(),
+                ))
+            }
+        };
+        let linked_ll = module.llvm_ir.with_extension("amdgcn.ockl.ll");
+        // rewritten 是 IR 文本内容——先落盘再喂 llvm-link（命令行不能传内容）
+        let ockl_input = module.llvm_ir.with_extension("amdgcn.preockl.ll");
+        std::fs::write(&ockl_input, &rewritten).map_err(|error| {
+            PipelineError::PtxGeneration(format!(
+                "failed to write ockl-link input ({}): {error}",
+                ockl_input.display()
+            ))
+        })?;
+        let status = std::process::Command::new(&linked)
+            .arg("-S")
+            .arg("--only-needed")
+            .arg(&ockl_input)
+            .arg(&ockl_bc)
+            .arg(&oclc_isa)
+            .arg(&oclc_abi)
+            .arg(&oclc_finite)
+            .arg("-o")
+            .arg(&linked_ll)
+            .output();
+        match status {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
+                return Err(PipelineError::PtxGeneration(format!(
+                    "llvm-link (ockl) failed:\n{}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+            Err(error) => {
+                return Err(PipelineError::PtxGeneration(format!(
+                    "failed to run llvm-link (ockl): {error}"
+                )));
+            }
+        }
+        std::fs::read_to_string(&linked_ll).map_err(|error| {
+            PipelineError::PtxGeneration(format!(
+                "failed to read ockl-linked IR ({}): {error}",
+                linked_ll.display()
+            ))
+        })?
+    } else {
+        rewritten
+    };
     let amdgcn_ll = module.llvm_ir.with_extension("amdgcn.ll");
     std::fs::write(&amdgcn_ll, &rewritten).map_err(|error| {
         PipelineError::PtxGeneration(format!(

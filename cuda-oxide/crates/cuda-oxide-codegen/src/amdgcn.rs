@@ -1774,6 +1774,372 @@ fn rewrite_ocml(ll: &str) -> String {
     text
 }
 
+/// [adapt-rocm] Step 17: device printf. ROCm serves device printf through the
+/// hostcall protocol: the module metadata `amdgpu_printf_kind = "hostcall"`
+/// makes the runtime inject a hostcall buffer via the implicit kernarg, and
+/// the ockl helpers `__ockl_printf_begin / _append_string_n / _append_args`
+/// write into it (ABI extracted by llvm-dis of ockl.bc; end-to-end proven by
+/// the ~/tmp-prof/printf_mod probe: 64 threads printed through
+/// hipModuleLoadData + hipModuleLaunchKernel).
+///
+/// Expansion envelope per `vprintf(fmt, args)` call site:
+/// - `fmt` resolves to a module-level addrspace(1) constant global through
+///   addrspacecast or {ptr,i64} insertvalue/extractvalue chains;
+/// - `args` is either an `inttoptr i64 0` (no args) or an alloca whose
+///   promoted fields map to the ockl i64 slots (i32/i64/f64/f32/[4 x i8]).
+/// Everything else keeps the raw `vprintf` call as a loud link failure.
+///
+/// The ockl.bc link itself happens in ptx.rs (oclc_isa_version_<gfx>.bc
+/// configuration), and the module gains the `amdgpu_printf_kind` metadata.
+/// [adapt-rocm] Step 17: device printf. ROCm serves device printf through the
+/// hostcall protocol: the module metadata `amdgpu_printf_kind = "hostcall"`
+/// makes the runtime inject a hostcall buffer via the implicit kernarg, and
+/// the ockl helpers `__ockl_printf_begin / _append_string_n / _append_args`
+/// write into it (ABI extracted by llvm-dis of ockl.bc; end-to-end proven by
+/// the ~/tmp-prof/printf_mod probe: 64 threads printed through
+/// hipModuleLoadData + hipModuleLaunchKernel).
+///
+/// Expansion envelope per `vprintf(fmt, args)` call site:
+/// - `fmt` resolves to a module-level addrspace(1) constant global through
+///   addrspacecast or {ptr,i64} insertvalue/extractvalue chains;
+/// - `args` is either an `inttoptr i64 0` (no args) or an alloca whose
+///   promoted fields map to the ockl i64 slots (i32/i64/f64/f32/[4 x i8]).
+/// Everything else keeps the raw `vprintf` call as a loud link failure.
+///
+/// The ockl.bc link itself happens in ptx.rs (oclc_isa_version_<gfx>.bc
+/// configuration), and the module gains the `amdgpu_printf_kind` metadata.
+fn rewrite_vprintf_to_ockl(text: &str) -> String {
+    if !text.contains("@vprintf(") {
+        return text.to_string();
+    }
+
+    // 模块级 constant 字节表（c"\xx.." 转义解析）
+    let mut globals_bytes: Vec<(String, Vec<u8>)> = Vec::new();
+    for line in text.lines() {
+        if !(line.contains("= addrspace(1) constant [") && line.contains(" x i8] c\"")) {
+            continue;
+        }
+        let Some(at) = line.find("@") else { continue };
+        let Some(eq) = line.find("= addrspace(1) constant [") else { continue };
+        let name = line[at..at + (eq - at)].trim().trim_start_matches('@').to_string();
+        let Some(q1) = line.find("c\"") else { continue };
+        let raw = &line[q1 + 2..];
+        let Some(close) = raw.rfind('"') else { continue };
+        let raw = &raw[..close];
+        let mut bytes = Vec::new();
+        let b = raw.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'\\' && i + 2 < b.len() {
+                if let Ok(v) = u8::from_str_radix(
+                    std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("zz"),
+                    16,
+                ) {
+                    bytes.push(v);
+                    i += 3;
+                    continue;
+                }
+            }
+            bytes.push(b[i]);
+            i += 1;
+        }
+        globals_bytes.push((name, bytes));
+    }
+
+    // SSA→指针来源表：addrspacecast @G + {ptr,i64} 链两跳传递
+    let mut ptr_origin: Vec<(String, String)> = Vec::new();
+    let origin_of = |map: &Vec<(String, String)>, name: &str| -> Option<String> {
+        map.iter().find(|(n, _)| n == name).map(|(_, g)| g.clone())
+    };
+    for line in text.lines() {
+        let l = line.trim();
+        if !l.starts_with('%') {
+            continue;
+        }
+        let Some((name, rhs)) = l.split_once(" = ") else { continue };
+        let g = rhs
+            .strip_prefix("addrspacecast ptr addrspace(1) @")
+            .and_then(|r| r.split(" to ptr").next())
+            .map(|g| g.to_string())
+            .or_else(|| {
+                // {ptr,i64} 链传递：extractvalue(...,0) / insertvalue 续链
+                if let Some(src) = rhs
+                    .strip_prefix("extractvalue { ptr, i64 } ")
+                    .and_then(|r| r.rsplit(", 0").next())
+                    .and_then(|r| r.rsplit_once('}'))
+                    .map(|(_, lhs)| {
+                        lhs.trim().strip_prefix("undef, ptr ").unwrap_or(lhs.trim())
+                    })
+                {
+                    return origin_of(&ptr_origin, src);
+                }
+                if rhs.starts_with("insertvalue { ptr, i64 } ") {
+                    let prev = rhs
+                        .trim_start_matches("insertvalue { ptr, i64 } ")
+                        .split(',')
+                        .next()
+                        .unwrap_or("")
+                        .trim();
+                    return origin_of(&ptr_origin, prev.trim_start_matches("undef, ptr "));
+                }
+                None
+            });
+        if let Some(g) = g {
+            ptr_origin.push((name.to_string(), g));
+        }
+    }
+    let origin_of = |name: &str| -> Option<String> { origin_of(&ptr_origin, name) };
+
+    // alloca 类型表（args 结构体字段由 alloca 元素类型给出；packed <> 保留）
+    let mut alloca_ty: Vec<(String, String)> = Vec::new();
+    for line in text.lines() {
+        let l = line.trim();
+        if !l.contains(" = alloca ") {
+            continue;
+        }
+        let Some((name, rhs)) = l.split_once(" = alloca ") else { continue };
+        if !(rhs.starts_with('{') || rhs.starts_with("<{")) {
+            continue;
+        }
+        let end = rhs.find(", align").unwrap_or(rhs.len());
+        alloca_ty.push((format!("%{}", name.trim_start_matches('%')), rhs[..end].to_string()));
+    }
+    let alloca_ty_of = |name: &str| -> Option<String> {
+        alloca_ty
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, t)| t.clone())
+    };
+
+    let mut used = false;
+    let mut out: Vec<String> = Vec::with_capacity(text.lines().count());
+    let mut dbg_seen = 0usize;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if !(trimmed.contains("call i32 @vprintf(") && trimmed.starts_with('%')) {
+            out.push(line.to_string());
+            continue;
+        }
+        dbg_seen += 1;
+        let indent = &line[..line.len() - trimmed.len()];
+        let Some((res_raw, rest)) = trimmed.strip_prefix('%').and_then(|r| r.split_once(" = "))
+        else {
+            out.push(line.to_string());
+            continue;
+        };
+        let res = format!("%{res_raw}");
+        let Some(inner) = rest
+            .strip_prefix("tail call i32 @vprintf(")
+            .or_else(|| rest.strip_prefix("call i32 @vprintf("))
+        else {
+            out.push(line.to_string());
+            continue;
+        };
+        // 边界=最后一个 ')'：args 内嵌套括号会让 find(") ") 停在中间层
+        let Some(close) = inner.rfind(')') else {
+            out.push(line.to_string());
+            continue;
+        };
+        let operands = &inner[..close];
+        // attrs 尾巴：') ' 后的剩余（"#0" 或空字符串——两者都合法）
+        let attrs_tail = &inner[close + 1..];
+        // 空尾巴 = 无属性组（合法）；非空必须全是 #N 组
+        let at = attrs_tail.trim();
+        if !(at.is_empty() || at.split_whitespace().all(|t| {
+            t.starts_with('#') && t[1..].bytes().all(|b| b.is_ascii_digit())
+        })) {
+            out.push(line.to_string());
+            continue;
+        }
+        // operands 形如 "ptr %fmt, ptr %args"
+        let Some((f, a)) = operands.split_once(", ptr ") else {
+            out.push(line.to_string());
+            continue;
+        };
+        // fmt 形态："%name" 或内联 "addrspacecast (ptr addrspace(1) @G to ptr)"
+        // fmt 两形态：内联 addrspacecast（即全局名）或 SSA %name（需溯源）
+        let (fmt, fmt_is_global) = if let Some(rest) = f.trim()
+            .strip_prefix("ptr addrspacecast (ptr addrspace(1) @")
+            .and_then(|r| r.split_once(" to ptr)"))
+            .map(|(g, _)| g)
+        {
+            (rest.to_string(), true)
+        } else {
+            (
+                f.trim().strip_prefix("ptr ").unwrap_or(f.trim()).to_string(),
+                false,
+            )
+        };
+        let args = a.trim().to_string();
+
+        // fmt 溯源 + strlen
+        let g = if fmt_is_global {
+            fmt.clone()
+        } else if let Some(g) = origin_of(&fmt) {
+            g
+        } else {
+            out.push(line.to_string());
+            continue;
+        };
+        let Some((_, blob)) = globals_bytes.iter().find(|(n, _)| n == &g) else {
+            out.push(line.to_string());
+            continue;
+        };
+        let strlen = blob.iter().position(|&b| b == 0).unwrap_or(blob.len());
+
+        let null_args = args == "null" || args == "ptr null"
+            || args == "i64 0"
+            || text.lines().any(|l| {
+                l.trim() == format!("{args} = inttoptr i64 0 to ptr").as_str()
+            });
+        let base = format!(
+            "{}.pf_",
+            res.strip_prefix('%').unwrap_or(res.as_str())
+        );
+        let mut seq: Vec<String> = Vec::new();
+        seq.push(format!("{indent}%{base}h = call i64 @__ockl_printf_begin(i64 0)"));
+        seq.push(format!(
+            "{indent}%{base}f = addrspacecast ptr addrspace(1) @{g} to ptr"
+        ));
+        seq.push(format!(
+            "{indent}%{base}s = call i64 @__ockl_printf_append_string_n(i64 %{base}h, ptr %{base}f, i64 {strlen}, i32 0)"
+        ));
+        let nargs;
+        if null_args {
+            nargs = 0;
+            seq.push(format!(
+                "{indent}%{base}r = call i64 @__ockl_printf_append_args(i64 %{base}h, i32 0, i64 0, i64 0, i64 0, i64 0, i64 0, i64 0, i64 0, i32 1)"
+            ));
+        } else {
+            // args 原文可能带指针属性（"ptr nonnull %x" 的 nonnull 已被
+            // operands 切分留下）——GEP 里属性不合法，这里剥出裸指针名：
+            // "%x.ac" → 类型查 "%x"。
+            let bare = args
+                .trim_start_matches("nonnull ")
+                .trim_start_matches("noundef ")
+                .trim();
+            let base_args = bare.strip_suffix(".ac").unwrap_or(bare);
+            let Some(ty) = alloca_ty_of(base_args) else {
+                out.push(line.to_string());
+                continue;
+            };
+            let packed = ty.starts_with('<');
+            let inner = ty.trim_start_matches('<').trim_end_matches('>');
+            let inner = inner.strip_prefix('{').unwrap_or(inner);
+            let inner = inner.strip_suffix('}').unwrap_or(inner);
+            let fields: Vec<&str> = inner.split(',').map(str::trim).collect();
+            let gep_ty = if packed {
+                format!("<{{ {} }}>", fields.join(", "))
+            } else {
+                format!("{{ {} }}", fields.join(", "))
+            };
+            let mut slots: Vec<String> = Vec::new();
+            let mut ok = true;
+            for (i, ft) in fields.iter().enumerate().take(7) {
+                let (gv, vv) = (format!("{base}g{i}"), format!("{base}v{i}"));
+                seq.push(format!(
+                    "{indent}%{gv} = getelementptr inbounds {gep_ty}, ptr {bare}, i32 0, i32 {i}"
+                ));
+                match *ft {
+                    "i32" => {
+                        seq.push(format!("{indent}%{vv} = load i32, ptr %{gv}, align 4"));
+                        seq.push(format!("{indent}%{vv}l = zext i32 %{vv} to i64"));
+                        slots.push(format!("i64 %{vv}l"));
+                    }
+                    "i8" => {
+                        seq.push(format!("{indent}%{vv} = load i8, ptr %{gv}, align 1"));
+                        seq.push(format!("{indent}%{vv}l = zext i8 %{vv} to i64"));
+                        slots.push(format!("i64 %{vv}l"));
+                    }
+                    "i16" => {
+                        seq.push(format!("{indent}%{vv} = load i16, ptr %{gv}, align 2"));
+                        seq.push(format!("{indent}%{vv}l = zext i16 %{vv} to i64"));
+                        slots.push(format!("i64 %{vv}l"));
+                    }
+                    "i64" => {
+                        seq.push(format!("{indent}%{vv} = load i64, ptr %{gv}, align 8"));
+                        slots.push(format!("i64 %{vv}"));
+                    }
+                    "double" => {
+                        seq.push(format!("{indent}%{vv} = load double, ptr %{gv}, align 8"));
+                        seq.push(format!("{indent}%{vv}b = bitcast double %{vv} to i64"));
+                        slots.push(format!("i64 %{vv}b"));
+                    }
+                    "float" => {
+                        seq.push(format!("{indent}%{vv} = load float, ptr %{gv}, align 4"));
+                        seq.push(format!("{indent}%{vv}x = fpext float %{vv} to double"));
+                        seq.push(format!("{indent}%{vv}b = bitcast double %{vv}x to i64"));
+                        slots.push(format!("i64 %{vv}b"));
+                    }
+                    "[4 x i8]" => {
+                        seq.push(format!("{indent}%{vv} = load i32, ptr %{gv}, align 1"));
+                        seq.push(format!("{indent}%{vv}l = zext i32 %{vv} to i64"));
+                        slots.push(format!("i64 %{vv}l"));
+                    }
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                out.push(line.to_string());
+                continue;
+            }
+            while slots.len() < 7 {
+                slots.push("i64 0".to_string());
+            }
+            nargs = fields.len();
+            seq.push(format!(
+                "{indent}%{base}r = call i64 @__ockl_printf_append_args(i64 %{base}h, i32 {}, {}, i32 1)",
+                nargs,
+                slots.join(", ")
+            ));
+        }
+        seq.push(format!("{indent}{res} = trunc i64 %{base}r to i32"));
+        out.extend(seq);
+        used = true;
+    }
+
+    let mut text = out.join("\n");
+    if !used {
+        return text;
+    }
+    // vprintf declare 移除 + ockl declares + hostcall 元数据
+    text = text
+        .lines()
+        .filter(|l| !l.starts_with("declare i32 @vprintf("))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let decls = "declare i64 @__ockl_printf_begin(i64)\n\
+declare i64 @__ockl_printf_append_args(i64, i32, i64, i64, i64, i64, i64, i64, i64, i32)\n\
+declare i64 @__ockl_printf_append_string_n(i64, ptr, i64, i32)\n";
+    if let Some(idx) = text.find("\ndefine ") {
+        text = format!("{}\n{}{}", &text[..idx], decls, &text[idx..]);
+    }
+    if !text.contains("amdgpu_printf_kind") {
+        // 编号接力：现有最大编号引用 + 1（无编号引用时用 1000 避开 !0）
+        let mut md = 1000usize;
+        for cap in text.split('!').skip(1) {
+            let ds: String = cap.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if ds.is_empty() {
+                continue;
+            }
+            if let Ok(n) = ds.parse::<usize>()
+                && n >= md
+            {
+                md = n + 1;
+            }
+        }
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&format!(
+            "!amdgpu_printf_kind = !{{!{md}}}\n!{md} = !{{i32 1, !\"amdgpu_printf_kind\", !\"hostcall\"}}\n"
+        ));
+    }
+    text
+}
 /// First column-0 `}` line after `start` (the function body's closing brace;
 /// basic blocks never open a column). Falls back to the last line.
 fn find_function_end(lines: &[&str], start: usize) -> usize {
@@ -2040,6 +2406,9 @@ pub fn rewrite_ir_for_amdgcn(ll: &str) -> Result<String, String> {
     //     machine (RDNA2 has no mbarrier hardware; a direct mapping is
     //     impossible and the software machine is the GPU-verified fallback).
     text = rewrite_mbarriers(&text);
+    // 17. [adapt-rocm] vprintf(NVVM) → __ockl_printf_* (hostcall printf;
+    //     ABI/protocol extracted from ockl.bc llvm-dis + printf_mod probe).
+    text = rewrite_vprintf_to_ockl(&text);
     Ok(text)
 }
 
@@ -3198,3 +3567,32 @@ entry:
         assert_eq!(once, twice);
     }
 }
+#[test]
+fn vprintf_probe_manual() {
+    let src = std::fs::read_to_string("../rustc-codegen-cuda/examples/printf/printf.amdgcn.ll").unwrap();
+    let out = crate::amdgcn::rewrite_vprintf_to_ockl(&src);
+    println!("begin={}", out.matches("__ockl_printf_begin").count());
+    println!("residual={}", out.matches("@vprintf(").count());
+    println!("md={}", out.contains("amdgpu_printf_kind"));
+    assert!(out.contains("__ockl_printf_begin"));
+}
+
+#[cfg(test)]
+mod vprintf_probe {
+    use crate::amdgcn::rewrite_vprintf_to_ockl;
+    #[test]
+    fn fires_on_real_amdgcn_module() {
+        let src = std::fs::read_to_string(
+            "../rustc-codegen-cuda/examples/printf/printf.amdgcn.ll",
+        )
+        .unwrap();
+        let out = rewrite_vprintf_to_ockl(&src);
+        let begin = out.matches("__ockl_printf_begin").count();
+        println!("begin={begin} residual={} md={}",
+            out.matches("@vprintf(").count(),
+            out.contains("amdgpu_printf_kind"));
+        assert!(begin > 0, "expansion did not fire");
+    }
+}
+
+// 手动挂载（模块级循环里没有被调用的保险）

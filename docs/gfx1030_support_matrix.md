@@ -82,7 +82,7 @@
 | fence + scope 映射（cta→workgroup，gl→agent，sys→系统） | FULL | [e2e] pytest 断言三 scope 产物；[hist] litmus | — |
 | Rust core::sync::atomic 内嵌 PTX-asm 族 → LLVM 原子 | FULL | [hist] GPU 验证；[e2e] pytest 12d/12e 全形态 | — |
 | 64 位原子（load/store/atomicrmw RMW） | FULL | [e2e] pytest b64 形态；[run] atomics 例 24/24 真卡（含 Test 8 DeviceAtomicU64 fetch_add），2026-10-25 | — |
-| 设备端 printf | **IMPLEMENTABLE**（未实现，方案明确） | [run] printf 例失败（209）：.ll/hsaco 中 `vprintf` 未解析（NVVM 符号原样穿透）；AMD 侧 printf=ockl `__ockl_printf_begin/append_args/append_string_n` 族（本机 ockl.bc 导出表实证）——需 prep pass 把 vprintf 调用点展开为 ockl printf 序列（clang 前端在 HIP 源码级做的 lowering，我们需 IR 文本级展开 varargs 包） | 复现：`CUDA_OXIDE_TARGET=gfx1030 cargo oxide run printf` |
+| 设备端 printf | **FULL**（2026-10-26 真卡） | [run] `cargo oxide run printf` → **"=== ALL PRINTF TESTS PASSED ==="**（8 测试族：整数/浮点/宽度对齐/符号旗标/线程索引/返回值/布尔/默认转换，含 varargs 打包+host 格式化）。实现=prep pass 双侧（amdgcn.rs+translate_amdgcn.py）vprintf→ockl 三函数展开（begin/append_string_n/append_args×7槽，字段类型 i32/i64/f64/f32/[4×i8]→i64 槽升级）+ 模块元数据 `amdgpu_printf_kind="hostcall"` + ptx.rs ockl.bc 链接（oclc_isa_version_<n>+abi_version_600+finite_only_off 三配置）。取证链：ockl.bc llvm-dis ABI + printf_mod B 路探针（hipModuleLoadData 路径 printf 服务实证）+ preockl.ll 逐错修复（9 项：@前缀/nonnull/GEP裸指针/元数据编号/llvm-link 文件化参数等） | 依赖 8 栈上限（append_args 固定 7 槽）；动态 fmt 字符串保留 vprintf（链接期显式失败，信封纪律） |
 
 ## 7. 泛型 / 结构体 / 跨 Crate / 宏与集成
 
