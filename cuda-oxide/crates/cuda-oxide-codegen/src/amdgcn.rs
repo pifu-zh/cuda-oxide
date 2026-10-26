@@ -2409,7 +2409,222 @@ pub fn rewrite_ir_for_amdgcn(ll: &str) -> Result<String, String> {
     // 17. [adapt-rocm] vprintf(NVVM) → __ockl_printf_* (hostcall printf;
     //     ABI/protocol extracted from ockl.bc llvm-dis + printf_mod probe).
     text = rewrite_vprintf_to_ockl(&text);
+    text = rewrite_packed_math(&text);
     Ok(text)
+}
+
+/// [adapt-rocm] Step 17b: PTX packed-math asm → legal AMDGPU IR.
+/// Mirrors Python translate_amdgcn.py Step 17b (7/7 llc-pass verified on gfx1030).
+/// Families: b16 atomic ld/st, bf16x2 binops/fma, cvt.f16x2/bf16x2, f32x2 vector ops,
+/// ex2.approx.f16. Out-of-envelope shapes keep their asm for llc to reject (fail-loud).
+fn rewrite_packed_math(text: &str) -> String {
+    if !text.contains("asm ") {
+        return text.to_string();
+    }
+    let mut ctr: u64 = 0;
+    let mut out: Vec<String> = Vec::with_capacity(text.lines().count());
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.contains("asm ") || !trimmed.starts_with('%') {
+            out.push(line.to_string());
+            continue;
+        }
+        let indent = &line[..line.len() - trimmed.len()];
+        ctr += 1;
+        let np = format!("_pm{ctr}_"); // unique prefix
+        let res = trimmed.split(' ').next().unwrap_or("");
+
+        // Extract operand list: everything between the outermost ( and )
+        let Some(op_start) = trimmed.find("\"(") else {
+            out.push(line.to_string());
+            continue;
+        };
+        let Some(op_end) = trimmed[op_start..].rfind(')') else {
+            out.push(line.to_string());
+            continue;
+        };
+        let ops_text = &trimmed[op_start + 2..op_start + op_end];
+        // Extract asm body
+        let body = trimmed
+            .split("asm ")
+            .nth(1)
+            .and_then(|r| r.split('"').nth(1))
+            .unwrap_or("")
+            .trim_end_matches(';')
+            .to_string();
+
+        // Extract opcode (first space-delimited word of body)
+        let opcode = body.split(' ').next().unwrap_or("");
+
+        // -- b16 atomic load: ld.acquire.gpu.b16 $0, [$1]; "=h,l"(ptr %p)
+        if body == "ld.acquire.gpu.b16 $0, [$1]" {
+            if let Some(ptr) = ops_text.strip_prefix("ptr ") {
+                out.push(format!("{indent}%{np}v = load atomic i16, ptr {ptr} acquire, align 2"));
+                out.push(format!("{indent}{res} = bitcast i16 %{np}_v to i16"));
+                continue;
+            }
+        }
+        // -- b16 atomic store: st.release.gpu.b16 [$0], $1; "l,h"(ptr %p, i16 %v)
+        if body == "st.release.gpu.b16 [$0], $1" && res.is_empty() {
+            let parts: Vec<&str> = ops_text.split(", i16 ").collect();
+            if parts.len() == 2 {
+                let ptr = parts[0].strip_prefix("ptr ").unwrap_or(parts[0]);
+                let val = parts[1].trim();
+                out.push(format!("{indent}store atomic i16 {val}, ptr {ptr} release, align 2"));
+                continue;
+            }
+        }
+        // -- abs/neg.bf16x2: exact i32 masks
+        if opcode == "abs.bf16x2" || opcode == "neg.bf16x2" {
+            let v = ops_text.split("i32 ").nth(1).map(str::trim).unwrap_or("");
+            let (mask, xop) = if opcode == "abs.bf16x2" { ("2147418111", "and") } else { ("-2147450880", "xor") };
+            out.push(format!("{indent}{res} = {xop} i32 {v}, {mask}"));
+            continue;
+        }
+        // -- bf16x2 binary: add/sub/mul/min/max "=r,r,r"(i32, i32)
+        let binops = ["add.rn.bf16x2", "sub.rn.bf16x2", "mul.rn.bf16x2", "min.bf16x2", "max.bf16x2"];
+        if binops.contains(&opcode) {
+            let args: Vec<&str> = ops_text.split("i32 ").skip(1)
+                .map(|s| s.split(',').next().unwrap_or("").trim()).collect();
+            if args.len() == 2 {
+                let (a, b) = (args[0], args[1]);
+                let mut sq = Vec::new();
+                // Widen both packed i32s: lo = and 0xFFFF, lo32 = shl 16, hi = lshr 16
+                sq.push(format!("{indent}%{np}alo = and i32 {a}, 65535"));
+                sq.push(format!("{indent}%{np}alo32 = shl i32 %{np}alo, 16"));
+                sq.push(format!("{indent}%{np}ahi = lshr i32 {a}, 16"));
+                sq.push(format!("{indent}%{np}alo_f = bitcast i32 %{np}alo32 to float"));
+                sq.push(format!("{indent}%{np}ahi_f = bitcast i32 %{np}ahi to float"));
+                sq.push(format!("{indent}%{np}blo = and i32 {b}, 65535"));
+                sq.push(format!("{indent}%{np}blo32 = shl i32 %{np}blo, 16"));
+                sq.push(format!("{indent}%{np}bhi = lshr i32 {b}, 16"));
+                sq.push(format!("{indent}%{np}blo_f = bitcast i32 %{np}blo32 to float"));
+                sq.push(format!("{indent}%{np}bhi_f = bitcast i32 %{np}bhi to float"));
+                if opcode == "min.bf16x2" || opcode == "max.bf16x2" {
+                    let cnd = if opcode == "min.bf16x2" { "olt" } else { "ogt" };
+                    sq.push(format!("{indent}%{np}c1 = fcmp {cnd} float %{np}alo_f, %{np}blo_f"));
+                    sq.push(format!("{indent}%{np}slo = select i1 %{np}c1, i32 %{np}alo, i32 %{np}blo"));
+                    sq.push(format!("{indent}%{np}c2 = fcmp {cnd} float %{np}ahi_f, %{np}bhi_f"));
+                    sq.push(format!("{indent}%{np}shi = select i1 %{np}c2, i32 %{np}ahi, i32 %{np}bhi"));
+                    sq.push(format!("{indent}%{np}shs = shl i32 %{np}shi, 16"));
+                    sq.push(format!("{indent}{res} = or i32 %{np}slo, %{np}shs"));
+                } else {
+                    let flop = match opcode.split('.').next() { Some("add") => "fadd", Some("sub") => "fsub", _ => "fmul" };
+                    sq.push(format!("{indent}%{np}flo = {flop} float %{np}alo_f, %{np}blo_f"));
+                    sq.push(format!("{indent}%{np}fhi = {flop} float %{np}ahi_f, %{np}bhi_f"));
+                    sq.push(format!("{indent}%{np}lo32 = bitcast float %{np}flo to i32"));
+                    sq.push(format!("{indent}%{np}hi32 = bitcast float %{np}fhi to i32"));
+                    // RNE pack lo
+                    sq.push(format!("{indent}%{np}lo32.ls1 = lshr i32 %{np}lo32, 16"));
+                    sq.push(format!("{indent}%{np}lo32.ls2 = and i32 %{np}lo32.ls1, 1"));
+                    sq.push(format!("{indent}%{np}lo32.rnd = add i32 %{np}lo32.ls2, 32767"));
+                    sq.push(format!("{indent}%{np}lo32.rn = add i32 %{np}lo32, %{np}lo32.rnd"));
+                    sq.push(format!("{indent}%{np}lo16 = lshr i32 %{np}lo32.rn, 16"));
+                    // RNE pack hi
+                    sq.push(format!("{indent}%{np}hi32.ls1 = lshr i32 %{np}hi32, 16"));
+                    sq.push(format!("{indent}%{np}hi32.ls2 = and i32 %{np}hi32.ls1, 1"));
+                    sq.push(format!("{indent}%{np}hi32.rnd = add i32 %{np}hi32.ls2, 32767"));
+                    sq.push(format!("{indent}%{np}hi32.rn = add i32 %{np}hi32, %{np}hi32.rnd"));
+                    sq.push(format!("{indent}%{np}hi16 = lshr i32 %{np}hi32.rn, 16"));
+                    sq.push(format!("{indent}%{np}hi16s = shl i32 %{np}hi16, 16"));
+                    sq.push(format!("{indent}{res} = or i32 %{np}lo16, %{np}hi16s"));
+                }
+                out.extend(sq);
+                continue;
+            }
+        }
+        // -- bf16x2 fma (incl relu): fma.rn[.relu].bf16x2 "=r,r,r,r"(i32, i32, i32)
+        if opcode.starts_with("fma.rn") && opcode.contains("bf16x2") {
+            let args: Vec<&str> = ops_text.split("i32 ").skip(1)
+                .map(|s| s.split(',').next().unwrap_or("").trim()).collect();
+            if args.len() == 3 {
+                let mut sq = Vec::new();
+                let relu = opcode.contains("relu");
+                for (tag, v) in [("a", args[0]), ("b", args[1]), ("c", args[2])] {
+                    sq.push(format!("{indent}%{np}{tag}lo = and i32 {v}, 65535"));
+                    sq.push(format!("{indent}%{np}{tag}lo32 = shl i32 %{np}{tag}lo, 16"));
+                    sq.push(format!("{indent}%{np}{tag}hi = lshr i32 {v}, 16"));
+                    sq.push(format!("{indent}%{np}{tag}lo_f = bitcast i32 %{np}{tag}lo32 to float"));
+                    sq.push(format!("{indent}%{np}{tag}hi_f = bitcast i32 %{np}{tag}hi to float"));
+                }
+                sq.push(format!("{indent}%{np}flo = call float @llvm.fma.f32(float %{np}alo_f, float %{np}blo_f, float %{np}clo_f)"));
+                sq.push(format!("{indent}%{np}fhi = call float @llvm.fma.f32(float %{np}ahi_f, float %{np}bhi_f, float %{np}chi_f)"));
+                sq.push(format!("{indent}%{np}lo32 = bitcast float %{np}flo to i32"));
+                sq.push(format!("{indent}%{np}hi32 = bitcast float %{np}fhi to i32"));
+                // RNE pack
+                sq.push(format!("{indent}%{np}lo32.ls1 = lshr i32 %{np}lo32, 16"));
+                sq.push(format!("{indent}%{np}lo32.ls2 = and i32 %{np}lo32.ls1, 1"));
+                sq.push(format!("{indent}%{np}lo32.rnd = add i32 %{np}lo32.ls2, 32767"));
+                sq.push(format!("{indent}%{np}lo32.rn = add i32 %{np}lo32, %{np}lo32.rnd"));
+                sq.push(format!("{indent}%{np}lo16 = lshr i32 %{np}lo32.rn, 16"));
+                sq.push(format!("{indent}%{np}hi32.ls1 = lshr i32 %{np}hi32, 16"));
+                sq.push(format!("{indent}%{np}hi32.ls2 = and i32 %{np}hi32.ls1, 1"));
+                sq.push(format!("{indent}%{np}hi32.rnd = add i32 %{np}hi32.ls2, 32767"));
+                sq.push(format!("{indent}%{np}hi32.rn = add i32 %{np}hi32, %{np}hi32.rnd"));
+                sq.push(format!("{indent}%{np}hi16 = lshr i32 %{np}hi32.rn, 16"));
+                sq.push(format!("{indent}%{np}hi16s = shl i32 %{np}hi16, 16"));
+                sq.push(format!("{indent}{res} = or i32 %{np}lo16, %{np}hi16s"));
+                if !text.contains("declare float @llvm.fma.f32") {
+                    out.push("declare float @llvm.fma.f32(float, float, float)".to_string());
+                }
+                out.extend(sq);
+                continue;
+            }
+        }
+        // -- cvt.rn/rz.f16x2.f32 "=r,f,f"(float hi, float lo)
+        if (opcode == "cvt.rn.f16x2.f32" || opcode == "cvt.rz.f16x2.f32") {
+            let fls: Vec<&str> = ops_text.split("float ").skip(1)
+                .map(|s| s.split(',').next().unwrap_or("").trim()).collect();
+            if fls.len() == 2 {
+                out.push(format!("{indent}%{np}h0 = fptrunc float {} to half", fls[0]));
+                out.push(format!("{indent}%{np}h1 = fptrunc float {} to half", fls[1]));
+                out.push(format!("{indent}%{np}b0 = bitcast half %{np}h0 to i16"));
+                out.push(format!("{indent}%{np}b1 = bitcast half %{np}h1 to i16"));
+                out.push(format!("{indent}%{np}x0 = zext i16 %{np}b0 to i32"));
+                out.push(format!("{indent}%{np}x1 = zext i16 %{np}b1 to i32"));
+                out.push(format!("{indent}%{np}xs = shl i32 %{np}x1, 16"));
+                out.push(format!("{indent}{res} = or i32 %{np}x0, %{np}xs"));
+                continue;
+            }
+        }
+        // -- ex2.approx.f16 "=h,h"(i16)
+        if opcode == "ex2.approx.f16" {
+            let v = ops_text.split("i16 ").nth(1).map(str::trim).unwrap_or("");
+            out.push(format!("{indent}%{np}h = bitcast i16 {v} to half"));
+            out.push(format!("{indent}%{np}f = fpext half %{np}h to float"));
+            out.push(format!("{indent}%{np}e = call float @llvm.amdgcn.exp2.f32(float %{np}f)"));
+            out.push(format!("{indent}%{np}t = fptrunc float %{np}e to half"));
+            out.push(format!("{indent}{res} = bitcast half %{np}t to i16"));
+            if !text.contains("declare float @llvm.amdgcn.exp2.f32") {
+                out.push("declare float @llvm.amdgcn.exp2.f32(float)".to_string());
+            }
+            continue;
+        }
+        // -- f32x2: add/sub/mul/fma "=l,l,l[,l]"(i64, i64[, i64])
+        if opcode.contains("f32x2") {
+            let args: Vec<&str> = ops_text.split("i64 ").skip(1)
+                .map(|s| s.split(',').next().unwrap_or("").trim()).collect();
+            if args.len() >= 2 {
+                let is_fma = opcode.starts_with("fma");
+                out.push(format!("{indent}%{np}va = bitcast i64 {} to <2 x float>", args[0]));
+                out.push(format!("{indent}%{np}vb = bitcast i64 {} to <2 x float>", args[1]));
+                if is_fma && args.len() >= 3 {
+                    out.push(format!("{indent}%{np}vc = bitcast i64 {} to <2 x float>", args[2]));
+                    out.push(format!("{indent}%{np}vs = call <2 x float> @llvm.fma.v2f32(<2 x float> %{np}va, <2 x float> %{np}vb, <2 x float> %{np}vc)"));
+                    if !text.contains("declare <2 x float> @llvm.fma.v2f32") {
+                        out.push("declare <2 x float> @llvm.fma.v2f32(<2 x float>, <2 x float>, <2 x float>)".to_string());
+                    }
+                } else {
+                    let flop = match opcode.split('.').next() { Some("add") => "fadd", Some("sub") => "fsub", _ => "fmul" };
+                    out.push(format!("{indent}%{np}vs = {flop} <2 x float> %{np}va, %{np}vb"));
+                }
+                out.push(format!("{indent}{res} = bitcast <2 x float> %{np}vs to i64"));
+                continue;
+            }
+        }
+        out.push(line.to_string());
+    }
+    out.join("\n")
 }
 
 /// Matches a leading `%[\w.$]+` SSA name and returns `(name, rest)`.
