@@ -64,6 +64,8 @@
 | idp4a（dp4a）同符号 | — | NATIVE：v_dot4（llvm.amdgcn.sdot4/udot4，clamp=false） | ✅ [e2e] dotprod 例四符号组合 |
 | idp2a（dp2a） | 无单指令 | INSTRUCTION COMPOSITION：extract+sext/zext+乘加展开 | ✅ [e2e] dotprod 例 |
 | libdevice `__nv_*` 数学 | NVVM bitcode 不入 AMD 模块 | ALTERNATIVE：`__ocml_*_f32/f64` 符号映射 + ocml.bc/oclc 配置链接 | ✅ [e2e] math_tan（≤2ULP [hist]） |
+| PTX packed-math 内嵌 asm（bf16x2/f16x2/f32x2/b16 原子/ex2.f16） | gfx1030 无 v_pk_bf16（llc 探针拒）；f32x2 打包为 RDNA3；v_pk_f16 须 v 约束 | INSTRUCTION COMPOSITION：bf16x2→bf16→f32 移位展宽+f32 运算+RNE 回缩；f16x2 cvt→fptrunc/RTZ/relu clamp；f32x2→`<2 x float>` 向量 bitcast+fma.v2f32；b16 原子→LLVM 原子 i16 load/store；ex2.approx.f16→llvm.amdgcn.exp2.f32 | ✅ [e2e] 2026-10-27 **双实现 7/7**：Python（translate_amdgcn.py，llc-pass）与 Rust（amdgcn.rs prep pass，集成构建 df79fb980）同族同步转绿——atomic_f16/bf16x2_arith/bf16x2_fma/cvt_f16x2/cvt_packed/f32x2_arith/ex2_approx_f16 |
+| 设备端 DWARF 调试信息 | 前端（MIR→IR）不产 !dbg metadata（.amdgcn.ll 计数=0、hsaco 零 .debug_* 节） | 路径已证可行：llc --debugger-tune=gdb 对带 !dbg IR 产 7 个 .debug_* 节 + DW_TAG_compile_unit/subprogram（scripts/probe_dwarf_gfx1030.sh） | IMPLEMENTABLE：剩余工作=自定义后端实现 debuginfo API（MIR DI 建图） |
 
 ### 2.5 硬件边界（NOT FEASIBLE 的证据基线）
 
