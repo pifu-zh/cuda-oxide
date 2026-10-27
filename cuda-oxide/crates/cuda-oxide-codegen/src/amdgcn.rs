@@ -2596,7 +2596,7 @@ fn rewrite_packed_math(text: &str) -> String {
                 // fls[0] = lo half source, fls[1] = hi half source
                 for (tag, src) in [("lo", fls[0]), ("hi", fls[1])] {
                     if src.starts_with('%') {
-                        out.push(format!("{indent}%{np}f{tag} = bitcast float {src} to i32"));
+                        out.push(format!("{indent}%{np}b{tag} = bitcast float {src} to i32"));
                     } else {
                         out.push(format!("{indent}%{np}f{tag} = fadd float {src}, 0.0"));
                         out.push(format!("{indent}%{np}b{tag} = bitcast float %{np}f{tag} to i32"));
