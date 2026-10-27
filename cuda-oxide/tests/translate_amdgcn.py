@@ -1093,7 +1093,7 @@ def _split_struct_fields(ty: str):
 def _emit_arg_slots(indent, args_ptr, args_ty, fields, base, seq):
     """逐字段 GEP+load+升 i64；未知字段类型返回 None（信封外）。"""
     vals = []
-    for i, ft in enumerate(fields[:7]):  # append_args 固定 7 槽
+    for i, ft in enumerate(fields):  # 全字段；>7 走链式 append_args
         g, v = f"{base}g{i}", f"{base}v{i}"
         seq.append(
             f"{indent}%{g} = getelementptr inbounds {args_ty}, "
@@ -1241,11 +1241,21 @@ def _rewrite_vprintf(text: str) -> str:
                 out.append(ln)
                 continue
         else:
-            vals = ["i64 0"] * 7
-        seq.append(
-            f"{indent}%{base}r = call i64 @__ockl_printf_append_args("
-            f"i64 %{base}h, i32 {len(fields)}, {', '.join(vals)}, i32 1)"
-        )
+            vals = []
+        # ockl 链式 ABI：每轮最多 7 值（轮内个数编码进 handle 位 3-7，
+        # 见 ockl.bc append_args 的 `nargs << 5`），返回 handle 接力下一轮；
+        # is_last（bit 1）仅末轮为 1。>7 参即 clang 同款多轮。
+        chunks = [vals[i:i + 7] for i in range(0, len(vals), 7)] or [["i64 0"]]
+        handle = f"%{base}h"
+        for ci, chunk in enumerate(chunks):
+            last = ci + 1 == len(chunks)
+            cs = chunk + ["i64 0"] * (7 - len(chunk))
+            oname = f"{base}r" if last else f"{base}rc{ci}"
+            seq.append(
+                f"{indent}%{oname} = call i64 @__ockl_printf_append_args("
+                f"i64 {handle}, i32 {len(chunk)}, {', '.join(cs)}, i32 {1 if last else 0})"
+            )
+            handle = f"%{oname}"
         seq.append(f"{indent}{res} = trunc i64 %{base}r to i32")
         out.extend(seq)
         used = True

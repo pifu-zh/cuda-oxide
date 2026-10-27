@@ -2004,9 +2004,7 @@ fn rewrite_vprintf_to_ockl(text: &str) -> String {
         seq.push(format!(
             "{indent}%{base}s = call i64 @__ockl_printf_append_string_n(i64 %{base}h, ptr %{base}f, i64 {strlen}, i32 0)"
         ));
-        let nargs;
         if null_args {
-            nargs = 0;
             seq.push(format!(
                 "{indent}%{base}r = call i64 @__ockl_printf_append_args(i64 %{base}h, i32 0, i64 0, i64 0, i64 0, i64 0, i64 0, i64 0, i64 0, i32 1)"
             ));
@@ -2035,7 +2033,7 @@ fn rewrite_vprintf_to_ockl(text: &str) -> String {
             };
             let mut slots: Vec<String> = Vec::new();
             let mut ok = true;
-            for (i, ft) in fields.iter().enumerate().take(7) {
+            for (i, ft) in fields.iter().enumerate() {
                 let (gv, vv) = (format!("{base}g{i}"), format!("{base}v{i}"));
                 seq.push(format!(
                     "{indent}%{gv} = getelementptr inbounds {gep_ty}, ptr {bare}, i32 0, i32 {i}"
@@ -2086,15 +2084,32 @@ fn rewrite_vprintf_to_ockl(text: &str) -> String {
                 out.push(line.to_string());
                 continue;
             }
-            while slots.len() < 7 {
-                slots.push("i64 0".to_string());
+            if slots.is_empty() {
+                seq.push(format!(
+                    "{indent}%{base}r = call i64 @__ockl_printf_append_args(i64 %{base}h, i32 0, i64 0, i64 0, i64 0, i64 0, i64 0, i64 0, i64 0, i32 1)"
+                ));
+            } else {
+                // ockl 链式 ABI：每轮最多 7 值（轮内个数编码进 handle 位 3-7，
+                // 见 ockl.bc append_args 的 `nargs << 5`），返回 handle 接力
+                // 下一轮；is_last（bit 1）仅末轮为 1。>7 参即 clang 同款多轮。
+                let nchunks = slots.len().div_ceil(7);
+                let mut handle = format!("%{base}h");
+                for (ci, chunk) in slots.chunks(7).enumerate() {
+                    let last = ci + 1 == nchunks;
+                    let mut cs: Vec<String> = chunk.to_vec();
+                    while cs.len() < 7 {
+                        cs.push("i64 0".to_string());
+                    }
+                    let oname = if last { format!("{base}r") } else { format!("{base}rc{ci}") };
+                    seq.push(format!(
+                        "{indent}%{oname} = call i64 @__ockl_printf_append_args(i64 {handle}, i32 {}, {}, i32 {})",
+                        chunk.len(),
+                        cs.join(", "),
+                        if last { 1 } else { 0 }
+                    ));
+                    handle = format!("%{oname}");
+                }
             }
-            nargs = fields.len();
-            seq.push(format!(
-                "{indent}%{base}r = call i64 @__ockl_printf_append_args(i64 %{base}h, i32 {}, {}, i32 1)",
-                nargs,
-                slots.join(", ")
-            ));
         }
         seq.push(format!("{indent}{res} = trunc i64 %{base}r to i32"));
         out.extend(seq);

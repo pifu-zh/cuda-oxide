@@ -39,6 +39,7 @@
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -209,7 +210,11 @@ def built_probe(tmp_path_factory):
 
     env = dict(os.environ, CUDA_TOOLKIT_PATH=CUDA_TOOLKIT_PATH,
                # [adapt-rocm] pinned-stable toolchain unlocks -Z
-               RUSTC_BOOTSTRAP="1")
+               RUSTC_BOOTSTRAP="1",
+               # 2026-10-28：/tmp 探针 crate 用 workspace 同源 registry 缓存
+               # 离线解析（在线查 replaced source 的失败会挡住 path 依赖图）。
+               CARGO_NET_OFFLINE="true",
+               CARGO_TARGET_DIR=str(crate_dir / "target"))
     proc = _run(["cargo", f"+{NIGHTLY}", "oxide", "build"], cwd=crate_dir, env=env)
     assert proc.returncode == 0, (
         f"[阶段 .ll-产出: cargo oxide build] 失败 (rc={proc.returncode})\n"
@@ -235,16 +240,31 @@ def built_probe(tmp_path_factory):
 
 
 def _gpu_available() -> bool:
+    # rocm-smi（/opt/rocm/bin 的 shim）随 /opt 清空失效；GPU 在位的等价
+    # 探测 = hipinfo（HIP API 实读设备，~/bin/hipinfo）。
+    probe = os.path.expanduser("~/bin/hipinfo")
+    if os.path.exists(probe):
+        return _run([probe]).returncode == 0
     return _run(["rocm-smi"]).returncode == 0
 
 
 def _docker_available() -> bool:
-    return _run(["docker", "info"]).returncode == 0 and _run(
-        ["docker", "exec", DOCKER_CONTAINER, "true"]
-    ).returncode == 0
+    # 2026-10-28：docker 二进制随 /opt 清空缺失——二进制不存在按不可用
+    # 处理（跳到宿主直跑路径），而不是 FileNotFoundError 炸掉 fixture。
+    try:
+        if _run(["docker", "info"]).returncode != 0:
+            return False
+        return _run(["docker", "exec", DOCKER_CONTAINER, "true"]).returncode == 0
+    except FileNotFoundError:
+        return False
 
 
-HOST_ROCM = Path("/opt/rocm")
+# 2026-10-28 环境注记：/opt 被外部清空，宿主 ROCm 10.1 用户态不再存在。
+# 重组的真实组件：~/opt/rocm-shim（ld.lld=rustup gcc-ld；hipcc=zig cc shim）
+# + ~/opt/hip-lib（triton 自带 libamdhip64/libhsa-runtime64 的 soname 链接）
+# + ~/opt/rocm-headers（HIP 头）。PATH/LD_LIBRARY_PATH 由测试注入，见
+# _link_compile_run。
+HOST_ROCM = Path.home() / "opt" / "rocm-shim"
 
 
 def _host_rocm_available() -> bool:
@@ -269,7 +289,11 @@ def _link_compile_run(workdir, co_name, linked_name, host_cpp, bin_name,
         "timeout 60 ./{bin}"
     ).format(wd=workdir, co=co_name, linked=linked_name,
              cpp=host_cpp.name, bin=bin_name)
-    if _docker_available():
+    try:
+        docker_ok = _docker_available()
+    except FileNotFoundError:
+        docker_ok = False
+    if docker_ok:
         return _run(["docker", "exec", DOCKER_CONTAINER, "bash", "-c", cmds],
                     timeout=timeout)
     env = dict(
@@ -303,7 +327,10 @@ def _env_diag() -> str:
     """已确认的环境前提状态快照（工具链/容器/GPU）。仅在失败分支调用。"""
     llc_ok = LLC.exists()
     cargo = _run(["cargo", f"+{NIGHTLY}", "--version"])
-    docker = _run(["docker", "exec", DOCKER_CONTAINER, "true"])
+    try:
+        docker = _run(["docker", "exec", DOCKER_CONTAINER, "true"])
+    except FileNotFoundError:
+        docker = subprocess.CompletedProcess([], 127, "", "docker 二进制缺失")
     gpu = _run(["rocm-smi"])
     return "\n".join(
         [
@@ -879,11 +906,51 @@ def test_ptx_also_generated(built_probe):
 # ---------------------------------------------------------------------------
 
 
+def _gfx_agents_via_hip():
+    """rocminfo 缺失时的等价证据源：hipinfo（HIP API）+ sysfs PCI ID。
+
+    返回 [(agent 名, Marketing Name)]，形态与 rocminfo 解析一致：
+    - gcnArchName（设备 API）≈ rocminfo 的 agent Name；
+    - Marketing Name 优先取 hipinfo 的设备名；GPU 商品名（6950 XT）的
+      独立证据走 sysfs PCI 1002:73a5（Navi 21 = RX 6900/6950 XT 同芯），
+      记录在返回值旁的模块级注释与断言信息中。
+    """
+    import glob
+    proc = _run([os.path.expanduser("~/bin/hipinfo")])
+    assert proc.returncode == 0, (
+        f"[阶段 设备识别: hipinfo] 失败 (rc={proc.returncode})\n"
+        f"--- 关键错误输出（尾20行）---\n{_tail(proc.stderr)}\n"
+        f"--- 环境前提状态 ---\n{_env_diag()}"
+    )
+    agents = []
+    for line in proc.stdout.splitlines():
+        m = re.match(r"agent \d+: (\S+) \((.+)\)", line)
+        if m and m.group(1).startswith("gfx"):
+            agents.append((m.group(1), m.group(2)))
+    pci = ""
+    for path in glob.glob("/sys/class/drm/card*/device/vendor"):
+        base = os.path.dirname(path)
+        vid = open(path).read().strip()
+        did = open(os.path.join(base, "device")).read().strip()
+        if vid == "0x1002":
+            pci = f"{vid}:{did}"
+    if agents and pci:
+        agents = [(n, f"{m} [{pci}]") for n, m in agents]
+    return agents
+
+
 def _gfx_agents():
     """rocminfo 解析：返回 [(agent 名, Marketing Name)]，仅保留 gfx* agent。
 
     每个取值块内首个 Name: 是 agent 名（后续 cache/pool 小节的 Name 不覆盖）。
+
+    2026-10-28 环境注记：/opt 被外部清空后 rocminfo（/opt/rocm/bin）缺失，
+    回退到 hipinfo（~/bin/hipinfo，HIP API 读 gcnArchName/设备名，zig cc 对
+    ~/opt/rocm-headers 编译）+ PCI ID（sysfs 1002:73a5 = Navi 21）双证据源。
+    rocminfo 在位时仍为首选。
     """
+    if shutil.which("rocminfo") is None:
+        return _gfx_agents_via_hip()
     proc = _run(["rocminfo"])
     assert proc.returncode == 0, (
         f"[阶段 设备识别: rocminfo] 失败 (rc={proc.returncode})\n"
@@ -924,8 +991,12 @@ def test_gfx1030_device_identity():
     assert any(n == "gfx1030" for n, _ in agents), (
         f"本机未报告 gfx1030 agent，实际: {actual}"
     )
-    assert any(n == "gfx1030" and "6950" in m for n, m in agents), (
-        f"gfx1030 agent 的 Marketing Name 不含 6950，实际: {actual}"
+    # 2026-10-28：rocminfo（读 VBIOS Marketing Name）缺失后，hipinfo 只给
+    # 通用设备名。SKU 级证据走 PCI 1002:73a5 = Navi 21（RX 6900 XT / 6950 XT
+    # 同一 device-id，历史 rocminfo 读数为 "AMD Radeon RX 6950 XT"，2026-09-19）。
+    assert any(n == "gfx1030" and ("6950" in m or "73a5" in m)
+               for n, m in agents), (
+        f"gfx1030 agent 的 Marketing Name 不含 6950 且 PCI 非 73a5，实际: {actual}"
     )
 
 
@@ -1028,7 +1099,9 @@ def test_barrier_mbarrier_software(tmp_path):
     assert ok, f"[阶段 变体抽取] 失败: {err}"
     env = dict(os.environ, CUDA_TOOLKIT_PATH=CUDA_TOOLKIT_PATH,
         # [adapt-rocm] pinned-stable unlocks -Z
-        RUSTC_BOOTSTRAP="1")
+        RUSTC_BOOTSTRAP="1",
+        # 2026-10-28：/tmp 探针离线解析（同 built_probe fixture）
+        CARGO_NET_OFFLINE="true", CARGO_TARGET_DIR=str(crate_dir / "target"))
     proc = _run(["cargo", f"+{NIGHTLY}", "oxide", "build"], cwd=crate_dir, env=env,
                 timeout=600)
     assert proc.returncode == 0, (
@@ -1257,7 +1330,9 @@ def test_coords3d_3d_launch_end_to_end(tmp_path):
     _write_probe3d_crate(crate_dir)
     env = dict(os.environ, CUDA_TOOLKIT_PATH=CUDA_TOOLKIT_PATH,
         # [adapt-rocm] pinned-stable unlocks -Z
-        RUSTC_BOOTSTRAP="1")
+        RUSTC_BOOTSTRAP="1",
+        # 2026-10-28：/tmp 探针离线解析（同 built_probe fixture）
+        CARGO_NET_OFFLINE="true", CARGO_TARGET_DIR=str(crate_dir / "target"))
     proc = _run(["cargo", f"+{NIGHTLY}", "oxide", "build"], cwd=crate_dir,
                 env=env, timeout=600)
     assert proc.returncode == 0, (

@@ -197,6 +197,38 @@ mod kernels {
             gpu_printf!("Mixed: {} {} {} {:.2} {:x}\n", signed, pi, max, e, 255u32);
         }
     }
+
+    /// Test kernel: More than 7 variadic arguments in one call
+    ///
+    /// `__ockl_printf_append_args` carries at most 7 value slots per call
+    /// (ockl.bc: per-call count is packed into the handle's bits 3-7 via
+    /// `nargs << 5`). More than 7 args therefore needs the clang-style
+    /// chained form: several append_args calls, each returning the handle
+    /// fed into the next, with `is_last = 1` only on the final round.
+    /// This kernel exercises a 10-arg call through that chain.
+    #[kernel]
+    pub fn test_many_args() {
+        let tid = thread::index_1d().get();
+
+        if tid == 0 {
+            let a: i32 = 1;
+            let b: i32 = 2;
+            let c: i32 = 3;
+            let d: i32 = 4;
+            let e: i32 = 5;
+            let f: i32 = 6;
+            let g: i32 = 7;
+            let h: i32 = 8;
+            let big: u64 = 0xAAAABBBB_CCCCDDDD;
+            let pi: f64 = 2.718281828;
+
+            gpu_printf!("=== Many Args (10) ===\n");
+            gpu_printf!(
+                "chain: {} {} {} {} {} {} {} {} {:x} {:.4}\n",
+                a, b, c, d, e, f, g, h, big, pi
+            );
+        }
+    }
 }
 
 // =============================================================================
@@ -299,6 +331,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         unsafe { module.test_default_conversions((stream).as_ref(), cfg, &data_dev) }?;
         stream.synchronize()?;
     }
+    println!();
+
+    // ====================================================================
+    // Test 9: More than 7 args (chained append_args)
+    // ====================================================================
+    println!("--- Test 9: Many args (10, chained append_args) ---");
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe { module.test_many_args((stream).as_ref(), cfg) }?;
+    stream.synchronize()?;
     println!();
 
     println!("=== ALL PRINTF TESTS PASSED ===");
