@@ -68,18 +68,55 @@
 9. **docker 缺失**：`_docker_available()`/`_env_diag()` 对二进制缺失
    （FileNotFoundError）按"不可用"处理，自动走宿主直跑路径。
 
-## printf 输出管线现状（重组栈）
+## printf 乱码根因（2026-10-28 深挖修复，双侧已改）
 
-- ockl 三函数 ABI（begin/append_string_n/append_args）在 triton ockl.bc
-  与 ROCm 10.1 同构；**>7 参数链式 append_args（clang 同款多轮，is_last
-  仅末轮）真卡验证通过**（10 参行 `chain: 1 2 3 4 5 6 7 8 aaaabbbbccccdddd
-  2.7183` 逐字符正确）。
-- 重组栈下部分 ≤7 参行存在 host 侧流解析乱码（如 `y=20` 截断为 `y=2`、
-  值槽位错位）：模式为消息中途截断/槽位错位，是 host 端（triton
-  libhsa/hip 的 hostcall 消费者）与重组栈组合的产物；设备 IR 侧
-  append_args(nargs,…) 单轮写入完整。ROCm 10.1 原栈（2026-10-26/27）下
-  printf 全族输出干净（见能力矩阵 printf 行的历史证据）。恢复原栈即可
-  复核，属环境差异而非代码回归。
+重组栈初版的"host 侧流解析乱码"定性**有误**——真根因在我们 prep pass
+的展开形态与 ockl/host 契约不匹配，共四处（对照系 = 真 hipcc 编译的同
+形态 C++ printf kernel，三连发/五连发全对，排除 host/驱动）：
+
+1. **strlen 不含 NUL**：clang 形态 append_string_n 的长度含 NUL
+   （llvm-dis of hipcc IR：strlen 差值 +1）。10.1 时代不含 NUL 可过，
+   7.2 起必须含。
+2. **handle 不接力**：clang 展开把 append_string_n 的**返回 handle** 传给
+   append_args；我们此前沿用 begin 的旧 handle → host 端流配对错乱
+   （`f32 default: {}` 值丢失、消息中途截断 `y=2`、二进制垃圾行）。
+3. **无参形态**：clang = 单条 `append_string_n(is_last=1)`，无 args 消息，
+   其返回值即 vprintf 结果；我们此前多发一条 `append_args(nargs=0,…,1)`。
+4. **repr(C) padding 当槽**：`#[repr(C)]` 打包 struct 的对齐空洞显式化为
+   数组成员（如 `i32` 后的 `[4 x i8]`）。`GpuPrintfArg::Promoted` 契约只产
+   标量（i32/u32/i64/u64/f64），数组成员必是 padding——prep pass 此前把
+   它当参数读，6 槽 vs fmt 5 个 %，第 2 参起整体错位（Mixed 行
+   `0.000000 4614256656748904448 -nan 4005bf0a8b04919b` 逐字节吻合
+   pad/pi/max/e 错位序列）。
+
+四处修复均已双侧落地（amdgcn.rs + translate_amdgcn.py）。修复后
+printf 九族真卡输出零乱码（含 Mixed 五参混合、10 参链式、`{: }`
+空格旗标、`y=20`）。诊断基建：printf 例新增 `ONLY=<n>` 环境变量可单跑
+第 n 族（乱码二分用）。
+
+## 工具链终态（2026-10-28 第二轮重组：真 gcc + conda-forge ROCm 7.2）
+
+- **真 gcc**（conda-forge gcc_linux-64 16.2.0，`~/opt/gcc-env`）取代 zig cc
+  shim：`~/bin/cc|gcc|g++` wrapper。后端 .so 由真 gcc 链接——smart-ld/
+  手工 crt/libLLVM 位码脚本补丁全部退役（gcc 走标准 bfd 路径，NEEDED
+  干净）。zig cc 的 libunwind SIGSEGV / ld.lld crt 坑不再适用。
+- **ROCm 7.2 完整用户态**（conda-forge，`~/opt/rocm2`）：hipcc（真 clang
+  22 HIP frontend）+ rocminfo（VBIOS Marketing Name 读数恢复：
+  "AMD Radeon RX 6950 XT"）+ rocm-smi + 67 件 oclc/ockl/ocml 位码 +
+  libamdhip64/libhsa/libamd_comgr/libdrm 配对集。
+- `~/opt/hip-lib`：soname 符号链接池（→ rocm2 真身；**必须含
+  libamd_comgr.so.3 带版本尾**——hip 7.2 按 .so.3 dlopen，只有无版本名
+  会 hipInit 报 NO_DEVICE）。
+- `~/opt/rocm2-shim/amdgcn/bitcode` → rocm2 的 clang resource 位码布局
+  （find_rocm_bitcode 的 `<rocm>/amdgcn/bitcode` 契约）。
+- bindgen（cuda-bindings 构建）：`BINDGEN_EXTRA_CLANG_ARGS=-I~/opt/rocm2/
+  lib/clang/22/include`（clang builtin 头；系统 llvm-22 resource dir 残缺）。
+  LD_LIBRARY_PATH **不得**前置 rocm2/lib——其 libLLVM.so.22.1 会被
+  libclang-22 错配（M68k 符号缺失）。
+- hipcc shim（~/bin/hipcc）：g++ + `--offload-arch`/`-x hip` 过滤（宿主
+  侧只编 HIP-API 主机码）。pytest 宿主直跑路径走它。
+- micromamba：`~/opt/tools/micromamba`（/tmp 会被清，持久件一律放
+  ~/opt）。
 
 ## 复现命令（最小链路）
 

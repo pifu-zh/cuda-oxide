@@ -251,95 +251,110 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         shared_mem_bytes: 0,
     };
 
+
+    // 诊断开关：ONLY=<n> 只跑第 n 族（乱码二分用；未设=全跑）。
+    let only: Option<u32> = std::env::var("ONLY").ok().and_then(|v| v.parse().ok());
+    macro_rules! run_test { ($n:expr, $body:block) => {
+        if only.map(|o| o == $n).unwrap_or(true) { $body }
+    } }
     // ====================================================================
     // Test 1: Integer formats
     // ====================================================================
     println!("--- Test 1: Integer formats ---");
-    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
-    unsafe { module.test_integers((stream).as_ref(), cfg) }?;
-    stream.synchronize()?;
+    run_test!(1, {
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe { module.test_integers((stream).as_ref(), cfg) }?;
+        stream.synchronize()?;    });
     println!();
 
     // ====================================================================
     // Test 2: Float formats
     // ====================================================================
     println!("--- Test 2: Float formats ---");
-    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
-    unsafe { module.test_floats((stream).as_ref(), cfg) }?;
-    stream.synchronize()?;
+    run_test!(2, {
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe { module.test_floats((stream).as_ref(), cfg) }?;
+        stream.synchronize()?;    });
     println!();
 
     // ====================================================================
     // Test 3: Width and alignment
     // ====================================================================
     println!("--- Test 3: Width and alignment ---");
-    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
-    unsafe { module.test_width_align((stream).as_ref(), cfg) }?;
-    stream.synchronize()?;
+    run_test!(3, {
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe { module.test_width_align((stream).as_ref(), cfg) }?;
+        stream.synchronize()?;    });
     println!();
 
     // ====================================================================
     // Test 4: Sign and flags
     // ====================================================================
     println!("--- Test 4: Sign and flags ---");
-    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
-    unsafe { module.test_flags((stream).as_ref(), cfg) }?;
-    stream.synchronize()?;
+    run_test!(4, {
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe { module.test_flags((stream).as_ref(), cfg) }?;
+        stream.synchronize()?;    });
     println!();
 
     // ====================================================================
     // Test 5: Thread-indexed output
     // ====================================================================
     println!("--- Test 5: Thread-indexed output ---");
-    {
-        let data: Vec<f32> = vec![1.1, 2.2, 3.3, 4.4, 5.5, 6.6, 7.7, 8.8];
-        let data_dev = DeviceBuffer::from_host(&stream, &data)?;
+    run_test!(5, {
+        {
+            let data: Vec<f32> = vec![1.1, 2.2, 3.3, 4.4, 5.5, 6.6, 7.7, 8.8];
+            let data_dev = DeviceBuffer::from_host(&stream, &data)?;
 
-        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
-        unsafe { module.test_thread_output((stream).as_ref(), cfg, &data_dev) }?;
-        stream.synchronize()?;
-    }
+            // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+            unsafe { module.test_thread_output((stream).as_ref(), cfg, &data_dev) }?;
+            stream.synchronize()?;
+        }    });
     println!();
 
     // ====================================================================
     // Test 6: Return value
     // ====================================================================
     println!("--- Test 6: Return value ---");
-    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
-    unsafe { module.test_return_value((stream).as_ref(), cfg) }?;
-    stream.synchronize()?;
+    run_test!(6, {
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe { module.test_return_value((stream).as_ref(), cfg) }?;
+        stream.synchronize()?;    });
     println!();
 
     // ====================================================================
     // Test 7: Boolean values
     // ====================================================================
     println!("--- Test 7: Boolean values ---");
-    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
-    unsafe { module.test_booleans((stream).as_ref(), cfg) }?;
-    stream.synchronize()?;
+    run_test!(7, {
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe { module.test_booleans((stream).as_ref(), cfg) }?;
+        stream.synchronize()?;    });
     println!();
 
     // ====================================================================
     // Test 8: Conversions chosen from the argument type
     // ====================================================================
     println!("--- Test 8: Default conversions ---");
-    {
-        let data: Vec<f32> = vec![1.1, 2.2, 3.3, 4.4];
-        let data_dev = DeviceBuffer::from_host(&stream, &data)?;
+    run_test!(8, {
+        {
+            let data: Vec<f32> = vec![1.1, 2.2, 3.3, 4.4];
+            let data_dev = DeviceBuffer::from_host(&stream, &data)?;
 
-        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
-        unsafe { module.test_default_conversions((stream).as_ref(), cfg, &data_dev) }?;
-        stream.synchronize()?;
-    }
+            // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+            unsafe { module.test_default_conversions((stream).as_ref(), cfg, &data_dev) }?;
+            stream.synchronize()?;
+        }    });
     println!();
 
     // ====================================================================
     // Test 9: More than 7 args (chained append_args)
     // ====================================================================
     println!("--- Test 9: Many args (10, chained append_args) ---");
-    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
-    unsafe { module.test_many_args((stream).as_ref(), cfg) }?;
-    stream.synchronize()?;
+    run_test!(9, {
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe { module.test_many_args((stream).as_ref(), cfg) }?;
+        stream.synchronize()?;    });
     println!();
 
     println!("=== ALL PRINTF TESTS PASSED ===");

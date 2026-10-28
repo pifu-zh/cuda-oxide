@@ -1094,6 +1094,11 @@ def _emit_arg_slots(indent, args_ptr, args_ty, fields, base, seq):
     """逐字段 GEP+load+升 i64；未知字段类型返回 None（信封外）。"""
     vals = []
     for i, ft in enumerate(fields):  # 全字段；>7 走链式 append_args
+        # repr(C) 的对齐空洞会显式化成数组成员（如 i32 后的 [4 x i8]）。
+        # GpuPrintfArg::Promoted 契约只产标量，数组成员必是 padding——跳过，
+        # 否则多发槽让 host 从该参起整体错位（Mixed 行乱码根因）。
+        if ft.startswith("["):
+            continue
         g, v = f"{base}g{i}", f"{base}v{i}"
         seq.append(
             f"{indent}%{g} = getelementptr inbounds {args_ty}, "
@@ -1212,7 +1217,8 @@ def _rewrite_vprintf(text: str) -> str:
             continue
         blob = globals_bytes[g]
         nul = blob.find(b"\x00")
-        strlen = nul if nul >= 0 else len(blob)
+        # clang 形态：append_string_n 的长度含 NUL（llvm-dis of hipcc IR）。
+        strlen = (nul if nul >= 0 else len(blob)) + 1
         args = args.strip()
         if (
             args.startswith("i64 0")
@@ -1231,22 +1237,31 @@ def _rewrite_vprintf(text: str) -> str:
             fields = _split_struct_fields(args_ty)
             args_ptr = args
         base = res.lstrip("%") + ".pf_"
+        # clang 形态：无参=单条 string_n(is_last=1)；有参=string_n(is_last=0)
+        # 返回 handle 接力给 append_args（用 begin 的旧 handle 会 host 端流
+        # 配对错乱——7.2 起乱码根因之一）。
+        str_last = 0 if args_ptr is not None else 1
         seq = [f"{indent}%{base}h = call i64 @__ockl_printf_begin(i64 0)",
                f"{indent}%{base}f = addrspacecast ptr addrspace(1) @{g} to ptr",
                f"{indent}%{base}s = call i64 @__ockl_printf_append_string_n("
-               f"i64 %{base}h, ptr %{base}f, i64 {strlen}, i32 0)"]
+               f"i64 %{base}h, ptr %{base}f, i64 {strlen}, i32 {str_last})"]
         if args_ptr is not None:
             vals = _emit_arg_slots(indent, args_ptr, args_ty, fields, base, seq)
             if vals is None:
                 out.append(ln)
                 continue
         else:
-            vals = []
+            # 无参：单条 string_n(is_last=1) 已发完，其返回值即 vprintf 结果。
+            seq.append(f"{indent}{res} = trunc i64 %{base}s to i32")
+            out.extend(seq)
+            used = True
+            continue
         # ockl 链式 ABI：每轮最多 7 值（轮内个数编码进 handle 位 3-7，
         # 见 ockl.bc append_args 的 `nargs << 5`），返回 handle 接力下一轮；
-        # is_last（bit 1）仅末轮为 1。>7 参即 clang 同款多轮。
-        chunks = [vals[i:i + 7] for i in range(0, len(vals), 7)] or [["i64 0"]]
-        handle = f"%{base}h"
+        # is_last（bit 1）仅末轮为 1。>7 参即 clang 同款多轮。handle 从
+        # string_n 返回值接力（clang 形态）。
+        chunks = [vals[i:i + 7] for i in range(0, len(vals), 7)]
+        handle = f"%{base}s"
         for ci, chunk in enumerate(chunks):
             last = ci + 1 == len(chunks)
             cs = chunk + ["i64 0"] * (7 - len(chunk))

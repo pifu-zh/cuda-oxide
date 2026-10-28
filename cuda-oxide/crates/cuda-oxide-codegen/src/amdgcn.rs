@@ -1985,7 +1985,10 @@ fn rewrite_vprintf_to_ockl(text: &str) -> String {
             out.push(line.to_string());
             continue;
         };
-        let strlen = blob.iter().position(|&b| b == 0).unwrap_or(blob.len());
+        // clang 形态：append_string_n 的长度含 NUL（llvm-dis of hipcc IR：
+        // strlen 差值 +1）。7.2 ockl/host 按此配对流消息；10.1 时代不含
+        // NUL 也能过，7.2 起必须含（乱码根因之一）。
+        let strlen = blob.iter().position(|&b| b == 0).unwrap_or(blob.len()) + 1;
 
         let null_args = args == "null" || args == "ptr null"
             || args == "i64 0"
@@ -2005,8 +2008,10 @@ fn rewrite_vprintf_to_ockl(text: &str) -> String {
             "{indent}%{base}s = call i64 @__ockl_printf_append_string_n(i64 %{base}h, ptr %{base}f, i64 {strlen}, i32 0)"
         ));
         if null_args {
+            // clang 无参形态：单条 string_n(is_last=1)，无 args 消息；
+            // 其返回值即 vprintf 结果。
             seq.push(format!(
-                "{indent}%{base}r = call i64 @__ockl_printf_append_args(i64 %{base}h, i32 0, i64 0, i64 0, i64 0, i64 0, i64 0, i64 0, i64 0, i32 1)"
+                "{indent}%{base}r = call i64 @__ockl_printf_append_string_n(i64 %{base}h, ptr %{base}f, i64 {strlen}, i32 1)"
             ));
         } else {
             // args 原文可能带指针属性（"ptr nonnull %x" 的 nonnull 已被
@@ -2034,6 +2039,13 @@ fn rewrite_vprintf_to_ockl(text: &str) -> String {
             let mut slots: Vec<String> = Vec::new();
             let mut ok = true;
             for (i, ft) in fields.iter().enumerate() {
+                // repr(C) 的对齐空洞会显式化成数组成员（如 i32 后的
+                // [4 x i8]）。GpuPrintfArg::Promoted 契约只产标量
+                // （i32/u32/i64/u64/f64），数组成员必是 padding——跳过，
+                // 否则多发槽让 host 从该参起整体错位（Mixed 行乱码根因）。
+                if ft.starts_with('[') {
+                    continue;
+                }
                 let (gv, vv) = (format!("{base}g{i}"), format!("{base}v{i}"));
                 seq.push(format!(
                     "{indent}%{gv} = getelementptr inbounds {gep_ty}, ptr {bare}, i32 0, i32 {i}"
@@ -2092,8 +2104,11 @@ fn rewrite_vprintf_to_ockl(text: &str) -> String {
                 // ockl 链式 ABI：每轮最多 7 值（轮内个数编码进 handle 位 3-7，
                 // 见 ockl.bc append_args 的 `nargs << 5`），返回 handle 接力
                 // 下一轮；is_last（bit 1）仅末轮为 1。>7 参即 clang 同款多轮。
+                // handle 必须从 string_n 的返回值接力（clang 形态：每条 append
+                // 的返回 handle 是下一条的输入；用 begin 的旧 handle 会host 端
+                // 流配对错乱——7.2 起 0.000000/槽错位乱码的根因之一）。
                 let nchunks = slots.len().div_ceil(7);
-                let mut handle = format!("%{base}h");
+                let mut handle = format!("%{base}s");
                 for (ci, chunk) in slots.chunks(7).enumerate() {
                     let last = ci + 1 == nchunks;
                     let mut cs: Vec<String> = chunk.to_vec();
