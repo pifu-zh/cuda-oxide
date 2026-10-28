@@ -121,11 +121,16 @@ printf 九族真卡输出零乱码（含 Mixed 五参混合、10 参链式、`{:
   repo.radeon.com/rocm/apt/7.2.4 四件套 `rocprofiler-sdk_1.1.0 +
   rocprofiler-sdk-roctx + rocprofiler-sdk-rocpd + hsa-amd-aqlprofile_1.0.0`
   （24.04 变体，dpkg-deb -x 用户级解包）。rocprofv3 --version 正常
-  （1.1.0/97f5574）。**剩余问题**：`--kernel-trace -o … -- app` 运行
-  exit=0 但 tool initialization 0.0007s 且不产任何输出文件——tracing
-  tool 未真正挂载（LD_PRELOAD 由 wrapper 设置，怀疑 hsa agent 注册或
-  ROCM_DIR 探测问题），待下轮深挖；conda-forge 无任何 rocprofiler 包，
-  官方 deb 是唯一来源。
+  （1.1.0/97f5574）。**剩余问题**：`--kernel-trace/-hip-trace -o … -- app` 均 exit=0 但不产
+  任何输出文件。诊断已定位：tool 库**挂载成功**（tool initialization/
+  finalization 日志来自 librocprofiler-sdk-tool.so 内部，手动 LD_PRELOAD
+  同样），但 hsa→profiler 的 agent/缓冲注册没有发生（0 kernel 记录、
+  0 输出）。下一步实验排序：① 用官方配对的 hsa-runtime_7.2.4 deb 替换
+  rocm2 的 hsa（当前 hsa=conda-forge 7.2.53211 构建，agent 注册协议可能
+  有差异）；② HSA_TOOLS_REPORT_LOAD_FAILURE=1 + rocprofiler trace 日志
+  级环境变量（ROCP_ROCPRF_LOG_LEVEL=trace 已试无增量）；③ 检查
+  rocprofiler-sdk 是否需要自有 rocpd daemon。conda-forge 无任何
+  rocprofiler 包，官方 deb 是唯一来源。
 
 ## 复现命令（最小链路）
 
