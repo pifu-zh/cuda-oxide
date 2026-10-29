@@ -121,16 +121,20 @@ printf 九族真卡输出零乱码（含 Mixed 五参混合、10 参链式、`{:
   repo.radeon.com/rocm/apt/7.2.4 四件套 `rocprofiler-sdk_1.1.0 +
   rocprofiler-sdk-roctx + rocprofiler-sdk-rocpd + hsa-amd-aqlprofile_1.0.0`
   （24.04 变体，dpkg-deb -x 用户级解包）。rocprofv3 --version 正常
-  （1.1.0/97f5574）。**剩余问题**：`--kernel-trace/-hip-trace -o … -- app` 均 exit=0 但不产
-  任何输出文件。诊断已定位：tool 库**挂载成功**（tool initialization/
-  finalization 日志来自 librocprofiler-sdk-tool.so 内部，手动 LD_PRELOAD
-  同样），但 hsa→profiler 的 agent/缓冲注册没有发生（0 kernel 记录、
-  0 输出）。下一步实验排序：① 用官方配对的 hsa-runtime_7.2.4 deb 替换
-  rocm2 的 hsa（当前 hsa=conda-forge 7.2.53211 构建，agent 注册协议可能
-  有差异）；② HSA_TOOLS_REPORT_LOAD_FAILURE=1 + rocprofiler trace 日志
-  级环境变量（ROCP_ROCPRF_LOG_LEVEL=trace 已试无增量）；③ 检查
-  rocprofiler-sdk 是否需要自有 rocpd daemon。conda-forge 无任何
-  rocprofiler 包，官方 deb 是唯一来源。
+  （1.1.0/97f5574）。**抓取层根因定位（2026-10-29 第二轮）**：`--kernel-trace/-hip-trace`
+  仍零输出，但本轮闭环了三件事——① **依赖归零**：补
+  rocprofiler-register_0.6.0 deb（`librocprofiler-register.so.0` 是
+  官方 hsa 的 NEEDED 注入点，conda 构建的 hsa/hip **均无此链接**=
+  之前零回调的最强解释）+ comgr 符号链接进 sdk lib 目录；② **官方
+  hsa-rocr_1.18.70204** deb 解包并切默认池（hip-lib → 官方 hsa，带
+  register 注入点；官方 hsa dlopen comgr 走 $ORIGIN——comgr 必须在
+  它的 lib 目录）；切换后全链回归绿（pytest 15/15、printf 九族零
+  乱码）。③ **抓取仍静默** → 最终判定=KFD perf 权限：aqlprofile 的
+  event page/计数器 ioctl 需 root 或 amdgpu.perfmon=1（本机
+  /sys/module/amdgpu/parameters/perfmon 不存在、sudo -n 不可用）。
+  归类 **BLOCKED（环境权限）**，非软件缺陷；持 root/perfmon 的环境
+  按本档案应可直接抓取。另：/tmp 会被外部清理，perf_baseline 已固化
+  ~/opt/perf/（真 hipcc 编译，-x hip 必需因 .c 后缀默认 C 模式）。
 
 ## 复现命令（最小链路）
 
