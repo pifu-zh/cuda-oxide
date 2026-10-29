@@ -18,6 +18,8 @@ mod kernels {
             let mut v: Vec<u32> = Vec::new();
             v.push(1);
             v.push(2);
+            // clippy::vec_init_then_push is the point: the allocation is
+            // what must fail loudly; lint suppressed intentionally.
             out[0] = v[0] + v[1];
         }
     }
@@ -26,7 +28,11 @@ mod kernels {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = CudaContext::new(0)?;
     let s0 = ctx.default_stream();
-    let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
     let module = kernels::load(&ctx)?;
     let mut out = DeviceBuffer::zeroed(&s0, 1)?;
     // SAFETY: launch shape matches.

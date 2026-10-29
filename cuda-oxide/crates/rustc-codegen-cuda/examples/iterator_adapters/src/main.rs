@@ -34,7 +34,6 @@
 use cuda_core::simt::LaunchConfig;
 use cuda_core::{CudaContext, DeviceBuffer};
 use cuda_device::{cuda_module, kernel, thread};
-use cuda_host::cuda_module as _;
 
 #[cuda_module]
 mod kernels {
@@ -80,7 +79,10 @@ mod kernels {
     pub fn zip_probe(data: &[u32], out: &mut [u32]) {
         let tid = thread::index_1d().get();
         if tid == 0 {
-            out[0] = (0..data.len() as u32).zip(data.iter()).map(|(i, &v)| i + v).sum();
+            out[0] = (0..data.len() as u32)
+                .zip(data.iter())
+                .map(|(i, &v)| i + v)
+                .sum();
         }
     }
 
@@ -111,6 +113,8 @@ mod kernels {
     }
 
     /// slice fold WITHOUT enumerate (works; Enumerate::fold does not).
+    /// Deliberately not `.sum()`: the fold form is the tested subject.
+    #[allow(clippy::unnecessary_fold)]
     #[kernel]
     pub fn fold_plain(data: &[u32], out: &mut [u32]) {
         let tid = thread::index_1d().get();
@@ -134,7 +138,10 @@ mod host_ref {
         data.iter().filter(|&&x| x > threshold).count() as u32
     }
     pub fn zip_probe(data: &[u32]) -> u32 {
-        (0..data.len() as u32).zip(data.iter()).map(|(i, &v)| i + v).sum()
+        (0..data.len() as u32)
+            .zip(data.iter())
+            .map(|(i, &v)| i + v)
+            .sum()
     }
     pub fn position_probe(data: &[u32], needle: u32) -> u32 {
         data.iter().position(|&x| x == needle).unwrap_or(usize::MAX) as u32
@@ -194,7 +201,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     unsafe { module.filter_count((s0).as_ref(), cfg, &dev, 6, &mut out) }?;
     out.copy_to_host(&s0, &mut host_out)?;
     s0.synchronize()?;
-    check("filter_count(>6)", host_out[0], host_ref::filter_count(&data, 6))?;
+    check(
+        "filter_count(>6)",
+        host_out[0],
+        host_ref::filter_count(&data, 6),
+    )?;
 
     // SAFETY: as above.
     unsafe { module.zip_probe((s0).as_ref(), cfg, &dev, &mut out) }?;
@@ -206,7 +217,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     unsafe { module.position_probe((s0).as_ref(), cfg, &dev, 21, &mut out) }?;
     out.copy_to_host(&s0, &mut host_out)?;
     s0.synchronize()?;
-    check("position_probe(21)", host_out[0], host_ref::position_probe(&data, 21))?;
+    check(
+        "position_probe(21)",
+        host_out[0],
+        host_ref::position_probe(&data, 21),
+    )?;
 
     // SAFETY: as above.
     unsafe { module.enum_loop((s0).as_ref(), cfg, &dev, &mut out) }?;
