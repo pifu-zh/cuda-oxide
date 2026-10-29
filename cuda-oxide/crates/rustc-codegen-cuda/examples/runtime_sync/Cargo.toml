@@ -1,0 +1,11 @@
+[package]
+name = "runtime_sync"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cuda-core = { path = "../../../../../cuda-core" }
+cuda-macros = { path = "../../../../crates/cuda-macros" }
+cuda-device = { path = "../../../../crates/cuda-device" }
+cuda-host = { path = "../../../../crates/cuda-host" }
+[workspace]

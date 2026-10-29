@@ -174,6 +174,27 @@ pub unsafe fn malloc_async(
     crate::cudarc_shim::memory::malloc_async(stream.cu_stream(), num_bytes)
 }
 
+/// Allocates `num_bytes` of managed (unified) memory accessible from both
+/// the host and the device.
+///
+/// Managed memory migrates on demand between host and device; the same
+/// pointer is valid on both sides. Attach `flags` controls visibility:
+/// `CU_MEM_ATTACH_GLOBAL` (default for probe use) makes it visible to all
+/// streams, `CU_MEM_ATTACH_SINGLE` restricts it to the stream given to
+/// [`mem_advise`] / stream attach.
+///
+/// Driver failures (out of memory included) come back as `Err`.
+///
+/// # Safety
+/// A valid CUDA context must be current. The caller owns the returned
+/// allocation and frees it with [`free_sync`]-style calls.
+pub unsafe fn malloc_managed(
+    num_bytes: usize,
+    flags: sys::CUmemAttach_flags,
+) -> Result<sys::CUdeviceptr, DriverError> {
+    crate::cudarc_shim::memory::malloc_managed(num_bytes, flags)
+}
+
 /// Asynchronously allocates `num_bytes` of device memory from a specific pool on the given stream.
 ///
 /// Driver failures come back as `Err`, as for [`malloc_async`].
