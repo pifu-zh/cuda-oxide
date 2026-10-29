@@ -26,7 +26,8 @@
 | 泛型（单态化后分发）/const 泛型/trait 静态分发 | PARTIAL | 理论=单态化后与核心 Rust 同一 lowering [static]；gfx 直验面=batch/pytest 所含形状。`const_generic` 例因 device-only 抽取器无法满足 cuda_host 引用而排除（batch 记录） | 写一个不依赖 host crate 的 const-generic device 变体进 batch |
 | 闭包（显式捕获，byval 结构体参数） | PARTIAL | [hist] host_closure 例 + Phase-1 闭包族 llc 绿；本机 batch 含 host_closure（Python 维度 PASS） | 集成维度本机未单独跑该例的运行验证 |
 | panic（=abort：内嵌 PTX trap asm → llvm.trap → s_trap） | FULL | [e2e] pytest trap asm 测试；[hist] panic 例 GPU 验证 | unwind 无（语言语义即 abort，非缺口） |
-| 迭代器/Vec/格式化等依赖设备端分配/std 的设施 | NOT TESTED | 上游 CUDA 侧同样限定；gfx 侧未单独验证 | 如需，先做 device-side allocator 探针 |
+| 迭代器适配器（无分配子集） | **FULL**（2026-10-29 真卡） | [e2e] 新例 iterator_adapters 七适配器各对独立 host 参考逐值全对：map+sum、min/max（match 形态）、filter+count、zip、position、enumerate+for、slice fold。**边界精确取证**（单 kernel 二分）：①`enumerate().fold()/sum()` 链崩——`Enumerate::fold` 产生嵌套闭包 struct 常量，MIR 导入器拒（"Expected ADT Rust type for struct constant, got RigidTy(Closure(...))"，core/src/iter/adapters/rev.rs）；②`Option::unwrap_or/map_or` 经 Fn-trait 分发被拒（"calling Result::Err through Fn/FnOnce is not yet supported"）——`match` 是工作替代（例内注释已指引）；③enumerate+`for` 循环可用 | `enumerate().fold/sum` 与 unwrap_or 族属 IMPLEMENTABLE（需导入器支持闭包型 struct 常量与 Fn-trait 分发）；工作替代已文档化 |
+| Vec/Box/String（设备堆分配） | BLOCKED→NOT FEASIBLE（语义上） | [neg] 负例 device_alloc_reject 编译期响亮拒绝："heap allocation is not supported in kernels (no device allocator); use fixed-size arrays or SharedArray"——设备无 GlobalAlloc，编译期即断（fail-loud，无误算风险）；上游 CUDA 侧同限定 | 设备侧 allocator（dlmalloc/Buddy on global memory）= IMPLEMENTABLE（research track 候选）；格式化依赖堆，同上游 |
 
 ## 2. LLVM IR → AMDGPU ISA 代码生成
 
