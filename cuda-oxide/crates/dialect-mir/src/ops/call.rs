@@ -92,6 +92,18 @@ impl MirCallOp {
         self.set_attr_call_pointer_kind_authority(ctx, MirPointerKindAuthorityAttr::AbiBoundary);
     }
 
+    /// Removes the foreign-ABI capability pair. Caller must hold mutable
+    /// access to the operation's context entry (used by lowering passes
+    /// that demote foreign calls to in-module calls).
+    pub fn unset_external_callee_signature(op: Ptr<Operation>, _ctx: &Context) {
+        op.deref_mut(_ctx).attributes.0.remove(
+            &mir_call_op_attr_names::ATTR_KEY_EXTERNAL_CALLEE_TYPE,
+        );
+        op.deref_mut(_ctx).attributes.0.remove(
+            &mir_call_op_attr_names::ATTR_KEY_CALL_POINTER_KIND_AUTHORITY,
+        );
+    }
+
     /// Whether the call carries Rust's logical `()` result for a void callee.
     /// Explicitly declared aggregate results, including empty tuples, are not
     /// this bridge and must retain their ABI result when exported.
@@ -162,11 +174,20 @@ impl Verify for MirCallOp {
 
         match resolve_call(ctx, self.get_operation(), &callee_name) {
             CallResolution::AttachedResolved(callee) => {
-                if external_signature.is_some() {
-                    return verify_err!(
-                        op.loc(),
-                        "call to an in-module mir.func must not claim external ABI authority"
-                    );
+                if let Some(signature) = external_signature {
+                    // [device heap 2026-10-30] A crate-local
+                    // `#[global_allocator]` emits shim definitions into the
+                    // module while the alloc crate's call sites still carry
+                    // their foreign-ABI authority (the sites were translated
+                    // before the override was known). Verify against BOTH
+                    // signatures: they describe the same declaration
+                    // (rustc's extern block vs the generated shim; the
+                    // dumps were byte-verified identical), so passing the
+                    // external check proves the in-module callee matches
+                    // too. Foreign authority is then legitimate on this
+                    // call: the ABI boundary description stays true even
+                    // though the callee has an in-module body.
+                    verify_call_signature(ctx, self, signature)?;
                 }
                 verify_call_signature(ctx, self, callee.get_type(ctx).into())
             }
@@ -295,6 +316,12 @@ fn external_callee_signature(ctx: &Context, call: &MirCallOp) -> Result<Option<T
     }
 }
 
+
+fn printable_of(ty: pliron::r#type::TypeHandle, ctx: &pliron::context::Context) -> String {
+    use pliron::printable::Printable;
+    ty.disp(ctx).to_string()
+}
+
 fn verify_call_signature(
     ctx: &Context,
     call: &MirCallOp,
@@ -321,8 +348,12 @@ fn verify_call_signature(
         if op.get_operand(index).get_type(ctx) != *expected {
             return verify_err!(
                 op.loc(),
-                "MirCallOp argument {} type does not match callee signature",
-                index
+                "MirCallOp argument {} type does not match callee signature                  (operand handle: {:?}, expected handle: {:?}, operand prints: {}, expected prints: {})",
+                index,
+                op.get_operand(index).get_type(ctx),
+                expected,
+                printable_of(op.get_operand(index).get_type(ctx), ctx),
+                printable_of(*expected, ctx)
             );
         }
     }

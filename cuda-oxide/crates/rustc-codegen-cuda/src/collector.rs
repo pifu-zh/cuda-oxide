@@ -925,6 +925,16 @@ const MISSING_DEVICE_STUB_MARKER: &str = "called outside #[kernel] / #[device]";
 /// allocator exists, so reaching one from a kernel can never work. This
 /// list is the single switch point to revisit if a device allocator ever
 /// lands.
+
+fn shim_for(fn_path: &str) -> &'static str {
+    let last = fn_path.rsplit("::").next().unwrap_or(fn_path);
+    ["__rust_alloc", "__rust_alloc_zeroed", "__rust_dealloc", "__rust_realloc",
+     "__rust_no_alloc_shim_is_unstable_v2"]
+        .into_iter()
+        .find(|s| *s == last)
+        .unwrap_or("handle_alloc_error")
+}
+
 fn rust_alloc_shim_name(fn_path: &str) -> Option<&str> {
     // [device heap 2026-10-29] `handle_alloc_error` was removed from this
     // list: it is the OOM *reporter* (a normal alloc-crate function with a
@@ -1233,10 +1243,11 @@ fn tile_export_meta_text<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> O
 /// - `device_externs`: External device function declarations (for FFI with external LTOIR)
 pub fn collect_device_functions<'tcx>(
     tcx: TyCtxt<'tcx>,
-    cgus: &[CodegenUnit<'tcx>],
+    cgus: &'tcx [CodegenUnit<'tcx>],
     verbose: bool,
 ) -> CollectionResult<'tcx> {
     let mut collector = DeviceCollector::new(tcx, verbose);
+    collector.cgus_input = cgus;
     let tile_exports = collect_tile_exports(tcx, cgus, verbose);
     let mut requires_ptx_bundle_merge = cgus.iter().any(|cgu| {
         cgu.items().iter().any(|(item, _data)| match item {
@@ -1441,6 +1452,10 @@ struct DeviceCollector<'tcx> {
     /// stands down for that shim and the local definition is enqueued so
     /// its body is emitted into the module.
     local_shim_defs: Option<std::collections::HashMap<&'static str, DefId>>,
+    /// Codegen units, for symbol-level definition lookups (no_mangle
+    /// shims in dependency crates never appear in mir_keys locally).
+    cgus: Option<&'tcx [CodegenUnit<'tcx>]>,
+    cgus_input: &'tcx [CodegenUnit<'tcx>],
 }
 
 impl<'tcx> DeviceCollector<'tcx> {
@@ -1457,6 +1472,8 @@ impl<'tcx> DeviceCollector<'tcx> {
             warned_dynamic_shared_array: false,
             verbose,
             local_shim_defs: None,
+            cgus: None,
+            cgus_input: &[],
         }
     }
 
@@ -1516,6 +1533,7 @@ impl<'tcx> DeviceCollector<'tcx> {
 
     /// Runs collection to completion, returning all discovered functions and extern declarations.
     fn collect(mut self) -> CollectionResult<'tcx> {
+        self.cgus = Some(self.cgus_input);
         while let Some(func) = self.worklist.pop_front() {
             let def_id = func.instance.def_id();
 
@@ -1626,6 +1644,75 @@ impl<'tcx> DeviceCollector<'tcx> {
     }
 
     /// Adds an external device function declaration (for FFI with external LTOIR).
+    /// Finds the CGU instance whose symbol equals `bare` exactly
+    /// (no_mangle definitions keep their source name).
+    fn find_cgu_definition_for_symbol(&self, bare: &str) -> Option<Instance<'tcx>> {
+        // 1) CGU set (caller-crate monomorphizations)
+        if let Some(cgus) = self.cgus {
+            for cgu in cgus {
+                for (item, _data) in cgu.items() {
+                    let MonoItem::Fn(instance) = item else {
+                        continue;
+                    };
+                    let symbol = self.tcx.symbol_name(*instance).name.to_string();
+                    if symbol == bare {
+                        return Some(*instance);
+                    }
+                }
+            }
+        }
+        // 2) cuda-device crate root children (no_mangle shims live there;
+        //    rustc keeps them in the defining crate's own CGU).
+        for krate in self.tcx.crates(()) {
+            if !matches!(self.tcx.crate_name(*krate).as_str(), "cuda_device" | "cuda-device") {
+                continue;
+            }
+            let root: rustc_hir::def_id::DefId = (*krate).as_def_id();
+            for child in self.tcx.module_children(root).iter() {
+                let Some(did) = child.res.opt_def_id() else { continue };
+                if !matches!(self.tcx.def_kind(did), rustc_hir::def::DefKind::Fn) {
+                    continue;
+                }
+                let name = self.tcx.item_name(did);
+                if self.verbose && name.as_str().starts_with("__rust") {
+                    eprintln!("[collector] cuda-device child fn: {name} (bare={bare})");
+                }
+                if name.as_str() == bare {
+                    return Some(Instance::mono(self.tcx, did));
+                }
+            }
+        }
+        if self.verbose {
+            eprintln!("[collector] no cuda-device/CGU definition for {bare}");
+        }
+        None
+    }
+
+
+    /// Finds the kernel-crate-local `__cuda_device_memset_u8` definition
+    /// (independent of the guard's lazily-built index, which only fills
+    /// when the alloc-crate guard actually fires).
+    fn find_local_memset_def(&self) -> Option<DefId> {
+        for local in self.tcx.mir_keys(()) {
+            let def_id = local.to_def_id();
+            if !matches!(self.tcx.def_kind(def_id), rustc_hir::def::DefKind::Fn) {
+                continue;
+            }
+            let instance = Instance::mono(self.tcx, def_id);
+            let symbol = self.tcx.symbol_name(instance).name.to_string();
+            if self.verbose && symbol.contains("memset") {
+                eprintln!("[collector] mir_keys candidate: {symbol}");
+            }
+            if symbol.ends_with("__cuda_device_memset_u8") {
+                return Some(def_id);
+            }
+        }
+        if self.verbose {
+            eprintln!("[collector] no local memset def found in mir_keys");
+        }
+        None
+    }
+
     fn add_device_extern(&mut self, def_id: DefId, full_name: &str) {
         // Skip if already seen
         if !self.seen_device_externs.insert(def_id) {
@@ -1866,6 +1953,10 @@ impl<'tcx> DeviceCollector<'tcx> {
             return;
         };
         let fn_path = self.tcx.def_path_str(*def_id);
+        if self.verbose && fn_path.contains("write_bytes") {
+            eprintln!("[collector] walk sees call to {fn_path}");
+            eprintln!("[collector] probe: placeholder-check next");
+        }
 
         // `#[tile_export]` metadata functions are host-only: their body is
         // the JSON description the collector already consumed. A device-side
@@ -1932,6 +2023,36 @@ impl<'tcx> DeviceCollector<'tcx> {
             TypingEnv::fully_monomorphized(),
             EarlyBinder::bind(self.tcx, args),
         );
+
+        // [device heap 2026-10-30] `std::intrinsics::write_bytes` resolves
+        // to InstanceKind::Intrinsic, which `Instance::try_resolve` cannot
+        // produce a stable instance for (silent return below). The importer
+        // dispatches this intrinsic to `__cuda_device_memset_u8`, whose
+        // definition lives in this kernel crate — enqueue it directly.
+        if fn_path.ends_with("::write_bytes") {
+            if let Some(def_id) = self.find_local_memset_def() {
+                let instance = Instance::mono(self.tcx, def_id);
+                let name = self.fqdn(instance);
+                let export_name = self.compute_export_name(&name, instance);
+                let mangled = self.tcx.symbol_name(instance).name.to_string();
+                self.discovery.insert(
+                    mangled.clone(),
+                    DiscoveryCtx {
+                        root_name: ctx.root_name.clone(),
+                        root_is_kernel: ctx.root_is_kernel,
+                        user_span: ctx.user_span,
+                    },
+                );
+                self.seen.insert(mangled);
+                self.used_export_names.insert(export_name.clone());
+                self.worklist.push_back(CollectedFunction {
+                    instance,
+                    is_kernel: false,
+                    export_name,
+                });
+            }
+            return;
+        }
 
         // The call site is the best span while the caller is user code;
         // afterwards keep the last user-code span recorded on the walk. Used
@@ -2168,7 +2289,32 @@ impl<'tcx> DeviceCollector<'tcx> {
         // cuda-device::heap) generates local shim definitions with local
         // DefIds, which the is_local check stands down for — the supported
         // escape hatch (device heap, 2026-10-29).
+        // [device heap 2026-10-30] cuda-device::heap defines the shim
+        // family as #[no_mangle] device functions (exact extern-block
+        // shapes). An extern decl (alloc crate, no MIR) whose symbol has a
+        // no_mangle definition in cuda-device is resolved by the linker to
+        // that definition — the guard must stand down. Scan cuda-device's
+        // module children once and index the shim symbols.
+        let shim_taken_over = rust_alloc_shim_name(&raw_name).is_some()
+            && self
+                .local_shim_defs
+                .as_ref()
+                .is_some_and(|m| m.contains_key(shim_for(&raw_name)));
+        // An extern declaration has no MIR and emits no device code; at
+        // link time its symbol binds to whatever definition the module
+        // carries (cuda-device::heap's #[no_mangle] shims when the kernel
+        // crate links cuda-device). The guard's job is to stop the WALK
+        // from descending into sysroot internals that genuinely have no
+        // device implementation — an extern decl isn't that. The no-MIR
+        // skip below already returns cleanly for it.
+        let is_extern_decl = !self.tcx.is_mir_available(resolved.def_id());
+        let is_cuda_device_shim = !resolved.def_id().is_local()
+            && rust_alloc_shim_name(&raw_name).is_some()
+            && matches!(self.tcx.crate_name(resolved.def_id().krate).as_str(), "cuda_device" | "cuda-device");
         if !resolved.def_id().is_local()
+            && !is_cuda_device_shim
+            && !is_extern_decl
+            && !shim_taken_over
             && let Some(shim) = rust_alloc_shim_name(&raw_name)
         {
             // [device heap 2026-10-29] A crate-local `#[global_allocator]`
@@ -2190,7 +2336,8 @@ impl<'tcx> DeviceCollector<'tcx> {
                     let instance = Instance::mono(self.tcx, def_id);
                     let symbol = self.tcx.symbol_name(instance).name.to_string();
                     for shim in ["__rust_alloc", "__rust_alloc_zeroed", "__rust_dealloc",
-                                 "__rust_realloc", "__rust_alloc_error_handler"] {
+                                 "__rust_realloc", "__rust_alloc_error_handler",
+                                 "__cuda_device_memset_u8"] {
                         if symbol.ends_with(shim) {
                             map.insert(shim, def_id);
                         }
@@ -2207,8 +2354,12 @@ impl<'tcx> DeviceCollector<'tcx> {
                     self.local_shim_defs.as_ref().and_then(|m| m.get(shim)).copied()
                 {
                     let instance = Instance::mono(self.tcx, def_id);
+                    // Use the def-path FQDN (like every other non-kernel fn):
+                    // call sites name callees by legalised def-path, and a
+                    // no_mangle symbol would diverge from that string.
+                    let name = self.fqdn(instance);
                     let mangled = self.tcx.symbol_name(instance).name.to_string();
-                    let export_name = sanitize_ptx_name(&mangled);
+                    let export_name = self.compute_export_name(&name, instance);
                     self.discovery.insert(mangled.clone(), callee_ctx.clone());
                     self.seen.insert(mangled);
                     self.used_export_names.insert(export_name.clone());
@@ -2251,13 +2402,72 @@ impl<'tcx> DeviceCollector<'tcx> {
         // Compiler-built shims (`FnPtrAsPtr`) have no HIR body either, so
         // `is_mir_available` is false for their def_id, but `instance_mir`
         // synthesises their body; do not skip those.
+        //
+        // [device heap 2026-10-30] An extern decl whose bare symbol has a
+        // #[no_mangle] definition in the CGU set (cuda-device::heap shims
+        // and the memset backing, reached through DeviceAlloc's collection
+        // hooks) resolves at link time to that definition. Forward the
+        // collection: enqueue the defining instance so the module carries a
+        // body instead of a dangling extern.
+        let bare_symbol = raw_name.rsplit("::").next().unwrap_or(&raw_name).to_string();
+        let is_device_runtime_symbol = rust_alloc_shim_name(&raw_name).is_some()
+            || bare_symbol == "__cuda_device_memset_u8";
+        if !self.tcx.is_mir_available(resolved.def_id())
+            && bare_symbol == "write_bytes"
+            && let Some(def_id) = self.find_local_memset_def()
+        {
+            if self.verbose {
+                eprintln!("[collector] write_bytes → enqueue memset backing");
+            }
+            // [device heap] write_bytes → our memset backing: enqueue the
+            // local definition so the importer's symbol-level call finds a
+            // mir.func in-module.
+            let instance = Instance::mono(self.tcx, def_id);
+            let name = self.fqdn(instance);
+            let export_name = self.compute_export_name(&name, instance);
+            let mangled = self.tcx.symbol_name(instance).name.to_string();
+            self.seen.insert(mangled);
+            self.used_export_names.insert(export_name.clone());
+            self.worklist.push_back(CollectedFunction {
+                instance,
+                is_kernel: false,
+                export_name,
+            });
+        }
+        if !self.tcx.is_mir_available(resolved.def_id())
+            && !matches!(resolved.def, InstanceKind::Shim(ShimKind::FnPtrAddr(..)))
+            && is_device_runtime_symbol
+        {
+            if let Some(def_instance) = self.find_cgu_definition_for_symbol(&bare_symbol) {
+                let mangled = self.tcx.symbol_name(def_instance).name.to_string();
+                let fq_name = self.fqdn(def_instance);
+                let export_name = self.compute_export_name(&fq_name, def_instance);
+                self.discovery.insert(
+                    mangled.clone(),
+                    DiscoveryCtx {
+                        root_name: caller.export_name.clone(),
+                        root_is_kernel: ctx.root_is_kernel,
+                        user_span: ctx.user_span,
+                    },
+                );
+                self.seen.insert(mangled);
+                self.used_export_names.insert(export_name.clone());
+                self.worklist.push_back(CollectedFunction {
+                    instance: def_instance,
+                    is_kernel: false,
+                    export_name,
+                });
+                return;
+            }
+        }
         if !self.tcx.is_mir_available(resolved.def_id())
             && !matches!(resolved.def, InstanceKind::Shim(ShimKind::FnPtrAddr(..)))
         {
             if self.verbose {
                 eprintln!(
-                    "[collector] Skipping extern/intrinsic (no MIR): {}",
-                    self.tcx.def_path_str(resolved.def_id())
+                    "[collector] Skipping extern/intrinsic (no MIR): {} (bare={})",
+                    self.tcx.def_path_str(resolved.def_id()),
+                    raw_name.rsplit("::").next().unwrap_or(&raw_name)
                 );
             }
             return;
@@ -2286,6 +2496,9 @@ impl<'tcx> DeviceCollector<'tcx> {
         // Use FQDN so the export name matches what the MIR translator
         // sees via `CrateDef::name()` on the call side.
         let name = self.fqdn(resolved);
+        if self.verbose && name.contains("rust_alloc") {
+            eprintln!("[collector] normal-path callee name: {name}");
+        }
         let export_name = self.compute_export_name(&name, resolved);
 
         if self.verbose {

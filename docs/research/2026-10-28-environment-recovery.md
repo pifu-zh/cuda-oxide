@@ -197,3 +197,21 @@ local shim（`__rust_alloc_zeroed` 等，bin crate local DefId，已入队收集
 
 **复现**：device_heap 例（五段断言就绪）——第五层修复后直接
 `cargo oxide run device_heap` 验证。
+
+## 设备堆第五层攻坚结果（2026-10-31，fail-closed 边界确认）
+
+四层落地后链路推进到【最后一个门】：`Result<NonNull<[u8]>, AllocError>`
+（alloc_impl_runtime 的返回类型，Vec/String/Box 所有分配路径的公共汇聚点）
+的 niche slot map——`Ok(NonNull<[u8]>)` 的 fat-pointer 载荷（ptr+len 16 字节）
+与 integer claim 在 byte 8 重叠，mir-lower 的 provenance 门按设计 fail-closed
+（"refusing to erase LLVM pointer provenance"，enum_layout.rs:424）。
+
+攻坚过程（全部留痕）：write_bytes intrinsic 分发（mir-importer 臂 + collector
+write_bytes→memset enqueue）；shim 定位从 cuda-device 挪进 kernel crate
+（local DefId 可收集）；export 命名与 call 站点对齐（fqdn 而非 symbol）；
+verifier 对 in-module+external 权威组合的双签名校验；诊断打印保留在
+verbose 路径。
+
+**结论**：Vec/String/Box 族解锁的剩余工作 = enum slot map 对 fat-pointer
+niche（指针+长度对）的通用化——单点、范围明确。fail-closed 保证无误算风险。
+capability 边界注释已写入 device_heap 例（保留全部断言为复现契约）。

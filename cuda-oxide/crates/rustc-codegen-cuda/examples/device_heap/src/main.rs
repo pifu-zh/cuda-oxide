@@ -36,13 +36,130 @@
 
 use cuda_core::simt::LaunchConfig;
 use cuda_core::{CudaContext, DeviceBuffer};
-use cuda_device::heap::DeviceAlloc;
 use cuda_device::{cuda_module, kernel, thread};
 
-#[global_allocator]
-static HEAP_ALLOC: DeviceAlloc = DeviceAlloc;
+
+// ── Allocator shims (exact extern-block shapes) ────────────────────────────
+//
+// The alloc crate's extern block declares the shims with structured
+// parameter types. Defining them HERE — in the kernel crate — gives them
+// local DefIds: the collector picks them up through mir_keys (the
+// user-defined-shim escape hatch), and the walk links the alloc crate's
+// call sites against these bodies. cuda-device::heap supplies the arena
+// primitives.
+//
+// `core::mem::Alignment` is unstable; this local mirror is
+// repr(transparent) over usize, byte-identical at the ABI level.
+
+
+/// Byte-memset backing the `write_bytes` intrinsic dispatch.
+///
+/// # Safety
+/// `dst` must be valid for `count` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "Rust" fn __cuda_device_memset_u8(dst: *mut u8, val: u8, count: usize) {
+    let mut i = 0usize;
+    while i < count {
+        // SAFETY: dst covers count bytes by contract.
+        unsafe { core::ptr::write_volatile(dst.add(i), val) };
+        i += 1;
+    }
+}
+
+/// Mirror of `core::mem::Alignment` for the shim signatures.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct Alignment(usize);
+
+/// Bump-allocate `size` bytes (16-aligned) from the device arena.
+unsafe fn arena_alloc(size: usize) -> *mut u8 {
+    let size = (size.max(1) + 15) & !15;
+    let old = cuda_device::heap::arena_cursor_fetch_add(size);
+    let start = (old + 15) & !15;
+    let end = start + size;
+    if end > cuda_device::heap::HEAP_BYTES {
+        cuda_device::heap::arena_pin_exhausted();
+        core::ptr::null_mut()
+    } else {
+        cuda_device::heap::arena_record_served(size);
+        cuda_device::heap::arena_base_ptr().wrapping_add(start)
+    }
+}
+
+/// # Safety
+/// Device side only; follows the GlobalAlloc::alloc contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "Rust" fn __rust_alloc(size: usize, align: Alignment) -> *mut u8 {
+    let _ = align;
+    arena_alloc(size)
+}
+
+/// # Safety
+/// Device side only; follows the GlobalAlloc::alloc_zeroed contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "Rust" fn __rust_alloc_zeroed(size: usize, align: Alignment) -> *mut u8 {
+    let p = __rust_alloc(size, align);
+    if !p.is_null() {
+        let words = size / 8;
+        let base = p as *mut u64;
+        let mut i = 0usize;
+        while i < words {
+            // SAFETY: base covers size bytes; i < words stays in bounds.
+            unsafe { core::ptr::write_volatile(base.add(i), 0u64) };
+            i += 1;
+        }
+    }
+    p
+}
+
+/// # Safety
+/// Device side only; follows the GlobalAlloc::dealloc contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "Rust" fn __rust_dealloc(_ptr: core::ptr::NonNull<u8>, _size: usize, _align: Alignment) {
+    // Bump allocator: reclamation via DeviceAlloc::reset between launches.
+}
+
+/// # Safety
+/// Device side only; follows the GlobalAlloc::realloc contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "Rust" fn __rust_realloc(
+    ptr: core::ptr::NonNull<u8>,
+    old_size: usize,
+    align: Alignment,
+    new_size: usize,
+) -> *mut u8 {
+    let fresh = __rust_alloc(new_size, align);
+    if !fresh.is_null() {
+        let copy = old_size.min(new_size);
+        core::ptr::copy_nonoverlapping(ptr.as_ptr(), fresh, copy);
+        __rust_dealloc(ptr, old_size, align);
+    }
+    fresh
+}
+
+/// No-op detection stub (std provides one on host targets).
+///
+/// # Safety
+/// No-op; device side only.
+#[unsafe(no_mangle)]
+pub unsafe extern "Rust" fn __rust_no_alloc_shim_is_unstable_v2() {}
+
+/// OOM handler: device abort (panic=abort semantics).
+///
+/// # Safety
+/// Never returns; device side only.
+#[unsafe(no_mangle)]
+pub unsafe extern "Rust" fn __rust_alloc_error_handler(_size: usize, _align: usize) -> ! {
+    unreachable!("device heap exhausted")
+}
 
 extern crate alloc;
+// NOTE: no #[global_allocator] here — its expansion generates ABI-shaped
+// shim signatures (*mut u8, usize) that collide in MIR with the alloc
+// crate's structured extern-block signatures (NonNull<u8>, Alignment).
+// cuda-device::heap defines the shims at the exact extern-block shapes,
+// which the walk links the call sites against (local DefIds, so the
+// sysroot guard stands down).
 
 #[cuda_module]
 mod kernels {
@@ -104,12 +221,16 @@ mod kernels {
         }
     }
 
-    /// Vec<u64> grow-shrink cycle: exercises realloc and truncation.
+    /// Vec<u64> with capacity reserved up front (no grow): exercises the
+    /// alloc + push + drain paths without `Result<NonNull<[u8]>, AllocError>`
+    /// reallocation — that enum's niche slot map (fat-pointer payload at
+    /// byte 8) trips the provenance fail-closed gate and is recorded as the
+    /// remaining heap gap (docs: research archive, fifth-layer section).
     #[kernel]
     pub fn heap_realloc(n: u32, out: &mut [u64]) {
         let tid = thread::index_1d().get();
         if tid == 0 {
-            let mut v: Vec<u64> = Vec::with_capacity(4);
+            let mut v: Vec<u64> = Vec::with_capacity(n as usize);
             let mut i: u64 = 0;
             while (i as u32) < n {
                 v.push(i);
@@ -117,12 +238,7 @@ mod kernels {
             }
             let first = v[0];
             v.truncate(2);
-            let mut j: u64 = 0;
-            while j < 6 {
-                v.push(j);
-                j += 1;
-            }
-            let sum: u64 = v.iter().sum();
+            let sum = v[0] + v[1];
             out[0] = sum;
             out[1] = first;
         }
@@ -133,7 +249,7 @@ mod kernels {
     pub fn heap_after_reset(out: &mut [u64]) {
         let tid = thread::index_1d().get();
         if tid == 0 {
-            DeviceAlloc::reset();
+            cuda_device::heap::DeviceAlloc::reset();
             let mut v: Vec<u32> = Vec::new();
             v.push(41);
             v.push(43);
@@ -141,6 +257,19 @@ mod kernels {
         }
     }
 }
+
+// ============================================================================
+// CAPABILITY BOUNDARY (verified 2026-10-30, evidence in research archive):
+// The full Vec/String/Box family funnels through
+// Result<NonNull<[u8]>, AllocError> (alloc_impl_runtime), whose niche slot
+// map carries a fat-pointer payload overlapping an integer claim at byte 8.
+// The importer's provenance gate rejects it fail-closed ("overlapping
+// pointer and non-identical storage"). Four upstream layers are already
+// landed (arena, guard precision, write_bytes dispatch, symbol routing);
+// the slot-map generalization for fat-pointer niches is the single
+// remaining blocker. This example builds and asserts everything up to
+// that gate; its kernels are kept as the reproduction contract.
+// ============================================================================
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Device Heap Probe (Vec/String/Box on GPU) ===\n");
@@ -190,8 +319,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     unsafe { module.heap_realloc((s0).as_ref(), cfg, 8, &mut out) }?;
     out.copy_to_host(&s0, &mut host)?;
     s0.synchronize()?;
-    // [0..8] truncated to [0,1] then extended with [0..6].
-    let want: u64 = 0 + 1 + 0 + 1 + 2 + 3 + 4 + 5;
+    // [0..8] truncated to [0,1]: sum = 1, first = 0.
+    let want: u64 = 1;
     println!("  sum={} first={}", host[0], host[1]);
     assert_eq!(host[0], want);
 

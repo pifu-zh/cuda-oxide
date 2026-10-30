@@ -1328,10 +1328,14 @@ fn translate_call(
             || name == "std::intrinsics::write_bytes")
     {
         let return_type = types::translate_destination_type(ctx, body, destination, &loc)?;
+        // Use the definition's legalised FQDN so resolve_call finds the
+        // in-module mir.func (its symbol name is the legalised export name).
         return helpers::emit_function_call(
             ctx,
             body,
-            "__cuda_device_memset_u8",
+            legaliser
+                .legalise("device_heap::__cuda_device_memset_u8")
+                .as_ref(),
             args,
             destination,
             return_type,

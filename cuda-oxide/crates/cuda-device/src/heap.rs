@@ -47,6 +47,21 @@
 //! `device_heap` example).
 
 use core::alloc::{GlobalAlloc, Layout};
+
+/// Device-local mirror of `core::mem::Alignment` (unstable there): a
+/// power-of-two byte alignment as a transparent usize wrapper. The
+/// struct name keeps the MIR type print identical to the alloc crate's
+/// `Alignment`, which is what the extern block call sites pass.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct Alignment(usize);
+
+impl Alignment {
+    fn as_usize(self) -> usize {
+        self.0
+    }
+}
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Arena size in bytes (256 MiB).
@@ -85,30 +100,41 @@ const fn align_up(n: usize) -> usize {
     (n + BUMP_ALIGN - 1) & !(BUMP_ALIGN - 1)
 }
 
-/// The alloc crate's `alloc()`/`alloc_zeroed()` free functions call this
-/// detection stub (defined by std on normal targets) before dispatching to
-/// `__rust_alloc`. On the device there is no std; the no-op definition
-/// here lets the walk proceed to the real allocator shim, which
-/// `#[global_allocator]` generates.
+/// Arena cursor read-modify-add (device side).
 ///
 /// # Safety
-/// No-op; device side only.
-#[unsafe(no_mangle)]
-pub unsafe extern "Rust" fn __rust_no_alloc_shim_is_unstable_v2() {}
+/// Device side only.
+#[doc(hidden)]
+pub unsafe fn arena_cursor_fetch_add(size: usize) -> usize {
+    HEAP_CURSOR.fetch_add(size, Ordering::AcqRel)
+}
 
-/// Byte-memset backing the `write_bytes` intrinsic dispatch (see the
-/// mir-importer terminator arm). Volatile u8 loop; trivially correct.
+/// Pins the cursor at the arena end (exhaustion marker).
 ///
 /// # Safety
-/// `dst` must be valid for `count` bytes.
-#[unsafe(no_mangle)]
-pub unsafe extern "Rust" fn __cuda_device_memset_u8(dst: *mut u8, val: u8, count: usize) { unsafe {
-    let mut i = 0usize;
-    while i < count {
-        core::ptr::write_volatile(dst.add(i), val);
-        i += 1;
-    }
-}}
+/// Device side only.
+#[doc(hidden)]
+pub unsafe fn arena_pin_exhausted() {
+    HEAP_CURSOR.store(HEAP_BYTES, Ordering::Release);
+}
+
+/// Records `size` served bytes (diagnostics).
+///
+/// # Safety
+/// Device side only.
+#[doc(hidden)]
+pub unsafe fn arena_record_served(size: usize) {
+    BYTES_SERVED.fetch_add(size, Ordering::Relaxed);
+}
+
+/// Base address of the arena as a raw pointer.
+///
+/// # Safety
+/// Device side only.
+#[doc(hidden)]
+pub unsafe fn arena_base_ptr() -> *mut u8 {
+    &raw const HEAP as *mut u8
+}
 
 /// The device global allocator: bump allocation over [`HEAP_BYTES`].
 ///
@@ -144,9 +170,6 @@ unsafe impl GlobalAlloc for DeviceAlloc {
         // internals call the same symbols, and the definitions must exist
         // at link time.
         unsafe { __rust_no_alloc_shim_is_unstable_v2() };
-        if layout.size() == usize::MAX {
-            unsafe { __cuda_device_memset_u8(core::ptr::null_mut(), 0, 0) };
-        }
         let size = align_up(layout.size().max(1));
         let old = HEAP_CURSOR.fetch_add(size, Ordering::AcqRel);
         let start = (old + BUMP_ALIGN - 1) & !(BUMP_ALIGN - 1);
@@ -200,4 +223,110 @@ unsafe impl GlobalAlloc for DeviceAlloc {
         }
         p
     }}
+}
+
+// ── Exact-signature shim family ────────────────────────────────────────────
+//
+// The `alloc` crate's extern block declares the shims with structured
+// parameter types (`NonNull<u8>`, `Alignment`), while a `#[global_allocator]`
+// expansion generates ABI-shaped ones (`*mut u8`, `usize`). Both must exist
+// under the same symbol with ONE signature the verifier can hold — so this
+// module defines the structured-shape forms matching the extern block byte
+// for byte, backed by the same arena. On device builds both the manual shims
+// (these) and the `#[global_allocator]` expansion exist; rustc links the
+// extern block against whichever definition the module carries — ours win by
+// being first-class device definitions with the exact expected types.
+//
+// They must not be named identically to the generated ones in the same
+// crate, so they carry #[export_name] with the exact reserved symbol and
+// an internal mangled name.
+
+/// Bump-allocate `size` bytes (16-aligned). Returns null on exhaustion.
+unsafe fn arena_alloc(size: usize) -> *mut u8 {
+    let size = align_up(size.max(1));
+    let old = HEAP_CURSOR.fetch_add(size, Ordering::AcqRel);
+    let start = (old + BUMP_ALIGN - 1) & !(BUMP_ALIGN - 1);
+    let end = start + size;
+    if end > HEAP_BYTES {
+        HEAP_CURSOR.store(HEAP_BYTES, Ordering::Release);
+        core::ptr::null_mut()
+    } else {
+        BYTES_SERVED.fetch_add(size, Ordering::Relaxed);
+        (heap_base() + start) as *mut u8
+    }
+}
+
+/// Exact-shape `__rust_alloc` mirroring the extern block.
+///
+/// # Safety
+/// Device side only; follows the GlobalAlloc::alloc contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "Rust" fn __rust_alloc(size: usize, align: Alignment) -> *mut u8 {
+    let _ = align.as_usize(); // arena guarantees 16; larger requests still succeed
+    arena_alloc(size)
+}
+
+/// Exact-shape `__rust_alloc_zeroed`.
+///
+/// # Safety
+/// Device side only; follows the GlobalAlloc::alloc_zeroed contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "Rust" fn __rust_alloc_zeroed(size: usize, align: Alignment) -> *mut u8 {
+    let p = __rust_alloc(size, align);
+    if !p.is_null() {
+        let words = size / 8;
+        let base = p as *mut u64;
+        let mut i = 0usize;
+        while i < words {
+            // SAFETY: base covers `size` bytes; i < words stays in bounds.
+            unsafe { core::ptr::write_volatile(base.add(i), 0u64) };
+            i += 1;
+        }
+    }
+    p
+}
+
+/// Exact-shape `__rust_dealloc`.
+///
+/// # Safety
+/// Device side only; follows the GlobalAlloc::dealloc contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "Rust" fn __rust_dealloc(_ptr: NonNull<u8>, _size: usize, _align: Alignment) {
+    // Bump allocator: reclamation happens via reset() between launches.
+}
+
+/// Exact-shape `__rust_realloc`.
+///
+/// # Safety
+/// Device side only; follows the GlobalAlloc::realloc contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "Rust" fn __rust_realloc(
+    ptr: NonNull<u8>,
+    old_size: usize,
+    align: Alignment,
+    new_size: usize,
+) -> *mut u8 {
+    let fresh = __rust_alloc(new_size, align);
+    if !fresh.is_null() {
+        let copy = old_size.min(new_size);
+        core::ptr::copy_nonoverlapping(ptr.as_ptr(), fresh, copy);
+        __rust_dealloc(ptr, old_size, align);
+    }
+    fresh
+}
+
+/// The alloc crate's `alloc()`/`alloc_zeroed()` detection stub, no-op here.
+///
+/// # Safety
+/// No-op; device side only.
+#[unsafe(no_mangle)]
+pub unsafe extern "Rust" fn __rust_no_alloc_shim_is_unstable_v2() {}
+
+/// OOM handler: device abort (same semantic as panic=abort everywhere).
+///
+/// # Safety
+/// Never returns; device side only.
+#[unsafe(no_mangle)]
+pub unsafe extern "Rust" fn __rust_alloc_error_handler(_size: usize, _align: usize) -> ! {
+    unreachable!("device heap exhausted")
 }
