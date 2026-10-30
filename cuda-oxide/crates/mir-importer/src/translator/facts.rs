@@ -1200,3 +1200,17 @@ pub fn reference_validity(
         assert!(!is_emitted_name("second_run_spin"));
     }
 }
+
+// [device heap 2026-10-31] The memset backing symbol that the collector
+// actually emitted (its FQDN depends on the defining crate, which varies
+// between the standalone example and batch variants). The importer's
+// write_bytes dispatch arm reads this to name the call.
+static MEMSET_SYMBOL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub(crate) fn record_memset_symbol(name: &str) {
+    let _ = MEMSET_SYMBOL.set(name.to_string());
+}
+
+pub(crate) fn memset_symbol() -> Option<&'static str> {
+    MEMSET_SYMBOL.get().map(|s| s.as_str())
+}

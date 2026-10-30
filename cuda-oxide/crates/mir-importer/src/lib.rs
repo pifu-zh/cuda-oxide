@@ -113,5 +113,15 @@ pub use pipeline::{
 };
 pub use translator::cute::is_cute_compiler_hook_path;
 pub use translator::facts::KnownDefs;
+
+/// [device heap] Records the memset backing symbol the collector emitted.
+pub fn record_memset_symbol(name: &str) {
+    translator::facts::record_memset_symbol(name);
+}
+
+/// [device heap] The memset backing symbol, if collected.
+pub fn memset_symbol() -> Option<&'static str> {
+    translator::facts::memset_symbol()
+}
 pub use translator::terminator::drop_glue::{drop_glue_is_noop, drop_instance_is_noop};
 pub use translator::terminator::is_panic_entry_path;

@@ -1334,7 +1334,7 @@ fn translate_call(
             ctx,
             body,
             legaliser
-                .legalise("device_heap::__cuda_device_memset_u8")
+                .legalise(crate::translator::facts::memset_symbol().unwrap_or("__cuda_device_memset_u8"))
                 .as_ref(),
             args,
             destination,

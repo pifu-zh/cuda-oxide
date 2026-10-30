@@ -2046,8 +2046,7 @@ impl<'tcx> DeviceCollector<'tcx> {
         if fn_path.ends_with("::write_bytes") {
             if let Some(def_id) = self.find_local_memset_def() {
                 let instance = Instance::mono(self.tcx, def_id);
-                let name = self.fqdn(instance);
-                let export_name = self.compute_export_name(&name, instance);
+                let export_name = "__cuda_device_memset_u8".to_string();
                 let mangled = self.tcx.symbol_name(instance).name.to_string();
                 self.discovery.insert(
                     mangled.clone(),
@@ -2436,15 +2435,14 @@ impl<'tcx> DeviceCollector<'tcx> {
             && bare_symbol == "write_bytes"
             && let Some(def_id) = self.find_local_memset_def()
         {
-            if self.verbose {
-                eprintln!("[collector] write_bytes → enqueue memset backing");
-            }
             // [device heap] write_bytes → our memset backing: enqueue the
             // local definition so the importer's symbol-level call finds a
             // mir.func in-module.
             let instance = Instance::mono(self.tcx, def_id);
-            let name = self.fqdn(instance);
-            let export_name = self.compute_export_name(&name, instance);
+            let export_name = "__cuda_device_memset_u8".to_string();
+            if self.verbose {
+                eprintln!("[collector] write_bytes → enqueue memset backing as {export_name:?}");
+            }
             let mangled = self.tcx.symbol_name(instance).name.to_string();
             self.seen.insert(mangled);
             self.used_export_names.insert(export_name.clone());
@@ -2517,10 +2515,14 @@ impl<'tcx> DeviceCollector<'tcx> {
         // Use FQDN so the export name matches what the MIR translator
         // sees via `CrateDef::name()` on the call side.
         let name = self.fqdn(resolved);
-        if self.verbose && name.contains("rust_alloc") {
-            eprintln!("[collector] normal-path callee name: {name}");
+        let mut export_name = self.compute_export_name(&name, resolved);
+        if name.ends_with("__cuda_device_memset_u8") {
+            // Pin the memset symbol to the bare name: the write_bytes
+            // dispatch arm names its call with the same constant, and the
+            // symbol is unique in the module (single definition).
+            export_name = "__cuda_device_memset_u8".to_string();
+            mir_importer::record_memset_symbol("__cuda_device_memset_u8");
         }
-        let export_name = self.compute_export_name(&name, resolved);
 
         if self.verbose {
             eprintln!("[collector] Discovered callee: {} -> {}", name, export_name);
@@ -2665,7 +2667,10 @@ impl<'tcx> DeviceCollector<'tcx> {
         }
 
         let name = self.fqdn(instance);
-        let export_name = self.compute_export_name(&name, instance);
+        let mut export_name = self.compute_export_name(&name, instance);
+        if name.ends_with("__cuda_device_memset_u8") {
+            export_name = "__cuda_device_memset_u8".to_string();
+        }
 
         if self.verbose {
             eprintln!(

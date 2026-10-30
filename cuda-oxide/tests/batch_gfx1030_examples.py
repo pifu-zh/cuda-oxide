@@ -81,6 +81,8 @@ EXAMPLES = [
     "uninit_const", "unroll_smoke", "volatile_memory", "warp_sums",
     # --- device heap / sync / iterator probes (2026-10-29 纳入) ---
     "runtime_sync", "iterator_adapters",
+    # 设备堆（2026-10-31 解锁：slot map fat-pointer niche 通用化）
+    "device_heap",
     # tcgen05 = sweep_error：Blackwell tensor-core 例（llc 崩溃路径），
     # 属 HARDWARE_LIMITED 范畴，不入批
 ]
@@ -160,7 +162,9 @@ def extract_top_level_items(src: str):
         # 提到 crate 顶层、kernels mod 经 use super::* 引用——缺了它抽取变体
         # 编译失败（E0425）。brace 结构以 "}" 收尾（深度归零），元组结构以
         # ";" 收尾，两种收尾都处理。
-        if re.match(r"^(pub\s+)?(const|static|type|struct|enum)\b", line):
+        if re.match(r"^(pub\s+)?(const|static|type|struct|enum)\b", line) or re.match(
+            r'^(pub\s+)?(unsafe\s+)?(extern\s+"[^"]*"\s+)?fn\b', line
+        ) and ("unsafe(no_mangle)" in "\n".join(lines[max(0, i - 3):i + 1]) or "arena_alloc" in line):
             # 定义行上方连续的 #[..] 属性行随定义一起带走
             # （derive(Copy) 不带走 → E0507，sharedmem V4 实证）
             start = i
