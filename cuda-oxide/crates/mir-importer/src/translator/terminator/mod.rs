@@ -1316,6 +1316,35 @@ fn translate_call(
         }
     }
 
+    // [device heap 2026-10-29] `write_bytes(dst, val, count)` (memset
+    // semantics) is reached through `Vec`'s grow/zeroed paths. Dispatch it
+    // to a symbol-level call against `__cuda_device_memset_u8`, whose
+    // definition lives in cuda-device::heap (volatile u8 loop, collected
+    // via DeviceAlloc's allocation path). Everything else about the call
+    // (destination, targets) is unchanged, so the regular-call tail below
+    // handles it verbatim under the rewritten symbol.
+    if let Some(ref name) = pattern_name
+        && (name == "core::intrinsics::write_bytes"
+            || name == "std::intrinsics::write_bytes")
+    {
+        let return_type = types::translate_destination_type(ctx, body, destination, &loc)?;
+        return helpers::emit_function_call(
+            ctx,
+            body,
+            "__cuda_device_memset_u8",
+            args,
+            destination,
+            return_type,
+            None,
+            &target_usize,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+        );
+    }
+
     // A call to a rustc intrinsic that no dispatch arm above recognized can
     // never be emitted as a regular function call: rustc resolves intrinsics
     // to `InstanceKind::Intrinsic`, the collector skips those by design, so

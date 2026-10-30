@@ -926,13 +926,24 @@ const MISSING_DEVICE_STUB_MARKER: &str = "called outside #[kernel] / #[device]";
 /// list is the single switch point to revisit if a device allocator ever
 /// lands.
 fn rust_alloc_shim_name(fn_path: &str) -> Option<&str> {
-    const SHIMS: [&str; 6] = [
+    // [device heap 2026-10-29] `handle_alloc_error` was removed from this
+    // list: it is the OOM *reporter* (a normal alloc-crate function with a
+    // MIR body), not an allocation entry point. Its body calls
+    // `__rust_alloc_error_handler`, which a crate-local
+    // `#[global_allocator]` (cuda-device::heap::DeviceAlloc) generates as
+    // local definitions — the walk proceeds through it correctly and the
+    // local stand-down covers the handler. Keeping it here would reject
+    // the Box::new error path even under a real allocator.
+    // [device heap 2026-10-29] `handle_alloc_error` (OOM reporter with a
+    // MIR body) and `__rust_no_alloc_shim_is_unstable_v2` (the alloc()
+    // detection stub, no-op on device via cuda-device::heap) are also
+    // removed: neither is an allocation entry point, and both resolve by
+    // symbol name once a `#[global_allocator]` (DeviceAlloc) is declared.
+    const SHIMS: [&str; 4] = [
         "__rust_alloc",
         "__rust_alloc_zeroed",
         "__rust_dealloc",
         "__rust_realloc",
-        "__rust_no_alloc_shim_is_unstable_v2",
-        "handle_alloc_error",
     ];
     let last = fn_path.rsplit("::").next().unwrap_or(fn_path);
     // None of these names is actually reserved: a user may legally define
@@ -1422,6 +1433,14 @@ struct DeviceCollector<'tcx> {
     warned_dynamic_shared_array: bool,
     /// Print progress to stderr.
     verbose: bool,
+    /// Lazily-built index of local allocator-shim definitions: shim
+    /// suffix name -> local DefId. Populated on the first guard hit by
+    /// scanning the local crate's MIR bodies (a crate-local
+    /// `#[global_allocator]` generates exactly these). Presence = the
+    /// allocator contract has been taken over locally; the guard then
+    /// stands down for that shim and the local definition is enqueued so
+    /// its body is emitted into the module.
+    local_shim_defs: Option<std::collections::HashMap<&'static str, DefId>>,
 }
 
 impl<'tcx> DeviceCollector<'tcx> {
@@ -1437,6 +1456,7 @@ impl<'tcx> DeviceCollector<'tcx> {
             seen_device_externs: HashSet::new(),
             warned_dynamic_shared_array: false,
             verbose,
+            local_shim_defs: None,
         }
     }
 
@@ -2143,10 +2163,64 @@ impl<'tcx> DeviceCollector<'tcx> {
         // user is free to define their own fn named `__rust_alloc` (the
         // name is not reserved), and that compiles for the device like any
         // other function, so local definitions must not trip the guard.
+        // Only sysroot functions can be the real allocator entry points.
+        // A crate-local `#[global_allocator]` (DeviceAlloc in
+        // cuda-device::heap) generates local shim definitions with local
+        // DefIds, which the is_local check stands down for — the supported
+        // escape hatch (device heap, 2026-10-29).
         if !resolved.def_id().is_local()
             && let Some(shim) = rust_alloc_shim_name(&raw_name)
         {
-            self.report_heap_allocation(shim, caller, &callee_ctx);
+            // [device heap 2026-10-29] A crate-local `#[global_allocator]`
+            // (cuda-device::heap::DeviceAlloc) generates shim definitions
+            // as LOCAL fns. rustc's call resolution still points the alloc
+            // crate's extern-block sites at the extern decls (non-local),
+            // so the guard must consult the local definitions explicitly:
+            // if a local fn whose symbol matches the shim exists, the
+            // allocator contract has been taken over — stand down and
+            // enqueue the local definition so its body is emitted (the
+            // extern decl then links to it).
+            if self.local_shim_defs.is_none() {
+                let mut map = std::collections::HashMap::new();
+                for local in self.tcx.mir_keys(()) {
+                    let def_id = local.to_def_id();
+                    if !matches!(self.tcx.def_kind(def_id), rustc_hir::def::DefKind::Fn) {
+                        continue;
+                    }
+                    let instance = Instance::mono(self.tcx, def_id);
+                    let symbol = self.tcx.symbol_name(instance).name.to_string();
+                    for shim in ["__rust_alloc", "__rust_alloc_zeroed", "__rust_dealloc",
+                                 "__rust_realloc", "__rust_alloc_error_handler"] {
+                        if symbol.ends_with(shim) {
+                            map.insert(shim, def_id);
+                        }
+                    }
+                }
+                self.local_shim_defs = Some(map);
+            }
+            let local_override = self
+                .local_shim_defs
+                .as_ref()
+                .is_some_and(|m| m.contains_key(shim));
+            if local_override {
+                if let Some(def_id) =
+                    self.local_shim_defs.as_ref().and_then(|m| m.get(shim)).copied()
+                {
+                    let instance = Instance::mono(self.tcx, def_id);
+                    let mangled = self.tcx.symbol_name(instance).name.to_string();
+                    let export_name = sanitize_ptx_name(&mangled);
+                    self.discovery.insert(mangled.clone(), callee_ctx.clone());
+                    self.seen.insert(mangled);
+                    self.used_export_names.insert(export_name.clone());
+                    self.worklist.push_back(CollectedFunction {
+                        instance,
+                        is_kernel: false,
+                        export_name,
+                    });
+                }
+            } else {
+                self.report_heap_allocation(shim, caller, &callee_ctx);
+            }
         }
 
         if is_ptx_asm_marker_path(&raw_name) {

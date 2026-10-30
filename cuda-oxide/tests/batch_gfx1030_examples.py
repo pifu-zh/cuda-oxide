@@ -79,6 +79,8 @@ EXAMPLES = [
     "switchint_128bit", "transmute_scalar_struct", "tuple_array_provenance",
     "tuple_constant_provenance", "tuple_field_lookup", "unaligned_memory",
     "uninit_const", "unroll_smoke", "volatile_memory", "warp_sums",
+    # --- device heap / sync / iterator probes (2026-10-29 纳入) ---
+    "runtime_sync", "iterator_adapters",
     # tcgen05 = sweep_error：Blackwell tensor-core 例（llc 崩溃路径），
     # 属 HARDWARE_LIMITED 范畴，不入批
 ]

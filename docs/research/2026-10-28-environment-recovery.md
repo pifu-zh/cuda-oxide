@@ -164,3 +164,36 @@ cd .. && CUDA_OXIDE_TARGET=gfx1030 cargo oxide run printf
 - printf 例（重组栈）：exit=0，>7 参链式行精确正确；部分旧行乱码见上节
   定性
 - 后端 .so：rust-lld 构建，无 zig unwinder 污染；最小文件 rustc 加载不崩
+
+## 设备堆工程记录（2026-10-29/30，五层攻坚）
+
+**目标**：解锁内核内 `Vec`/`String`/`Box`（设备堆族）。机制选型：语言原生
+`#[global_allocator]`（展开生成 local shim DefIds，collector sysroot 守卫
+is_local 自动放行），比改守卫白名单或手写 extern shim 更符合语言语义。
+
+**已落地**（adapts collector + cuda-device + mir-importer）：
+1. `cuda-device::heap`：`DeviceAlloc`(GlobalAlloc) + 256 MiB 静态 bump
+   arena（16 对齐、atomic cursor、dealloc no-op + reset 复用、volatile
+   零填充避开未支持的 write_bytes intrinsic）。
+2. collector 守卫精准化：`handle_alloc_error`（OOM 报告器，有 MIR 体）与
+   `__rust_no_alloc_shim_is_unstable_v2`（检测桩）移出 SHIMS 拦截清单
+   ——两者皆非分配入口，且桩有 no-op 设备定义。
+3. mir-importer write_bytes intrinsic 分发臂：符号级 call →
+   `__cuda_device_memset_u8`（cuda-device::heap 提供 volatile 循环
+   backing，经 DeviceAlloc::alloc 恒真分支保证收集）。
+4. foreign ABI 权威降级机制已实现（is_emitted_name 查询）——见第五层。
+
+**第五层缺口（BLOCKED→IMPLEMENTABLE）**：`#[global_allocator]` 生成的
+local shim（`__rust_alloc_zeroed` 等，bin crate local DefId，已入队收集）
+符号与 alloc crate 调用站点的 foreign 权威组合，验证器两连拒：
+- "call to an in-module mir.func must not claim external ABI authority"
+  → 已实现 is_emitted_name 降级修复；
+- 降级后 → "MirCallOp argument 0 type does not match callee signature"：
+  NonZero/Alignment 结构在调用点与 callee 签名两处各自翻译，结构等价但
+  类型句柄不同——需要导入器类型系统的结构化统一（dedup by structural
+  type），属 MIR 类型系统的深水区。
+
+**负例回归**：device_alloc_reject（无 allocator 时）保持编译期 fail-loud。
+
+**复现**：device_heap 例（五段断言就绪）——第五层修复后直接
+`cargo oxide run device_heap` 验证。
