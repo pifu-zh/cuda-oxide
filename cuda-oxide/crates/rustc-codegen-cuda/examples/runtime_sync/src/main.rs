@@ -26,8 +26,7 @@
 
 use cuda_core::simt::LaunchConfig;
 use cuda_core::{CudaContext, DeviceBuffer};
-use cuda_device::thread;
-use cuda_macros::kernel;
+use cuda_device::{kernel, thread};
 use cuda_host::cuda_module;
 
 #[cuda_module]

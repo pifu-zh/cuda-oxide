@@ -102,13 +102,13 @@ pub unsafe extern "Rust" fn __rust_no_alloc_shim_is_unstable_v2() {}
 /// # Safety
 /// `dst` must be valid for `count` bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "Rust" fn __cuda_device_memset_u8(dst: *mut u8, val: u8, count: usize) {
+pub unsafe extern "Rust" fn __cuda_device_memset_u8(dst: *mut u8, val: u8, count: usize) { unsafe {
     let mut i = 0usize;
     while i < count {
         core::ptr::write_volatile(dst.add(i), val);
         i += 1;
     }
-}
+}}
 
 /// The device global allocator: bump allocation over [`HEAP_BYTES`].
 ///
@@ -143,9 +143,9 @@ unsafe impl GlobalAlloc for DeviceAlloc {
         // definitions are collected into the device module: alloc crate
         // internals call the same symbols, and the definitions must exist
         // at link time.
-        __rust_no_alloc_shim_is_unstable_v2();
+        unsafe { __rust_no_alloc_shim_is_unstable_v2() };
         if layout.size() == usize::MAX {
-            __cuda_device_memset_u8(core::ptr::null_mut(), 0, 0);
+            unsafe { __cuda_device_memset_u8(core::ptr::null_mut(), 0, 0) };
         }
         let size = align_up(layout.size().max(1));
         let old = HEAP_CURSOR.fetch_add(size, Ordering::AcqRel);
@@ -165,7 +165,7 @@ unsafe impl GlobalAlloc for DeviceAlloc {
         // Bump allocator: reclamation happens via reset() between launches.
     }
 
-    unsafe fn realloc(&self, ptr: *mut u8, old_layout: Layout, new_size: usize) -> *mut u8 {
+    unsafe fn realloc(&self, ptr: *mut u8, old_layout: Layout, new_size: usize) -> *mut u8 { unsafe {
         let new_layout = Layout::from_size_align_unchecked(new_size, old_layout.align());
         let fresh = self.alloc(new_layout);
         if !fresh.is_null() {
@@ -174,9 +174,9 @@ unsafe impl GlobalAlloc for DeviceAlloc {
             self.dealloc(ptr, old_layout);
         }
         fresh
-    }
+    }}
 
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 { unsafe {
         let p = self.alloc(layout);
         if !p.is_null() {
             // NOTE: core::ptr::write_bytes lowers to the rustc
@@ -192,10 +192,12 @@ unsafe impl GlobalAlloc for DeviceAlloc {
             let base = p as *mut u64;
             let mut i = 0usize;
             while i < words {
-                core::ptr::write_volatile(base.add(i), 0u64);
+                // SAFETY: base covers layout.size() bytes; i < words keeps
+                // the offset in bounds.
+                unsafe { core::ptr::write_volatile(base.add(i), 0u64) };
                 i += 1;
             }
         }
         p
-    }
+    }}
 }
