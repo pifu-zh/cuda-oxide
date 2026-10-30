@@ -3,6 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+// `core::mem::Alignment` is unstable; the shim signatures use the real type
+// so the MIR-level prints match the alloc crate call sites exactly.
+#![feature(ptr_alignment_type)]
+
 //! Device-side heap e2e: Vec/String/Box inside kernels.
 //!
 //! The kernel crate declares a crate-local `#[global_allocator]` pointing
@@ -66,10 +70,7 @@ pub unsafe extern "Rust" fn __cuda_device_memset_u8(dst: *mut u8, val: u8, count
     }
 }
 
-/// Mirror of `core::mem::Alignment` for the shim signatures.
-#[repr(transparent)]
-#[derive(Clone, Copy)]
-pub struct Alignment(usize);
+use core::mem::Alignment;
 
 /// Bump-allocate `size` bytes (16-aligned) from the device arena.
 unsafe fn arena_alloc(size: usize) -> *mut u8 {

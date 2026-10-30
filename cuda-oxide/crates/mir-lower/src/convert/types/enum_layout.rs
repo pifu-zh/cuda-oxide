@@ -410,7 +410,15 @@ pub(crate) fn build_enum_slot_map(
             // bits, which stays fail-closed; `OverArrayLeafBound` reports the
             // same bounded rewrite contract as the payload storage gate.
             let extra_pointer_claims = if has_pointer_overlap {
-                match analyze_pointer_overlap(ctx, offset, size, storage_ty, &colliding_claims) {
+                match analyze_pointer_overlap(
+                    ctx,
+                    offset,
+                    size,
+                    storage_ty,
+                    &colliding_claims,
+                    layout_kind == EnumLayoutKind::Niche
+                        || layout_kind == EnumLayoutKind::Direct,
+                ) {
                     Ok(extra) => extra,
                     Err(PointerOverlapRejection::OverArrayLeafBound { required }) => {
                         return Err(anyhow::anyhow!(
@@ -421,9 +429,19 @@ pub(crate) fn build_enum_slot_map(
                     }
                     Err(PointerOverlapRejection::ProvenanceLoss) => {
                         return Err(anyhow::anyhow!(
-                            "enum slot map: `{}` has overlapping pointer and non-identical storage at byte {}; refusing to erase LLVM pointer provenance",
+                            "enum slot map: `{}` (layout {:?}) has overlapping pointer and non-identical storage at byte {}; refusing to erase LLVM pointer provenance (incoming field {} storage-llvm {}, claims-llvm {:?})",
                             name,
-                            offset
+                            layout_kind,
+                            offset,
+                            flat,
+                            {
+                                use pliron::printable::Printable;
+                                storage_ty.disp(ctx).to_string()
+                            },
+                            claims.iter().map(|(o, s, t)| {
+                                use pliron::printable::Printable;
+                                format!("({o},{s},{})", t.disp(ctx).to_string())
+                            }).collect::<Vec<_>>()
                         ));
                     }
                 }
@@ -1162,6 +1180,63 @@ mod tests {
     }
 
     #[test]
+
+    #[test]
+    fn enum_slot_map_result_non_null_alloc_error_fat_pointer_niche() {
+        let mut ctx = make_ctx();
+        let logical = mir_uint(&mut ctx, 8);
+        let u8_ty = mir_uint(&mut ctx, 8);
+        let pointer: TypeHandle = MirPtrType::get_generic(&mut ctx, u8_ty, false).into();
+        // NonNull<[u8]>: {ptr, len} fat pointer, 16 bytes.
+        let non_null: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "NonNullU8Slice".into(),
+            vec!["pointer".into(), "len".into()],
+            vec![pointer, logical],
+            vec![0, 1],
+            vec![0, 8],
+            16,
+            8,
+        )
+        .into();
+        // AllocError is a ZST.
+        let alloc_error: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "AllocError".into(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            0,
+            1,
+        )
+        .into();
+        let enum_ty: TypeHandle = MirEnumType::get_with_encoding(
+            &mut ctx,
+            "AllocResult".into(),
+            logical,
+            vec![0, 1],
+            vec![
+                EnumVariant::new_with_layout("Ok".into(), vec![non_null], vec![0], vec![16]),
+                EnumVariant::new_with_layout("Err".into(), vec![alloc_error], vec![0], vec![0]),
+            ],
+            EnumEncoding {
+                tag_offset: 0,
+                total_size: 16,
+                abi_align: 8,
+                layout_kind: EnumLayoutKind::Niche,
+                carrier_kind: EnumCarrierKind::Pointer,
+                carrier_width: 64,
+                untagged_variant: 0,
+                variant_inhabited: vec![1, 1],
+                ..EnumEncoding::default()
+            },
+        )
+        .into();
+        let map = build_enum_slot_map(&mut ctx, enum_ty).unwrap();
+        assert_eq!(map.carrier_slot, Some(0));
+    }
+
     fn enum_slot_map_keeps_plain_pointer_niche_in_one_pointer_slot() {
         let mut ctx = make_ctx();
         let logical = mir_uint(&mut ctx, 8);

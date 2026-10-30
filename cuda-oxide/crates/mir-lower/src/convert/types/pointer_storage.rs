@@ -10,6 +10,7 @@ use pliron::context::Context;
 use pliron::r#type::TypeHandle;
 
 use super::llvm_type_size_align;
+use super::super::types::llvm_type_is_byte_faithful;
 use crate::convert::enum_payload_storage::MAX_ENUM_PAYLOAD_ARRAY_REWRITE_LEAVES;
 
 pub(super) fn llvm_type_contains_pointer(ctx: &Context, ty: TypeHandle) -> bool {
@@ -232,6 +233,7 @@ pub(super) fn analyze_pointer_overlap(
     incoming_size: u64,
     incoming_ty: TypeHandle,
     colliding_claims: &[&(u64, u64, TypeHandle)],
+    is_niche_layout: bool,
 ) -> std::result::Result<Vec<LlvmPointerStorage>, PointerOverlapRejection> {
     use PointerOverlapRejection::ProvenanceLoss;
 
@@ -258,6 +260,58 @@ pub(super) fn analyze_pointer_overlap(
     // also carries at the same offset/size/address space; otherwise a pointer
     // slot would be backed by non-matching bytes (an address-space mismatch, or
     // a pointer claim where the field has integer bits).
+    //
+    // [fat-pointer niche 2026-10-31] `Result<NonNull<[u8]>, AllocError>`-shaped
+    // enums: one variant's field occupies the same byte range (same offset AND
+    // size) as another variant's pointer-bearing claim, and the incoming field
+    // is byte-faithful. This is Rust's niche layout contract — the same
+    // storage carries the Ok payload (integer view) and the Err discriminant
+    // (pointer==null view) — so the interpretations coexist: pointer claims
+    // stay for the niche-reading variant; the incoming integer leaves claim
+    // the bytes for the payload variant. Requires the full-range match so a
+    // partial overlap still fails closed.
+    let exact_shaped_niche = is_niche_layout
+        && colliding_claims.iter().any(|&&(o, s, _)| {
+            o == incoming_offset && s == incoming_size
+        });
+    if exact_shaped_niche {
+        let incoming_end = incoming_offset
+            .checked_add(incoming_size)
+            .ok_or(ProvenanceLoss)?;
+        let incoming_is_bf = llvm_type_is_byte_faithful(ctx, incoming_ty);
+        let claims_are_bf = colliding_claims
+            .iter()
+            .all(|&&(o, s, claim_ty)| {
+                o < incoming_end
+                    && incoming_offset < o.checked_add(s).unwrap_or(u64::MAX)
+                    && llvm_type_is_byte_faithful(ctx, claim_ty)
+            });
+        // A pure pointer-vs-pure-integer pun of the same shape stays
+        // rejected: the niche contract needs the colliding claim to carry
+        // NON-pointer payload alongside its pointer leaf (the fat-pointer
+        // length), not a bare pointer the incoming view reinterprets as
+        // integers.
+        let claim_has_non_pointer_span = colliding_claims.iter().any(|&&(o, s, claim_ty)| {
+            let mut probe = Vec::new();
+            let _ = collect_llvm_pointer_storage(ctx, claim_ty, o, &mut probe);
+            let pointer_bytes: u64 = probe.iter().map(|leaf| leaf.size).sum();
+            pointer_bytes > 0 && pointer_bytes < s
+        });
+        if incoming_is_bf && claims_are_bf && claim_has_non_pointer_span {
+            let mut extra = Vec::new();
+            for leaf in &existing {
+                let covered = leaf.offset >= incoming_offset
+                    && leaf.offset.checked_add(leaf.size).is_some_and(|end| end <= incoming_end);
+                if !covered {
+                    return Err(ProvenanceLoss);
+                }
+                // The pointer leaf's bytes are inside the incoming field: the
+                // niche-reading variant keeps its `ptr` slot, and the incoming
+                // integer view writes the same bytes — no extra slot needed.
+            }
+            return Ok(extra);
+        }
+    }
     for leaf in &existing {
         if !incoming.contains(leaf) {
             return Err(ProvenanceLoss);

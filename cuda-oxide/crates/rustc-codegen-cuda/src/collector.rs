@@ -1661,8 +1661,22 @@ impl<'tcx> DeviceCollector<'tcx> {
                 }
             }
         }
+        if self.verbose {
+            eprintln!("[collector] CGU miss for {bare}; trying crate roots");
+        }
         // 2) cuda-device crate root children (no_mangle shims live there;
         //    rustc keeps them in the defining crate's own CGU).
+        // Kernel-crate-local shims: root module children of LOCAL_CRATE.
+        for child in self.tcx.module_children(LOCAL_CRATE.as_def_id()).iter() {
+            let Some(did) = child.res.opt_def_id() else { continue };
+            if !matches!(self.tcx.def_kind(did), rustc_hir::def::DefKind::Fn) {
+                continue;
+            }
+            let name = self.tcx.item_name(did);
+            if name.as_str() == bare {
+                return Some(Instance::mono(self.tcx, did));
+            }
+        }
         for krate in self.tcx.crates(()) {
             if !matches!(self.tcx.crate_name(*krate).as_str(), "cuda_device" | "cuda-device") {
                 continue;
@@ -2411,7 +2425,13 @@ impl<'tcx> DeviceCollector<'tcx> {
         // body instead of a dangling extern.
         let bare_symbol = raw_name.rsplit("::").next().unwrap_or(&raw_name).to_string();
         let is_device_runtime_symbol = rust_alloc_shim_name(&raw_name).is_some()
-            || bare_symbol == "__cuda_device_memset_u8";
+            || bare_symbol == "__cuda_device_memset_u8"
+            || bare_symbol == "__rust_no_alloc_shim_is_unstable_v2";
+        if self.verbose && bare_symbol.starts_with("__rust_no_alloc") {
+            eprintln!("[collector] forward-check: raw={raw_name} mir_avail={} shim={}",
+                self.tcx.is_mir_available(resolved.def_id()),
+                rust_alloc_shim_name(&raw_name).is_some());
+        }
         if !self.tcx.is_mir_available(resolved.def_id())
             && bare_symbol == "write_bytes"
             && let Some(def_id) = self.find_local_memset_def()
@@ -2439,9 +2459,10 @@ impl<'tcx> DeviceCollector<'tcx> {
             && is_device_runtime_symbol
         {
             if let Some(def_instance) = self.find_cgu_definition_for_symbol(&bare_symbol) {
-                let mangled = self.tcx.symbol_name(def_instance).name.to_string();
-                let fq_name = self.fqdn(def_instance);
-                let export_name = self.compute_export_name(&fq_name, def_instance);
+                // Export under the CALL SITE's symbol string (the extern
+                // decl's mangled name) — that is what resolve_call matches.
+                // The definition body itself is the kernel-crate shim.
+                let export_name = sanitize_ptx_name(&mangled);
                 self.discovery.insert(
                     mangled.clone(),
                     DiscoveryCtx {
