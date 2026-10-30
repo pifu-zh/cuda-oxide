@@ -215,3 +215,32 @@ verbose 路径。
 **结论**：Vec/String/Box 族解锁的剩余工作 = enum slot map 对 fat-pointer
 niche（指针+长度对）的通用化——单点、范围明确。fail-closed 保证无误算风险。
 capability 边界注释已写入 device_heap 例（保留全部断言为复现契约）。
+
+## 设备堆第六层：slot map 通用化落地（2026-10-31，device_heap 五段真卡全绿）
+
+analyze_pointer_overlap 新增 exact-shaped niche 分支：
+- 触发条件：layout ∈ {Niche, Direct}；incoming field 与某 colliding claim
+  【同 offset 同 size】；incoming 与 claims 均 byte-faithful；claim 内含
+  【非指针载荷】（指针叶字节和 < claim size，排除纯指针-整数 pun）。
+- 共存语义：指针 claim 保留（niche 读侧 = Err 的 ptr==null 判别），
+  incoming 整数叶覆盖同字节（Ok 载荷写侧）。指针叶必须完全落在
+  incoming 范围内，部分重叠仍 fail-closed。
+- 配套：shim/memset 挪进 kernel crate；cursor/计数器 volatile 化
+  （atomic inline-PTX 'l' 约束 llc-amdgcn 拒绝）；collector 转发收集
+  （extern decl → 同符号定义；write_bytes call 站点直接 enqueue local def）；
+  verifier 双签名校验（external 声明 + in-module mir.func 同存）。
+
+**device_heap 五段真卡全绿**（RX 6950 XT）：heap_vec sum=285 cap=16 /
+heap_string len=6 checksum=633 / heap_box .0=21 .1=11 / heap_realloc
+sum=1 / heap_after_reset 84。Vec/String/Box 整族解锁。
+矩阵与批清单同步（device_heap 入 102 例批）。
+
+## 第六层收尾（2026-10-31，102 例批 device_heap 双维 PASS）
+
+memset 符号曾经三条收集路径（normal callee / standalone root /
+write_bytes 分发）各命名不同——importer 臂只能匹配其一。统一：全部
+enqueue 站点把 memset export 钉为裸常量 "__cuda_device_memset_u8"
+（模块内唯一定义），臂经 facts 钩子（mir_importer::memset_symbol）
+读同一常量。批抽取器扩展：no_mangle fn 与 helper fn（arena_alloc）
+随顶层项抽取。**102 例批最终**：llc-pass 99/102、integrated 99/102
+（device_heap 双维 PASS；3 排除=抽取器局限）。
