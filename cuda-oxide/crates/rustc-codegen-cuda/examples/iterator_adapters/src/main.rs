@@ -48,20 +48,30 @@ mod kernels {
         }
     }
 
-    /// min/max via match (unwrap_or/map_or is the unsupported Fn path).
+    /// min/max via value-shaped unwrap_or: `copied()` converts the
+    /// `Option<&T>` from min/max into `Option<T>`, whose unwrap_or dispatches
+    /// through the plain branch (verified on device — the reference-shaped
+    /// `unwrap_or(&0)` form is what routed into Fn-trait dispatch).
     #[kernel]
     pub fn min_max(data: &[u32], out: &mut [u32]) {
         let tid = thread::index_1d().get();
         if tid == 0 {
-            let min = match data.iter().min() {
-                Some(&v) => v,
-                None => 0,
-            };
-            let max = match data.iter().max() {
-                Some(&v) => v,
-                None => 0,
-            };
+            let min: u32 = data.iter().min().copied().unwrap_or(0);
+            let max: u32 = data.iter().max().copied().unwrap_or(0);
             out[0] = min.wrapping_mul(1_000_000).wrapping_add(max);
+        }
+    }
+
+    /// map_or + unwrap_or_else with value-shaped/non-capturing closures
+    /// (2026-10-31: verified working on device — the earlier "Fn-trait
+    /// dispatch rejected" boundary applies to reference-shaped defaults).
+    #[kernel]
+    pub fn map_or_probe(data: &[u32], out: &mut [u32]) {
+        let tid = thread::index_1d().get();
+        if tid == 0 {
+            let via_map_or: u32 = data.first().map_or(9, |&v| v.wrapping_add(1));
+            let via_else: u32 = data.first().copied().unwrap_or_else(|| 42);
+            out[0] = via_map_or.wrapping_mul(1_000).wrapping_add(via_else);
         }
     }
 
@@ -134,6 +144,11 @@ mod host_ref {
         let max = data.iter().max().copied().unwrap_or(0);
         min.wrapping_mul(1_000_000).wrapping_add(max)
     }
+    pub fn map_or_probe(data: &[u32]) -> u32 {
+        let via_map_or: u32 = data.first().map_or(9, |&v| v.wrapping_add(1));
+        let via_else: u32 = data.first().copied().unwrap_or_else(|| 42);
+        via_map_or.wrapping_mul(1_000).wrapping_add(via_else)
+    }
     pub fn filter_count(data: &[u32], threshold: u32) -> u32 {
         data.iter().filter(|&&x| x > threshold).count() as u32
     }
@@ -196,6 +211,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     out.copy_to_host(&s0, &mut host_out)?;
     s0.synchronize()?;
     check("min_max", host_out[0], host_ref::min_max(&data))?;
+
+    // SAFETY: as above.
+    unsafe { module.map_or_probe((s0).as_ref(), cfg, &dev, &mut out) }?;
+    out.copy_to_host(&s0, &mut host_out)?;
+    s0.synchronize()?;
+    check("map_or_probe", host_out[0], host_ref::map_or_probe(&data))?;
 
     // SAFETY: as above.
     unsafe { module.filter_count((s0).as_ref(), cfg, &dev, 6, &mut out) }?;
