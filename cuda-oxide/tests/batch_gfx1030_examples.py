@@ -80,7 +80,8 @@ EXAMPLES = [
     "tuple_constant_provenance", "tuple_field_lookup", "unaligned_memory",
     "uninit_const", "unroll_smoke", "volatile_memory", "warp_sums",
     # --- device heap / sync / iterator probes (2026-10-29 纳入) ---
-    "runtime_sync", "iterator_adapters",
+    "runtime_sync", "iterator_adapters", "iter_enum_fold", "iter_unwrap_or_probe",
+    "device_heap",
     # 设备堆（2026-10-31 解锁：slot map fat-pointer niche 通用化）
     "device_heap",
     # tcgen05 = sweep_error：Blackwell tensor-core 例（llc 崩溃路径），

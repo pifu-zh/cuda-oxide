@@ -1230,6 +1230,14 @@ pub(super) fn translate_struct_constant_from_alloc(
         );
     }
 
+    // [enumerate-fold 2026-10-31] Closure-typed struct constants (Enumerate::
+    // fold carries its closure state as a struct constant) have no ADT
+    // metadata. Their bytes are zero at constant-evaluation time — the real
+    // closure state is live MIR locals, not constant data — so synthesize the
+    // value from the dialect type's field layout instead of rejecting.
+    if let TyKind::RigidTy(RigidTy::Closure(_, _)) = rust_ty.kind() {
+        return translate_zero_sized_constant_value(ctx, const_ty_ptr, block_ptr, prev_op, loc);
+    }
     let (adt_def, substs) = match rust_ty.kind() {
         TyKind::RigidTy(RigidTy::Adt(adt_def, substs)) => (adt_def, substs),
         other => {
