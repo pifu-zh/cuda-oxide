@@ -262,3 +262,18 @@ enum_fold_sum）；iter_unwrap_or_probe、iter_enum_fold 独立探针入批；
 102 例批双维 99/102（device_heap 双维 PASS）→ 104/105 例批 101/105
 （env 脚本化后环境重置免疫）。批清单 +5 例（device_heap/runtime_sync/
 iterator_adapters/iter_enum_fold/iter_unwrap_or_probe）。
+
+## rocprofiler 深挖收束（2026-10-31 第二轮，strace + 官方 hsa 复测）
+
+官方 hsa-rocr（含 rocprofiler-register NEEDED）切换后复测：
+- tool 初始化时长 0.00007s → 0.0014s（真实挂载，glog 确认）；
+- 四模式（kernel/hip/sys/runtime-trace）+ csv 显式格式 + -d 输出目录
+  仍零输出零文件；手动 LD_PRELOAD tool 同样静默；
+- strace -f ioctl：app 正常运行（GPU 执行 0.5s），无被拒 kfd ioctl；
+- rocprofv2 legacy 路线段错误（aqlprofile64 + register 同路径）。
+
+**判定不变**：抓取通道需驱动侧 perf 事件支持（root / amdgpu.perfmon=1），
+且 hsa-rocr→rocprofiler-sdk 的回调通告在重组栈上仍静默——非依赖缺失
+（ldd 全解析、register 单例共享、官方 hsa-rocr 已通告）。fail-closed，
+无误算风险。§8 计数器归因以 **HIP 事件对**（scripts/perf_events_attribution.c，
+真卡验证 FFMA 21.39 TFLOPS=理论 99.5%）作为替代证据链。
