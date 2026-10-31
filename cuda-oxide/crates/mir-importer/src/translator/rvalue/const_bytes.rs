@@ -1520,12 +1520,14 @@ pub(super) fn translate_zero_sized_constant_value(
     }
 
     let zero_sized_kind = {
-        let ty_ref = ty_ptr.deref(ctx);
-        if ty_ref.is::<dialect_mir::types::MirStructType>() {
+        if ty_ptr.deref(ctx).is::<dialect_mir::types::MirStructType>() {
             ZeroSizedKind::Struct
-        } else if ty_ref.is::<dialect_mir::types::MirUnionType>() {
+        } else if ty_ptr.deref(ctx).is::<dialect_mir::types::MirUnionType>() {
             ZeroSizedKind::Union
-        } else if let Some(tuple_ty) = ty_ref.downcast_ref::<dialect_mir::types::MirTupleType>() {
+        } else if let Some(tuple_ty) = ty_ptr
+            .deref(ctx)
+            .downcast_ref::<dialect_mir::types::MirTupleType>()
+        {
             if tuple_ty.get_types().is_empty() {
                 ZeroSizedKind::EmptyTuple
             } else {
@@ -1536,11 +1538,56 @@ pub(super) fn translate_zero_sized_constant_value(
             }
         } else {
             ZeroSizedKind::Unsupported(format!(
-                "Zero-sized constant synthesis does not support type {:?}",
-                ty_ref
+                "Zero-sized constant synthesis does not support type {ty_ptr:?}"
             ))
         }
     };
+
+    // [enumerate-fold 2026-10-31] Integer constants synthesized on the
+    // closure-fallback path (Enumerate::fold state): emit a zero
+    // MirConstant of the same width -- the walk supplies real values through
+    // the enclosing struct's field translation.
+    if ty_ptr
+        .deref(ctx)
+        .downcast_ref::<pliron::builtin::types::IntegerType>()
+        .is_some()
+    {
+        let int_attr = pliron::builtin::attributes::IntegerAttr::new(
+            {
+                let width = ty_ptr
+                    .deref(ctx)
+                    .downcast_ref::<pliron::builtin::types::IntegerType>()
+                    .map(|i| i.width())
+                    .unwrap_or(64);
+                let signedness = ty_ptr
+                    .deref(ctx)
+                    .downcast_ref::<pliron::builtin::types::IntegerType>()
+                    .map(|i| i.signedness())
+                    .unwrap_or(Signedness::Unsigned);
+                pliron::builtin::types::IntegerType::get(ctx, width, signedness)
+            },
+            pliron::utils::apint::APInt::from_u128(0, std::num::NonZeroUsize::new(64).unwrap()),
+        );
+        use dialect_mir::ops::MirConstantOp;
+        let op = Operation::new(
+            ctx,
+            MirConstantOp::get_concrete_op_info(),
+            vec![ty_ptr],
+            vec![],
+            vec![],
+            0,
+        );
+        op.deref_mut(ctx).set_loc(loc);
+        let const_op = MirConstantOp::new(op);
+        const_op.set_attr_value(ctx, int_attr);
+        let val = const_op.get_operation().deref(ctx).get_result(0);
+        if let Some(prev) = prev_op {
+            const_op.get_operation().insert_after(ctx, prev);
+        } else {
+            const_op.get_operation().insert_at_front(block_ptr, ctx);
+        }
+        return Ok((val, Some(const_op.get_operation())));
+    }
 
     // A zero-sized struct can still carry (zero-sized) fields in its type, and
     // `MirConstructStructOp` requires one operand per field. Recursively

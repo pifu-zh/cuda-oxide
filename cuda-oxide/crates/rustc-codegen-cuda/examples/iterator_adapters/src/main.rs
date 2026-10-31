@@ -122,6 +122,32 @@ mod kernels {
         }
     }
 
+    /// enumerate + fold + sum: previously the boundary (Enumerate::fold
+    /// builds nested closure struct constants; the Closure-constant
+    /// zero-synthesis fallback in the importer resolves them).
+    #[kernel]
+    pub fn enum_fold(data: &[u32], out: &mut [u32]) {
+        let tid = thread::index_1d().get();
+        if tid == 0 {
+            out[0] = data
+                .iter()
+                .enumerate()
+                .fold(0u32, |acc, (i, &v)| acc + i as u32 + v);
+        }
+    }
+
+    #[kernel]
+    pub fn enum_sum(data: &[u32], out: &mut [u32]) {
+        let tid = thread::index_1d().get();
+        if tid == 0 {
+            out[0] = data
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| i as u32 + v)
+                .sum();
+        }
+    }
+
     /// slice fold WITHOUT enumerate (works; Enumerate::fold does not).
     /// Deliberately not `.sum()`: the fold form is the tested subject.
     #[allow(clippy::unnecessary_fold)]
@@ -170,6 +196,14 @@ mod host_ref {
     }
     pub fn fold_plain(data: &[u32]) -> u32 {
         data.iter().fold(0, |acc, &v| acc + v)
+    }
+    pub fn enum_fold(data: &[u32]) -> u32 {
+        data.iter()
+            .enumerate()
+            .fold(0u32, |acc, (i, &v)| acc + i as u32 + v)
+    }
+    pub fn enum_sum(data: &[u32]) -> u32 {
+        data.iter().enumerate().map(|(i, &v)| i as u32 + v).sum()
     }
 }
 
@@ -249,6 +283,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     out.copy_to_host(&s0, &mut host_out)?;
     s0.synchronize()?;
     check("enum_loop", host_out[0], host_ref::enum_loop(&data))?;
+
+    // SAFETY: as above.
+    unsafe { module.enum_fold((s0).as_ref(), cfg, &dev, &mut out) }?;
+    out.copy_to_host(&s0, &mut host_out)?;
+    s0.synchronize()?;
+    check("enum_fold", host_out[0], host_ref::enum_fold(&data))?;
+
+    // SAFETY: as above.
+    unsafe { module.enum_sum((s0).as_ref(), cfg, &dev, &mut out) }?;
+    out.copy_to_host(&s0, &mut host_out)?;
+    s0.synchronize()?;
+    check("enum_sum", host_out[0], host_ref::enum_sum(&data))?;
 
     // SAFETY: as above.
     unsafe { module.fold_plain((s0).as_ref(), cfg, &dev, &mut out) }?;
