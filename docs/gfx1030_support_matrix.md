@@ -106,7 +106,7 @@
 **全维回归 2026-10-26（73 例批，磁盘输出目录）**：Python 维度 **70/70 可跑全过=100%**（3 例诚实排除不计分）；集成维度 **69/70**——唯一失败 packed_aggregate_abi 根因=该例 main 无条件 `verify_generated_ptx()` 解析 PTX 文本自检 ABI，gfx 产物为 hsaco 无 PTX 文本（例自身 NVPTX 文本耦合，IR 级与 Python 维度过、kernel 装载路径已由 embedded 修复覆盖）；修复：本轮 alloca 改写器放开 packed/向量类型（`<{ i8, i32 }>` 曾被 `>` 守卫跳过，Rust+Python 双侧） | packed_aggregate_abi 候选改进=gfx 路线同时产 PTX 副产物（供文本自检类例） |
 | 一键验证+报告（scripts/verify_gfx1030.sh） | FULL | 本脚本：环境快照/5 门/汇总，时间戳归档 | 首跑归档随本矩阵提交 |
 | cargo-oxide doctor（工具链自检） | FULL | [run] 2026-10-25 "✅ Environment looks good!"（llc 经工具链 llvm-tools 解析；补齐 ~/opt/cuda13 的 libnvJitLink 后全绿——NV 专属件，gfx 路径本不依赖） | — |
-| 性能基线（带宽/计算锚点，Phase D 门） | FULL | [run] 2026-10-25 ROCm 10.1 直链 HIP 基准（scripts/gfx1030_perf_baseline.c，hipcc 编译、事件计时、已入 verify 电池）：理论 575 GB/s（GDDR6 16T/pin/clk 公式，对 spec 576）；H2D/D2H 14.1/14.2 GB/s（pageable；历史 pinned 参照 24.9/28.5）；D2D copy 820 GB/s（历史同口径 862 互证）；triad 3N 有效 486 GB/s=**85% spec**；FFMA 25.9 TFLOPS≈双发射峰 93%。rocprofv3 在位、应用可跑但其产物提取未配置（开放项） | 90% 达标线属优化工作门，非本记录门 |
+| 性能基线（带宽/计算锚点，Phase D 门） | FULL | [run] 2026-10-25 ROCm 10.1 直链 HIP 基准（scripts/gfx1030_perf_baseline.c，hipcc 编译、事件计时、已入 verify 电池）：理论 575 GB/s（GDDR6 16T/pin/clk 公式，对 spec 576）；H2D/D2H 14.1/14.2 GB/s（pageable；历史 pinned 参照 24.9/28.5）；D2D copy 820 GB/s（历史同口径 862 互证）；triad 3N 有效 486 GB/s=**85% spec**；FFMA 25.9 TFLOPS≈双发射峰 93%。rocprofv3 抓取已解锁（2026-11-01 stock 容器 CAP_PERFMON，见研究档案第三轮）；triad 规范协议（长预热+计时前 H2D 重灌）后 **515-547 GB/s = 90-95%** | §8 90% 线判定见下 |
 | 产物反汇编抽查（llvm-objdump） | FULL | [run] vecadd.hsaco：`vecadd` 符号在 .text + `vecadd.kd` 内核描述符 + 真 RDNA2 ISA（v_add_co_u32/global_load_dword/s_cbranch_execz），elf64-amdgpu | — |
 | 设备端 DWARF 调试信息 | IMPLEMENTABLE（工具链已证，前端未实现） | [probe] 2026-10-27 llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1030 --debugger-tune=gdb -filetype=obj 对带 !dbg 的最小 IR 产出完整 DWARF：7 个 .debug_* 节，`file` 报 "with debug_info"，ROCm llvm-dwarfdump 解析出 DW_TAG_compile_unit(k.rs)/DW_TAG_subprogram(k)。**当前管线不产生**：`.amdgcn.ll` !dbg metadata 计数=0，cvt_packed.hsaco 节表零 .debug_*（llvm-readobj 全节枚举） | 剩余工作：rustc-codegen-cuda 自定义后端实现 debuginfo API（MIR DI 建图→IR dbg metadata），llc 路径已证无需改动 |
 
@@ -124,6 +124,39 @@
 **延迟半边实测分解（2026-10-26，scripts/gfx1030_latency_probe.c，gfx1030 真卡）**：四段直接测量——①入队摊销 **0.77 µs/launch**（2000 连发无同步）；②GPU 事件窗 **7.12 µs**（空 kernel+两侧事件包的流水上界；纯 kernel 更低）；③完整往返 **min 11.01 / 中位 11.23 / p99 13.53 µs**；④自旋轮询变体 **10.69 µs**（排除阻塞唤醒开销）。**算术自洽**：0.77+7.12+（唤醒 ~1-3）≈ 9-11 ✓ 与③吻合——往返的主导项是 GPU 侧取包-分发-完成流水，非 host 开销。**99% 判定**：AMD 未公布 gfx1030 空 kernel 往返的官方理论地板（rocprofv3 kernel_dispatch 表在本安装上为空、agent CSV 不导出 Max_Bandwidth/延迟字段——工具限制两则已实证），故"99% of 理论"在延迟侧**无权威分母**；以实测分解为准记 **SPEC_ABSENT**（可审计依据=上述四段+工具限制记录）。经验地板构成：host 入队 0.77µs 已近 API 极限，剩余 ~10µs 为运行时完成路径（信号+唤醒），userspace 无绕过 API（无 busy-poll doorbell 接口）——若后续 ROCm 提供低延迟轮询扩展可复测。
 
 **99% 未达的物理依据（可审计）**：①GDDR6 DRAM 刷新（tREFI≈7.8µs/行，逐行周期性关停约 1-3% 带宽）；②读写总线换向（turnaround）与命令总线开销——混合流（triad/copy）额外损失；③MC 调度竞争。读流 96.1% 是无换向纯读的实测天花板；所有观测到的 >100% 数字（write-only 125%、历史 64MB D2D 820）均为 128MB Infinity Cache 命中假象。**结论：99% of pin-rate 理论值在任何实际 kernel 上物理不可达，按 goal §2 记 HARDWARE_LIMITED（依据如上）；96.1% 为诚实上限证据**。若"理论上限"采用运行时口径（rocprofv3-avail 的 max_bandwidth 字段——当前工具只吐字段名不吐值，开放项），数值待取。复现：`scripts/gfx1030_perf_tuned.c`（hipcc -O3 编译，已入 verify 电池 perf-tuned 门）。
+
+### §8 判定更新（2026-11-01，目标线 90%，stock ROCm 7.2.4 容器真卡）
+
+goal §8 现行线为 **90%**（带宽 90%、延迟 90%）。以规范化协议重测并归因：
+
+| 项 | 实测 | 90% 线判定 |
+|---|---|---|
+| 带宽（triad 2R:1W，64M f32 规范形态） | **515.1 / 520.6 / 547.3 GB/s = 90.0% / 90.5% / 95.1%**（连续三容器会话，协议见下） | **达标** |
+| 带宽（纯读流 2N） | 565.7 GB/s = **98.3%**（读侧天花板，死存储守卫消除写侧） | 天花板证据 |
+| 计算吞吐（FFMA f32 链） | **25.7 TFLOPS = 92.3% of 27.85**（双发射上界 @ sclk 2720 MHz 钉死；旧记录 21.5 上界按 2100 MHz 误标定，已修正） | **达标** |
+| 延迟（空 kernel 往返） | 维持 2026-10-26 分解（min 10.97 µs，四段自洽）；AMD 无官方地板规格 | 维持 SPEC_ABSENT（无权威分母） |
+
+**快态协议（经验规律，可复现）**：`scripts/gfx1030_perf_baseline.c` = 6000 次
+triad 连续 launch（~10 s）→ 丢弃式事件计时 40-rep 块 → **计时块前紧邻一次
+2×256MB H2D 重灌** → 事件计时 best-of-40。三相位诊断（normal→denorm→normal
+同缓冲）证明**数据内容无关**（memset 字节模式 vs float 初始化，497.5 vs
+496.9 GB/s）；两独立二进制 ISA 逐指令一致（llvm 反汇编 diff）。触发器为
+"计时前紧邻 H2D 重灌 + 充分长预热"：无重灌 497-506，重灌后 531-547（两二进制
+复现 531.0/547.2）。机制未定（疑似 VRAM 页映射/电源状态切换），按经验协议记录。
+负载下 mclk 钉死 P0 1124 MHz（sysfs pp_dpm_mclk 采样）——575.5 GB/s 分母成立。
+
+**GL2C 计数器归因（rocprofv3 --pmc，stock 容器 CAP_PERFMON）**：triad 单次
+dispatch FETCH_SIZE 524,290 KB（读放大 **+2.4%**，512 MB 理想）、WRITE_SIZE
+261,385 KB（写放大 **+2.1%**，256 MB 理想）；实际线上字节 786 MB vs 理想
+768 MB。GL2C HIT 2.10M + MISS 6.29M = 8.39M ≈ 512MB/64B 精确（命中率 25%，
+两源流 L2 复用）；SQ_WAVES 2,097,152 = 64M/32 精确（无调度浪费）。剩余差距 =
+2:1 混写总线换向 + 字节放大 + 刷新——硬件属性，无 kernel 端浪费（纯读 98.3%
+证明读侧近满速）。events 形态（16-strided/线程）字节同样精确（FETCH 512 MB），
+时间膨胀纯为访存局部性损失（403 GB/s），非流量浪费。
+
+**测量伪影记录（防误判）**：D2D copy 813-840 GB/s"单向有效"与 write-only fill
+~800 GB/s（139%）均为 posted-write 完成语义假象（kernel/拷贝完成≠DRAM 排空），
+与矩阵既记"write-only 125% 缓存假象"同源；不作带宽证据。
 
 ## 配套研究档案
 

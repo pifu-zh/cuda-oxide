@@ -277,3 +277,38 @@ iterator_adapters/iter_enum_fold/iter_unwrap_or_probe）。
 （ldd 全解析、register 单例共享、官方 hsa-rocr 已通告）。fail-closed，
 无误算风险。§8 计数器归因以 **HIP 事件对**（scripts/perf_events_attribution.c，
 真卡验证 FFMA 21.39 TFLOPS=理论 99.5%）作为替代证据链。
+
+## rocprofiler 第三轮（2026-11-01，stock 容器全链路解锁）
+
+官方镜像 `docker.m.daocloud.io/rocm/dev-ubuntu-24.04:7.2.4-complete`
+（Ubuntu 24.04.4 + ROCm 7.2.4 全栈，HIP 7.2.0/HSA 8.20.4）容器内复测，
+GPU 透传 `--device=/dev/kfd --device=/dev/dri --group-add 44 --group-add 999
+--security-opt seccomp=unconfined`：
+
+1. **kernel/runtime-trace**：可写 CWD（tool 要在 CWD 写 `.rocprofv3` 状态目录，
+   ro 挂载 CWD 上 abort signal 6）→ rc=0，hip_api/kernel/memory_allocation/
+   agent_info CSV 齐全。
+2. **HW 计数器（--pmc）**：需 `--cap-add PERFMON --cap-add SYS_ADMIN`
+   （默认 docker caps 无 CAP_PERFMON——重组栈上的"KFD perf 权限 BLOCKED"
+   实为此墙 + 重组栈缺 register 链路两层）。SQ_WAVES probe、FETCH_SIZE/
+   WRITE_SIZE/GL2C_HIT/MISS/TA_* 全部真实计数（counter_collection CSV）。
+3. **gfx1030 计数器约束**：GL2C 块每 pass ≤4 计数器（12/7/5 组合一律
+   error 38 "Request exceeds the capabilities"，栈对该 agent 不做多 pass
+   拆分）；`SQ_INSTS_*/SQ_WAIT_ANY` 在 avail 列表存在但 agent 上不可采集；
+   派生指标 FETCH_SIZE/WRITE_SIZE（4 桶 KB 表达式）单发可采。
+4. **已知坑**：tool 的 abort signal handler 结束后 app 可能挂死空转
+   （kernels still active）——外层 `timeout` 必备。
+5. 计数器归因产出已入矩阵 §8 更新块（读放大 2.4%/写放大 2.1%/L2 命中 25%/
+   waves 精确）。
+
+**改判**：rocprofiler 抓取层 BLOCKED（重组栈）→ **FULL（stock 栈 +
+容器 caps 条件）**。§8 计数器归因证据链由 HIP 事件对升级为真 HW 计数器。
+
+### §8 收束（同日）
+
+perf_baseline 规范化（长预热 6000 launch + 丢弃计时块 + 计时前 2×256MB
+H2D 重灌）后 triad **515-547 GB/s = 90-95%**（三会话复现）——90% 线**达标**；
+FFMA 口径修正（27.85 TFLOPS 上界 @2720MHz）实测 **92.3%** **达标**。快态
+协议经验规律与伪影记录（posted-write 完成语义）详见矩阵 §8 更新块。
+推翻的中间假设：denormal 数据效应（三相位诊断证伪——实为相位/重灌效应）；
+ffma 21.5 上界（2100 MHz 误标定）。
