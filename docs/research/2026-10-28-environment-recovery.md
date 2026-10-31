@@ -244,3 +244,21 @@ enqueue 站点把 memset export 钉为裸常量 "__cuda_device_memset_u8"
 读同一常量。批抽取器扩展：no_mangle fn 与 helper fn（arena_alloc）
 随顶层项抽取。**102 例批最终**：llc-pass 99/102、integrated 99/102
 （device_heap 双维 PASS；3 排除=抽取器局限）。
+
+## 迭代器边界解锁（2026-10-31，enumerate 链真卡全绿）
+
+两项 IMPLEMENTABLE 收敛：
+1. **Closure-typed struct 常量**：const_alloc 对 Closure 类型合成
+   zero-synthesis fallback（无 ADT 元数据；闭包体在 MIR locals，非常量数据），
+   同路径的 usize 常量发零 MirConstant（同宽）。Enumerate::fold/sum 链、
+   unwrap_or_else 全部真卡通过。
+2. **值形态 Option**：copied() 后 unwrap_or / map_or（值闭包）/
+   unwrap_or_else（非捕获闭包）真卡通过——此前"Fn-trait 分发被拒"的
+   边界实为【引用形态 default】（Option<&T>::unwrap_or(&0)）。match 仍为
+   引用形态的替代。
+
+**验证**：iterator_adapters 八 kernel 逐值全对（新增 map_or_probe、
+enum_fold_sum）；iter_unwrap_or_probe、iter_enum_fold 独立探针入批；
+102 例批双维 99/102（device_heap 双维 PASS）→ 104/105 例批 101/105
+（env 脚本化后环境重置免疫）。批清单 +5 例（device_heap/runtime_sync/
+iterator_adapters/iter_enum_fold/iter_unwrap_or_probe）。
