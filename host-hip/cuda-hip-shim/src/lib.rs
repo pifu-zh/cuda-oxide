@@ -830,6 +830,20 @@ pub unsafe extern "C" fn cuMemHostAlloc(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn cuMemHostRegister_v2(
+    p: *mut c_void,
+    bytesize: usize,
+    flags: u32,
+) -> CUresult {
+    hip!(hipHostRegister(p, bytesize, flags))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn cuMemHostUnregister_v2(p: *mut c_void) -> CUresult {
+    hip!(hipHostUnregister(p))
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn cuMemFree_v2(dptr: CUdeviceptr) -> CUresult {
     hip!(hipFree(dptr as usize as *mut c_void))
 }

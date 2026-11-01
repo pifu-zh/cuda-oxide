@@ -209,6 +209,8 @@ hip_api! {
     hipMallocFromPoolAsync: fn(ptr: *mut *mut c_void, size: usize, pool: HipMemoryPool, stream: HipStream) -> i32;
     hipMallocManaged: fn(ptr: *mut *mut c_void, size: usize, flags: u32) -> i32;
     hipHostAlloc: fn(ptr: *mut *mut c_void, size: usize, flags: u32) -> i32;
+    hipHostRegister: fn(ptr: *mut c_void, size: usize, flags: u32) -> i32;
+    hipHostUnregister: fn(ptr: *mut c_void) -> i32;
     // [PORT gfx1030 PhaseB.1] pinned-host device alias + stream write
     hipHostGetDevicePointer: fn(dptr: *mut *mut c_void, host: *mut c_void, flags: u32) -> i32;
     hipStreamWriteValue32: fn(stream: HipStream, ptr: *mut c_void, value: i32, flags: u32) -> i32;

@@ -100,6 +100,34 @@ int main(int argc_m, char **argv_m) {
     printf("D2D  best %.1f GB/s copy (%.3f ms / 64MB)  [单向有效 = /2]\n",
            gb / (best / 1e3), best);
 
+    /* pinned-host transfers (hipHostMalloc staging): the canonical H2D/D2H
+     * numbers above are pageable; pinned doubles them (~2x, see
+     * pinned_overlap example for the Rust-side chain). */
+    {
+        float *pin = NULL;
+        if (hipHostMalloc((void**)&pin, MB, hipHostMallocDefault) == hipSuccess) {
+            best = 1e9;
+            for (int r = 0; r < REPS; r++) {
+                CK(hipEventRecord(ev0, 0));
+                CK(hipMemcpy(da, pin, MB, hipMemcpyHostToDevice));
+                CK(hipEventRecord(ev1, 0)); CK(hipEventSynchronize(ev1));
+                float ms; CK(hipEventElapsedTime(&ms, ev0, ev1));
+                if (ms < best) best = ms;
+            }
+            printf("H2Dp best %.1f GB/s (pinned staging)\n", gb / (best / 1e3));
+            best = 1e9;
+            for (int r = 0; r < REPS; r++) {
+                CK(hipEventRecord(ev0, 0));
+                CK(hipMemcpy(pin, da, MB, hipMemcpyDeviceToHost));
+                CK(hipEventRecord(ev1, 0)); CK(hipEventSynchronize(ev1));
+                float ms; CK(hipEventElapsedTime(&ms, ev0, ev1));
+                if (ms < best) best = ms;
+            }
+            printf("D2Hp best %.1f GB/s (pinned staging)\n", gb / (best / 1e3));
+            hipHostFree(pin);
+        }
+    }
+
     /* triad: 64M f32 = 256MB buffers, 3 traffic per elem */
     const long long N = N0;
     CK(hipMemset(ta, 1, N * 4)); CK(hipMemset(tb, 2, N * 4));
