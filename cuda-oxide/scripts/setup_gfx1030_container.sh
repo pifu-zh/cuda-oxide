@@ -42,6 +42,10 @@ if [ ! -e /opt/cuda13/targets/x86_64-linux/include/cuda.h ]; then
 fi
 ls /opt/cuda13/targets/x86_64-linux/include/cuda.h
 
+echo "== HOME symlinks: rustup/cargo mounts =="
+ln -sfn /host-rustup /home/ubuntu/.rustup
+ln -sfn /host-cargo /home/ubuntu/.cargo
+
 echo "== hipinfo probe -> /home/ubuntu/bin =="
 mkdir -p /home/ubuntu/bin
 cat > /tmp/hipinfo.c <<'EOF'
