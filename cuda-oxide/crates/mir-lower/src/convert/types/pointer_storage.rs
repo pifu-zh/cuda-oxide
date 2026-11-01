@@ -298,7 +298,7 @@ pub(super) fn analyze_pointer_overlap(
             pointer_bytes > 0 && pointer_bytes < s
         });
         if incoming_is_bf && claims_are_bf && claim_has_non_pointer_span {
-            let mut extra = Vec::new();
+            let extra: Vec<LlvmPointerStorage> = Vec::new();
             for leaf in &existing {
                 let covered = leaf.offset >= incoming_offset
                     && leaf.offset.checked_add(leaf.size).is_some_and(|end| end <= incoming_end);

@@ -312,3 +312,30 @@ FFMA 口径修正（27.85 TFLOPS 上界 @2720MHz）实测 **92.3%** **达标**�
 协议经验规律与伪影记录（posted-write 完成语义）详见矩阵 §8 更新块。
 推翻的中间假设：denormal 数据效应（三相位诊断证伪——实为相位/重灌效应）；
 ffma 21.5 上界（2100 MHz 误标定）。
+
+## 容器优先工作流（2026-11-01，用户指令：host 不再放任何工具链）
+
+又一次环境重置（~/opt 全灭）后，host 侧重组路线退役，改为**容器优先**：
+
+- host 只保留：docker（VPN 代理现端口 7891；GitHub 凭证走 SSH，origin 已切
+  git@github.com:pifu-zh/cuda-oxide.git）、仓库 checkout、~/.cargo+~/.rustup
+  （挂载进容器复用，容器 glibc 兼容 host rustc/cargo/cargo-oxide 二进制）。
+- 常驻容器 `gfx1030-dev`（镜像 rocm/dev-ubuntu-24.04:7.2.4-complete，
+  /repo 挂外层仓库根——SIMT workspace 经 ../cuda-core 引用共享 crate，
+  挂载必须盖住两层）。入口：`cuda-oxide/scripts/gfx1030_container.sh
+  ensure|shell|exec CMD...`；`prepare_gfx1030_env.sh` 变为转发壳。
+- 容器内容物（`setup_gfx1030_container.sh` 幂等重建）：micromamba、
+  conda-forge CUDA 13.4 工具链（/opt/cuda13，bindgen 必需——cargo-oxide
+  对 gfx 路径也硬校验 CUDA 13.0+ 工具链目录）、python3-pytest、hipinfo
+  探针（/home/ubuntu/bin，契约格式 `agent N: gfx1030 (Marketing Name)`）、
+  容器 gcc 重编的后端 dylib。建议 `docker commit` 快照。
+- 容器内已验证：pytest 电池 **12 passed / 3 skipped**（hipinfo/identity/
+  端到端全绿，比 host 时代还干净——无环境残缺项）；`CUDA_OXIDE_TARGET=
+  gfx1030 cargo-oxide run vecadd` 真卡 **1024 元素全对**。环境件全清单：
+  CUDA_TOOLKIT_PATH=/opt/cuda13 + LIBCLANG_PATH=/opt/rocm/lib/llvm/lib +
+  BINDGEN_EXTRA_CLANG_ARGS（clang resource 头）+ LD_LIBRARY_PATH=
+  host-hip/cuda-hip-shim/shim-lib + CUDA_OXIDE_TARGET=gfx1030（缺它管线
+  默认产 PTX 形态 → embed 后 gfx loader 报 CUDA_ERROR_INVALID_IMAGE，
+  已在 gfx1030_container.sh 内固化）。
+- perf 探针（perf_baseline/triad4/denorm_ab）与 rocprofv3 抓取同样在容器
+  内跑（--cap-add PERFMON --cap-add SYS_ADMIN 已含在 ensure 参数里）。
