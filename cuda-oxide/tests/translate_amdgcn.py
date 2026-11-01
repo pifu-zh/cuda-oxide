@@ -283,7 +283,7 @@ def _rewrite_allocas_in_function(body: list) -> list:
     allocas = []  # (行号, name, 新定义行)
     for k, line in enumerate(body):
         m = _ALLOCA_DEF_RE.match(line)
-        if not m or "addrspace(" in m.group("rest"):
+        if not m:
             continue
         name = m.group("name")
         rest = m.group("rest")
@@ -297,6 +297,14 @@ def _rewrite_allocas_in_function(body: list) -> list:
         parts = _split_top_level_commas(rest)
         if len(parts) > 2 or parts[0] == "void":
             continue  # 不可解析形态：保留原样（llc verifier 显式失败）
+        # [PORT gfx1030 Stage3-1 对齐] 只跳过"自身地址空间已显式给出"的 alloca
+        # （尾随 addrspace(N) 参数）。旧整串 contains("addrspace(") 守卫会误伤
+        # 元素类型含共享指针的 generic 槽（如 `[2 x ptr addrspace(3)]`——装着
+        # shared 指针的 generic 栈槽，addressof_sharedarray 的
+        # `{ { ptr addrspace(3), i64 }, ... }` 聚合同理），留成 generic 触发
+        # verifier。与 amdgcn.rs 同名函数对齐。
+        if any(p.startswith("addrspace(") and p.endswith(")") for p in parts[1:]):
+            continue
         ty = parts[0]
         count = parts[1] if len(parts) == 2 else None
         indent = m.group("indent")
