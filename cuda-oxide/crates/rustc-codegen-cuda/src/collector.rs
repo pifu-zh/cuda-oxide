@@ -1666,15 +1666,19 @@ impl<'tcx> DeviceCollector<'tcx> {
         }
         // 2) cuda-device crate root children (no_mangle shims live there;
         //    rustc keeps them in the defining crate's own CGU).
-        // Kernel-crate-local shims: root module children of LOCAL_CRATE.
-        for child in self.tcx.module_children(LOCAL_CRATE.as_def_id()).iter() {
-            let Some(did) = child.res.opt_def_id() else { continue };
+        // Kernel-crate-local shims: scan the local MIR keys. `module_children`
+        // on the local crate root is not a supported key under this query
+        // context (ICE: "not supported for this key"), and `mir_keys` is the
+        // proven-safe local scan (same shape as `find_local_memset_def`).
+        for local in self.tcx.mir_keys(()) {
+            let did = local.to_def_id();
             if !matches!(self.tcx.def_kind(did), rustc_hir::def::DefKind::Fn) {
                 continue;
             }
-            let name = self.tcx.item_name(did);
-            if name.as_str() == bare {
-                return Some(Instance::mono(self.tcx, did));
+            let instance = Instance::mono(self.tcx, did);
+            let symbol = self.tcx.symbol_name(instance).name;
+            if symbol == bare {
+                return Some(instance);
             }
         }
         for krate in self.tcx.crates(()) {

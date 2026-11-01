@@ -339,3 +339,39 @@ ffma 21.5 上界（2100 MHz 误标定）。
   已在 gfx1030_container.sh 内固化）。
 - perf 探针（perf_baseline/triad4/denorm_ab）与 rocprofv3 抓取同样在容器
   内跑（--cap-add PERFMON --cap-add SYS_ADMIN 已含在 ensure 参数里）。
+
+## 设备端 panic 消息格式化（2026-11-02 调查，IMPLEMENTABLE——精确阻塞点已定位）
+
+目标：panic! 消息经 printf/hostcall 链打到 host 再 trap（现状 = 裸 trap 无消息）。
+
+**管线现状取证**：`panic!("literal")` 在 opt-level 3 的 MIR 里被 rustc 内联成
+「语句构造消息 + `asm!("trap;")` 终结子」的块；collector 侧 StrConstScan /
+const_str_text（tcx eval + try_get_slice_bytes_for_diagnostics）能完整取出消息
+文本（verbose 已证）。importer 在 `is_dropped_panic_call`（block.rs:87）整块
+跳过——"materialized &str constant has no device lowering" 是既有设计。
+
+**本轮实现到最后一厘米的部分**（已回滚，路径全部验证过）：
+- cuda-device 根模块 `__cuda_panic_str(&'static [u8; 64])` 钩子（打印+换行），
+  collector 侧 span 键注册表（collector const_str_text 提取 →
+  record_panic_message(span lines) → importer 查询）+ 入队臂
+  （find_cgu_definition_for_symbol 跨 CGU 符号查找）+ 例子。
+- collector 顺带修复一个真 ICE：`find_cgu_definition_for_symbol` 的本地分支
+  用 `module_children(LOCAL_CRATE)` 在该查询上下文不受支持
+  （"not supported for this key"），改为 `mir_keys` 扫描（已保留提交）。
+
+**精确阻塞点（四道验证器墙，全部实测）**：消息字节要从 importer 合成出
+`ptr<ui8, as0, RawConst>` 级别的指针操作数，而：
+1. `MirGlobalAllocOp` 结果指针必须 as1/as4（as0 被拒）；其 global_type 是
+   数组时结果点子也是数组。
+2. `MirCastOp` PtrToPtr 跨点子（数组→ui8）即使带 AbiBoundary authority 也被拒
+   （"requires matching pointee/element types"）。
+3. `establish_declared_pointer_type` 要求点子精确相同（只做同点子
+   addrspace/kind retype）。
+4. `MirRefOp` 要求 result pointee == operand 的点子（ref 消费的是点子类型的
+   值，不是指针）。
+
+**正确路径（下一步工程）**：str/byte-string 常量 → 设备端「按值物化」需要
+`build_array_op_from_bytes` 的无 rustc-Ty 变体（现在强制要 rust_array_ty 做
+元素布局校验），物化成数组值后走 promoted-const 同款
+`MirRefOp(StaticAddress)` + GEP-0 + call。工作量 = fmt/常量字符串 lowering
+子项目（DWARF 同族基础设施），非补丁级。
