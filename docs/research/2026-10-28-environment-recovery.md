@@ -482,3 +482,14 @@ compile_all 无 fault ✓；**mbarrier_bridges out[0..3] = input[0..3]
 4/8/16B + zfill(.s) + mbarrier 桥接全部真卡逐值验证。语义收窄：异步
 重叠（vmcnt 深流水）为后续优化（微基准已证机制）；tx 字节计数跟踪
 内化于同步语义。
+
+### Rust 镜像 + 集成管线验证（2026-11-03 续三）——cp.async SUPPORTED 落地
+
+Rust amdgcn.rs Step 18（rewrite_cp_async）+ Step 5b（append_index_call_
+ntid_args）镜像落地（fmt-string 的 `{j-1}` 需预计算 jm1；usize 减法下溢
+需 jm1 移入 else）。集成管线真卡：cp_async_small（ca 4/8B 全 PASS）+
+cp_async_zfill（src_size=4/2/0 三测试 PASS——第三测暴露 smax 钳底需求：
+runtime src_size=0 时 smin(0, sz-1) 下溢 -1 GEP 跨页 fault，修为
+smax(sz-1, 0) 钳底）。批回归 101/105 持平（Step 18/5b/smax 无回退）。
+能力矩阵 cp.async 行更新 SUPPORTED（软仿真同步形态）。docker snapshot
+镜像（72GB 陈旧层）清理后磁盘 38%。

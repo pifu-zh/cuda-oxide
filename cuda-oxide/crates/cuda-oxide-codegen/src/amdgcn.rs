@@ -2343,6 +2343,15 @@ pub fn rewrite_ir_for_amdgcn(ll: &str) -> Result<String, String> {
     text = rewrite_calls(&text, "llvm.nvvm.read.ptx.sreg.ntid.y", "or i32 %ntid_y, 0").0;
     text = rewrite_calls(&text, "llvm.nvvm.read.ptx.sreg.ntid.z", "or i32 %ntid_z, 0").0;
     text = append_ntid_kernarg_params(&text);
+    // 5b. [adapt-rocm] thread::index_{1,2,3}d call sites pass only the frame
+    //     pointer while the helper signature declares (frame, ntid_x,
+    //     ntid_y, ntid_z) -- llc inlining maps the missing args to poison,
+    //     and the garbage register decides between the compute path and the
+    //     -1 sentinel path (cp_async_small fault: garbage = 0 -> index = -1
+    //     -> cp.async GEP -1 -> cross-page load fault). Appends the three
+    //     ntid args to every one-arg call of these helpers (idempotent:
+    //     the check requires exactly one argument).
+    text = append_index_call_ntid_args(&text);
     // 6. nctaid .y/.z → constant 1 (1-D GRID semantics; the launch macros'
     //    grid dims stay 1-D across the batch — the block dims are the ones
     //    that went multi-dimensional).
@@ -2440,7 +2449,293 @@ pub fn rewrite_ir_for_amdgcn(ll: &str) -> Result<String, String> {
     //     ABI/protocol extracted from ockl.bc llvm-dis + printf_mod probe).
     text = rewrite_vprintf_to_ockl(&text);
     text = rewrite_packed_math(&text);
+    // 18. [adapt-rocm] cp.async → software emulation (RDNA2 has no async
+    //     copy hardware; the sync load + LDS store form is the
+    //     GPU-verified fallback -- soft_tma_bench plain1 423 GB/s).
+    text = rewrite_cp_async(&text);
     Ok(text)
+}
+
+/// [adapt-rocm] Step 5b: thread::index_{1,2,3}d call sites pass only the
+/// frame pointer while the helper signature declares `(frame, ntid_x,
+/// ntid_y, ntid_z)` -- llc inlining maps the missing args to poison, and
+/// the garbage register decides between the compute path and the -1
+/// sentinel path (cp_async_small fault: garbage = 0 -> index = -1 ->
+/// cp.async GEP -1 -> cross-page load fault). Appends the three ntid args
+/// to every one-arg call of these helpers (idempotent: the check requires
+/// exactly one argument).
+fn append_index_call_ntid_args(ll: &str) -> String {
+    const NTIDS: &str = "i32 %ntid_x, i32 %ntid_y, i32 %ntid_z";
+    let mut out: Vec<String> = Vec::with_capacity(ll.lines().count());
+    for line in ll.lines() {
+        let trimmed = line.trim_start();
+        let is_define = trimmed.starts_with("define ");
+        let is_call = (trimmed.starts_with("call i64 @_R")
+            || trimmed.starts_with("call i1 @_R")
+            || trimmed.starts_with("tail call i64 @_R")
+            || trimmed.starts_with("tail call i1 @_R"))
+            && (trimmed.contains("index_1d")
+                || trimmed.contains("index_2d")
+                || trimmed.contains("index_3d")
+                || trimmed.contains("_dimensional_launch"));
+        if !is_call || is_define {
+            out.push(line.to_string());
+            continue;
+        }
+        let Some(open) = trimmed.find('(') else {
+            out.push(line.to_string());
+            continue;
+        };
+        let Some(close) = trimmed.rfind(')') else {
+            out.push(line.to_string());
+            continue;
+        };
+        let args = &trimmed[open + 1..close];
+        let parts = split_top_level_commas(args);
+        // Idempotence: once the three ntid args are present the arity is 4.
+        if parts.len() != 1 {
+            out.push(line.to_string());
+            continue;
+        }
+        let indent = &line[..line.len() - trimmed.len()];
+        let args_end = open + 1 + args.len();
+        out.push(format!(
+            "{}{}{}, {}{}",
+            indent,
+            &trimmed[..args_end],
+            NTIDS,
+            "",
+            &trimmed[args_end..]
+        ));
+    }
+    let mut text = out.join("\n");
+    if ll.ends_with('\n') && !text.is_empty() {
+        text.push('\n');
+    }
+    text
+}
+
+/// [adapt-rocm] Step 18: cp.async → software emulation (RDNA2 has no async
+/// copy hardware; the sync load + LDS store form is the GPU-verified
+/// fallback -- soft_tma_bench plain1, 423 GB/s at N traffic). Mirrors
+/// Python translate_amdgcn.py Step 18.
+///
+/// Lowering:
+/// - `cp.async.ca/cg.shared.global.{4,8,16}` → vector load (as1) + LDS
+///   store (as3); the dst/src operand texts pass through verbatim (llc
+///   materializes SSA names, shared symbols, and constant-GEP expressions
+///   natively).
+/// - `.s` zero-fill variants (i32 src_size) → byte-granular loads + select
+///   zero-fill (const src_size: read only the first S bytes; runtime:
+///   smin-clamped offsets so the loads stay in bounds), assembled per
+///   dword via zext/shl/or.
+/// - `commit.group` / `wait.all` / `wait.group.N` → deleted (sync
+///   semantics: program order is the issue order; LDS is visible in-wave).
+/// - `cp.async.mbarrier.arrive[.noinc][.shared]` → one arrive
+///   (`__port_mb_arrive`, decrement by 1): the bridge kernels' count=2
+///   inits need BOTH the .noinc arrive and the explicit arrive to reach
+///   zero; deleting the form left pending at 1 -> test_wait spin (hang).
+/// Strips call-operand parameter attributes (`nonnull`, `noundef`) from a
+/// cp.async operand text: `ptr addrspace(1) nonnull %v25` →
+/// `ptr addrspace(1) %v25`. The attributes are legal in call operands but
+/// invalid in load/store/GEP operand positions.
+fn clean_cp_operand(text: &str) -> String {
+    let joined = text
+        .replace("nonnull ", "")
+        .replace("noundef ", "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    joined
+}
+
+fn rewrite_cp_async(text: &str) -> String {
+    if !text.contains("llvm.nvvm.cp.async") {
+        return text.to_string();
+    }
+    let mut ctr: u64 = 0;
+    let mut out: Vec<String> = Vec::with_capacity(text.lines().count());
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let indent = &line[..line.len() - trimmed.len()];
+        // 1. declares: drop (the lowering inlines at the call sites).
+        if trimmed.starts_with("declare void @llvm.nvvm.cp.async.") {
+            continue;
+        }
+        // 2. commit.group / wait.all / wait.group.N: drop (sync semantics).
+        if trimmed.contains("@llvm.nvvm.cp.async.commit.group(")
+            || trimmed.contains("@llvm.nvvm.cp.async.wait.")
+        {
+            continue;
+        }
+        // 3. cp.async.mbarrier.arrive[.noinc][.shared] → one arrive.
+        if trimmed.contains("@llvm.nvvm.cp.async.mbarrier.arrive") {
+            let Some(open) = trimmed.find('(') else {
+                out.push(line.to_string());
+                continue;
+            };
+            let Some(close) = trimmed.rfind(')') else {
+                out.push(line.to_string());
+                continue;
+            };
+            let argstr = trimmed[open + 1..close].trim();
+            out.push(format!("{indent}call void @__port_mb_arrive({argstr})"));
+            continue;
+        }
+        // 4. ca/cg copy calls.
+        let is_copy = trimmed.contains("@llvm.nvvm.cp.async.ca.shared.global.")
+            || trimmed.contains("@llvm.nvvm.cp.async.cg.shared.global.");
+        if !is_copy
+            || !(trimmed.starts_with("call void @")
+                || trimmed.starts_with("tail call void @"))
+        {
+            out.push(line.to_string());
+            continue;
+        }
+        // Parse the size/zfill from the callee name.
+        let Some(name_pos) = trimmed.find("shared.global.") else {
+            out.push(line.to_string());
+            continue;
+        };
+        let tail = &trimmed[name_pos + "shared.global.".len()..];
+        let Some(paren) = tail.find('(') else {
+            out.push(line.to_string());
+            continue;
+        };
+        let name_part = &tail[..paren];
+        let zfill = name_part.ends_with(".s");
+        let Ok(size) = name_part.trim_end_matches(".s").parse::<usize>() else {
+            out.push(line.to_string());
+            continue;
+        };
+        if size % 4 != 0 || size == 0 {
+            out.push(line.to_string());
+            continue;
+        }
+        let dwords = size / 4;
+        // Args: between the first ( and the last ); attr tail (#N) stripped.
+        let argstr = &tail[paren + 1..];
+        let argstr = match argstr.rfind(')') {
+            Some(idx) => &argstr[..idx],
+            None => argstr,
+        };
+        let args = split_top_level_commas(argstr);
+        if args.len() < 2 {
+            out.push(line.to_string());
+            continue;
+        }
+        let dst = clean_cp_operand(args[0]);
+        let src = clean_cp_operand(args[1]);
+        ctr += 1;
+        let pfx = format!("cp{ctr}");
+
+        if !zfill {
+            // Vector direct copy: operand texts pass through verbatim.
+            let vty = format!("<{dwords} x i32>");
+            out.push(format!(
+                "{indent}%{pfx}v = load {vty}, {src}, align {size}"
+            ));
+            out.push(format!(
+                "{indent}store {vty} %{pfx}v, {dst}, align {size}"
+            ));
+            continue;
+        }
+
+        // .s zero-fill: byte-granular loads + select zero-fill.
+        // The src must be an SSA name (the byte GEPs use the src text).
+        if !src.contains(" %") || !src.rsplit_once(' ').unwrap().1.starts_with('%') {
+            // Non-SSA src (symbol/expression): keep the line fail-loud.
+            out.push(line.to_string());
+            continue;
+        }
+        // The src_size arg: strip the i32 type prefix for the value.
+        let ssz = args.get(2).copied().unwrap_or("");
+        let ssz_val = ssz
+            .trim()
+            .trim_start_matches("i32")
+            .trim();
+        let const_s = ssz_val.chars().all(|c| c.is_ascii_digit());
+        let s_val: usize = const_s.then(|| ssz_val.parse().unwrap()).unwrap_or(0);
+
+        let mut bytes: Vec<String> = Vec::with_capacity(size);
+        for i in 0..size {
+            if !const_s {
+                // Runtime src_size: idx = min(i, max(src_size-1, 0)) -- the
+                // smax floor keeps src_size=0 from underflowing to a -1 GEP.
+                if i == 0 {
+                    out.push(format!("{indent}%{pfx}.m1 = sub i32 {ssz_val}, 1"));
+                    out.push(format!("{indent}%{pfx}.lim = call i32 @llvm.smax.i32(i32 %{pfx}.m1, i32 0)"));
+                }
+                out.append(&mut vec![
+                    format!("{indent}%{pfx}.idx{i} = call i32 @llvm.smin.i32(i32 {i}, i32 %{pfx}.lim)"),
+                    format!("{indent}%{pfx}.gep{i} = getelementptr i8, {src}, i32 %{pfx}.idx{i}"),
+                    format!("{indent}%{pfx}.ld{i} = load i8, ptr addrspace(1) %{pfx}.gep{i}, align 1"),
+                    format!("{indent}%{pfx}.gt{i} = icmp sgt i32 {ssz_val}, {i}"),
+                    format!("{indent}%{pfx}.b{i} = select i1 %{pfx}.gt{i}, i8 %{pfx}.ld{i}, i8 0"),
+                ]);
+            } else if i < s_val {
+                out.push(format!(
+                    "{indent}%{pfx}.gep{i} = getelementptr i8, {src}, i64 {i}"
+                ));
+                out.push(format!(
+                    "{indent}%{pfx}.b{i} = load i8, ptr addrspace(1) %{pfx}.gep{i}, align 1"
+                ));
+            } else {
+                out.push(format!("{indent}%{pfx}.b{i} = or i8 0, 0"));
+            }
+            bytes.push(format!("%{pfx}.b{i}"));
+        }
+        // Assemble dwords and store (SSA: the or chain uses fresh names).
+        for d in 0..dwords {
+            for j in 0..4 {
+                let i = d * 4 + j;
+                out.push(format!(
+                    "{indent}%{pfx}.z{i} = zext i8 {} to i32",
+                    bytes[i]
+                ));
+                out.push(format!(
+                    "{indent}%{pfx}.s{i} = shl i32 %{pfx}.z{i}, {}",
+                    8 * j
+                ));
+                if j == 0 {
+                    out.push(format!(
+                        "{indent}%{pfx}.w{d}_0 = or i32 %{pfx}.s{i}, 0"
+                    ));
+                } else {
+                    let jm1 = j - 1;
+                    out.push(format!(
+                        "{indent}%{pfx}.w{d}_{j} = or i32 %{pfx}.s{i}, %{pfx}.w{d}_{jm1}"
+                    ));
+                }
+            }
+            out.push(format!(
+                "{indent}%{pfx}.dgep{d} = getelementptr i8, {dst}, i64 {}",
+                d * 4
+            ));
+            out.push(format!(
+                "{indent}store i32 %{pfx}.w{d}_3, ptr addrspace(3) %{pfx}.dgep{d}, align 4"
+            ));
+        }
+    }
+    let mut text = out.join("\n");
+    // The runtime .s path needs the smin intrinsic declared.
+    let mut decls: Vec<&str> = Vec::new();
+    if text.contains("@llvm.smin.i32") && !text.contains("declare i32 @llvm.smin.i32") {
+        decls.push("declare i32 @llvm.smin.i32(i32, i32)");
+    }
+    if text.contains("@llvm.smax.i32") && !text.contains("declare i32 @llvm.smax.i32") {
+        decls.push("declare i32 @llvm.smax.i32(i32, i32)");
+    }
+    if !decls.is_empty() {
+        if let Some(idx) = text.find("\ndefine ") {
+            let ins: Vec<String> = decls.iter().map(|d| format!("\n{d}")).collect();
+            text = format!("{}{}{}", &text[..idx], ins.join(""), &text[idx..]);
+        }
+    }
+    if text.ends_with('\n') && !text.is_empty() {
+        text.push('\n');
+    }
+    text
 }
 
 /// [adapt-rocm] Step 17b: PTX packed-math asm → legal AMDGPU IR.
