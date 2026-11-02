@@ -375,3 +375,33 @@ const_str_text（tcx eval + try_get_slice_bytes_for_diagnostics）能完整取�
 元素布局校验），物化成数组值后走 promoted-const 同款
 `MirRefOp(StaticAddress)` + GEP-0 + call。工作量 = fmt/常量字符串 lowering
 子项目（DWARF 同族基础设施），非补丁级。
+
+## soft TMA 微基准重建（2026-11-02，手写 ISA；小规模正确性已证，全规模记账 bug 开放）
+
+旧微基准随 10-19 清空丢失。本轮从零重建：`cuda-oxide/scripts/soft_tma_bench/`
+（gen_kernels.py 生成 7 个手写 gfx1030 ISA kernel + soft_tma_host.c 驱动）。
+
+**设计**（aiter gfx1030 路线 + vmcnt 部分排空）：
+- plain1（串行参照）/ df4_bN（深流水 gmem→VGPR→gmem 全拷贝）/ lds_bN
+  （深流水 gmem→VGPR→LDS ds_write_b128→ds_read 归约消费）。
+- 关键 ISA 事实（本轮实测）：**ds_write_b128/ds_read_b128 在 gfx1030 完全可用**
+  （单条 16B LDS 写——推翻旧档案"直通 LDS 仅 b32"对 DS 路径的适用性；该结论
+  只对 MUBUF 直通成立）；wave32 下进位加法须 `vcc_lo` +
+  `v_add_co_ci_u32_e64 ..., null, ...` 形态；`v_add_u32` 不存在（用
+  `v_add_nc_u32`）。
+
+**装载链四坑**（全部实测排掉）：COv6 被驱动拒（管线 Phase-1 已知教训复现）
+→ 必须 `-mcode-object-version=5`；ld.lld -shared 对 COv6 输入静默不产出
+ET_DYN（v5 输入才正常）；描述符 SGPR 预算必须 ≥ 实际用量（漏了 =
+hipErrorNoKernelImageForDevice）；结果布局/累加器 VGPR 不得与流水线组寄存器
+重叠。
+
+**已证**：小规模（blocks≤40、qpb≤512）lds/df4/plain 全部逐值正确——深流水
++ ds_write_b128 + vmcnt(B) 部分排空的机制成立；plain1 全规模（320 block）
+也正确（423-427 GB/s，N 口径 73-74%）。
+
+**开放（诚实记录）**：多 wave/CU（8 wave）时 deep 变体在 ~34% 覆盖处提前
+退出且数据不完整（wave 数依赖、无 fault、计时相应缩短）；计数器仪表显示
+drain 数减半。疑点集中在 LGKM/VM 队列在多 wave 下的交互或 s17 记账。修复前
+**不得引用任何全规模 deep 变体带宽数字**；旧注册表 78.4% 数字在重建基准上
+尚未复现。plain1 的 423 GB/s（73-74%）是本轮唯一可引用的全规模数字。
