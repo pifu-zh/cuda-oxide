@@ -202,6 +202,11 @@ def translate_nvvm_to_amdgcn(ll_text: str) -> str:
     #      b16 原子；nvls/mma 硬件缺失保留原样留给 llc）
     text = _rewrite_packed_math(text)
 
+    # 18. [adapt-rocm] cp.async → 软件仿真（RDNA2 无异步拷贝硬件；同步
+    #     load + LDS store；微基准 soft_tma_bench 实证 DS b128 可用、
+    #     同步形态全规模 423 GB/s）。性能化的 vmcnt 流水版本待跟进。
+    text = _rewrite_cp_async(text)
+
     return text
 
 
@@ -1588,6 +1593,7 @@ def _rewrite_packed_math(text: str) -> str:
             decls.append("declare <2 x float> @llvm.fma.v2f32(<2 x float>, <2 x float>, <2 x float>)")
         if "@llvm.amdgcn.exp2.f32" in joined and "declare float @llvm.amdgcn.exp2.f32" not in text:
             decls.append("declare float @llvm.amdgcn.exp2.f32(float)")
+
         if decls:
             idx = joined.find("\ndefine ")
             if idx >= 0:
@@ -1791,6 +1797,181 @@ entry:
   ret i32 %done32
 }
 """
+
+
+# ---------------------------------------------------------------------------
+# Step 18: cp.async → 软件仿真（RDNA2 无异步拷贝硬件）
+# ---------------------------------------------------------------------------
+# [adapt-rocm 2026-11-03] NVVM cp.async 内建在 amdgcn 目标上无 lowering
+# （llc 拒绝，cp_async_small/cp_async_zfill 构建失败）。软仿真路径：
+#
+#   cp.async.ca/cg.shared.global.{4,8,16}(dst as3, src as1)
+#       → %q = load <N/4 x i32>, ptr addrspace(1) %src（操作数文本原样透传，
+#         SSA/全局符号/常量 GEP 表达式 llc 全部原生物化）
+#         store <N/4 x i32> %q, ptr addrspace(3) %dst
+#   cp.async.*.s 变体（i32 src_size 零填）→ 字节粒度 load + select 零填
+#       （const src_size：只读前 S 字节；runtime src_size：min 钳制保证
+#       不越界 + select），按 dword 组装存回
+#   commit.group → 删除（gfx 无组语义；程序序即发射序）
+#   wait.all / wait.group.N → 删除（同步仿真：LDS 写在同 wave 程序序内
+#       对后续 LDS 读可见；跨 wave 由 s_barrier 的 lgkmcnt 排空覆盖）
+#   cp.async.mbarrier.arrive[.noinc][.shared] → 删除（同步仿真下异步完成
+#       跟踪天然满足；桥接模式的相位推进由显式 mbarrier_arrive 驱动——
+#       语义收窄记录：依赖 tx 计数的模式须改用 wait_all）
+#
+# 性能注记：同步形态 = soft_tma_bench 的 plain1 模式（全规模实测
+# 423-427 GB/s，N 口径，73-74% of pin rate）。vmcnt 部分排水的深流水
+# 版本（微基准 lds_bN 已证机制）为后续优化。
+
+_CP_CALL_RE = re.compile(
+    r"^(?P<indent>\s*)(?:(?:tail )?call\s+void\s+"
+    r"@llvm\.nvvm\.cp\.async\.(?P<flavor>ca|cg)\.shared\.global\."
+    r"(?P<size>4|8|16)(?P<zfill>\.s)?)\("
+)
+_CP_ATTR_TAIL_RE = re.compile(r"\)\s*(?:#\d+)?\s*$")  # 调用闭括号 + attr 尾
+
+_CP_COMMIT_RE = re.compile(
+    r"^\s*(?:tail )?call\s+void\s+@llvm\.nvvm\.cp\.async\.commit\.group\(\s*\)\s*(?:#\d+)?\s*$"
+)
+
+_CP_WAIT_RE = re.compile(
+    r"^\s*(?:tail )?call\s+void\s+@llvm\.nvvm\.cp\.async\.wait\."
+    r"(?:all\(\s*\)|group\(\s*i32\s+[0-9]+\s*\))\s*(?:#\d+)?\s*$"
+)
+
+_CP_MBARRIER_RE = re.compile(
+    r"^\s*(?:tail )?call\s+void\s+@llvm\.nvvm\.cp\.async\.mbarrier\."
+    r"arrive(?:\.noinc)?(?:\.shared)?\("
+)
+
+_CP_DECLARE_RE = re.compile(
+    r"^\s*declare\s+void\s+@llvm\.nvvm\.cp\.async\."
+)
+
+_CP_SRC_SSA_RE = re.compile(
+    r"^(?:ptr addrspace\(1\)\s*)?(?:(?:nonnull|noundef)\s+)*"
+    r"(?P<name>%[\w.$]+)$"
+)
+
+def _cp_split_args(argstr: str):
+    """深度感知的顶层逗号切分（GEP/向量字面量内的逗号不切）。"""
+    parts, depth, start = [], 0, 0
+    for i, ch in enumerate(argstr):
+        if ch in "<([{":
+            depth += 1
+        elif ch in ">])}":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(argstr[start:i].strip())
+            start = i + 1
+    parts.append(argstr[start:].strip())
+    return parts
+
+
+_CP_COUNTER = [0]  # cp.async lowering 的唯一名计数器（跨调用递增）
+
+def _rewrite_cp_async(text: str) -> str:
+    """cp.async 内建 → 软件仿真 IR（同步 load + LDS store；Step 18）。"""
+    if "llvm.nvvm.cp.async" not in text:
+        return text
+
+    lines = text.split("\n")
+    out = []
+    # 逐函数重置计数器：名字只需在函数内唯一（SSA 是函数内作用域）
+    def _fresh(base):
+        _CP_COUNTER[0] += 1
+        return f"{base}{_CP_COUNTER[0]}"
+
+    prev_call = None
+    def _scan_prev_call():
+        """最近的函数 define 行之后的第一个 cp.async 调用标记重置点。"""
+        return None
+    for line in lines:
+        if _CP_DECLARE_RE.match(line):
+            continue  # 内建声明删除（lowering 内联在调用点）
+
+        if _CP_COMMIT_RE.match(line) or _CP_WAIT_RE.match(line) \
+                or _CP_MBARRIER_RE.match(line):
+            continue  # 同步仿真：组/等待/异步到达语义均内化于程序序
+
+        m = _CP_CALL_RE.match(line)
+        if not m:
+            out.append(line)
+            continue
+
+        indent = m.group("indent")
+        size = int(m.group("size"))
+        zfill = m.group("zfill") is not None
+        # 括号体：正则锚定的 '(' 之后取到行末最外层 ')'；attr 尾（#N）剥离
+        argstr = line[m.end():]
+        argstr = _CP_ATTR_TAIL_RE.sub("", argstr)
+        args = _cp_split_args(argstr)
+        if len(args) < 2:
+            out.append(line)
+            continue
+        dst = args[0]
+        src = args[1]
+        ssz = args[2] if len(args) > 2 else ""
+        dwords = size // 4
+
+        if not zfill:
+            # 向量直拷：操作数文本原样透传（llc 物化 SSA/符号/常量 GEP）
+            pfx = _fresh("cp")
+            vty = f"<{dwords} x i32>"
+            out.append(f"{indent}%{pfx}v = load {vty}, {src}, align {size}")
+            out.append(f"{indent}store {vty} %{pfx}v, {dst}, align {size}")
+            continue
+
+        # ---- .s 零填变体：字节粒度 load + select 零填 ----
+        src_base = _CP_SRC_SSA_RE.match(src)
+        if src_base is None:
+            # 非 SSA src（符号/GEP 表达式）：保留原样 fail-loud（llc 显式拒绝）
+            out.append(line)
+            continue
+        src_base = src_base.group("name")
+
+        ssz_m = re.match(r"^(?:i32\s+)?(?P<v>[^\s]+)$", ssz.strip())
+        ssz_val = ssz_m.group("v") if ssz_m else ssz  # 裸值：`3` 或 `%vN`
+        const_s = ssz_val.isdigit()
+        s_val = int(ssz_val) if const_s else None
+        pfx = _fresh("cp")
+        bytes_out = []
+        for i in range(size):
+            if not const_s:
+                # runtime src_size：idx = min(i, src_size-1)（钳制不越界）
+                out.append(f"{indent}%{pfx}.lim = add i32 {ssz_val}, -1" if i == 0 else "")
+                out.append(f"{indent}%{pfx}.idx{i} = call i32 @llvm.smin.i32(i32 {i}, i32 %{pfx}.lim)")
+                out.append(f"{indent}%{pfx}.gep{i} = getelementptr i8, {src}, i32 %{pfx}.idx{i}")
+                out.append(f"{indent}%{pfx}.ld{i} = load i8, ptr addrspace(1) %{pfx}.gep{i}, align 1")
+                out.append(f"{indent}%{pfx}.gt{i} = icmp sgt i32 {ssz_val}, {i}")
+                out.append(f"{indent}%{pfx}.b{i} = select i1 %{pfx}.gt{i}, i8 %{pfx}.ld{i}, i8 0")
+            elif i < s_val:
+                out.append(f"{indent}%{pfx}.gep{i} = getelementptr i8, {src}, i64 {i}")
+                out.append(f"{indent}%{pfx}.b{i} = load i8, ptr addrspace(1) %{pfx}.gep{i}, align 1")
+            else:
+                out.append(f"{indent}%{pfx}.b{i} = or i8 0, 0")  # 零填
+            bytes_out.append(f"%{pfx}.b{i}")
+
+        # 组装 dword 并按 4B 存回（dst 文本可为 SSA/符号/常量 GEP 表达式）
+        for d in range(dwords):
+            for j in range(4):
+                i = d * 4 + j
+                out.append(f"{indent}%{pfx}.z{i} = zext i8 {bytes_out[i]} to i32")
+                out.append(f"{indent}%{pfx}.s{i} = shl i32 %{pfx}.z{i}, {8 * j}")
+                # SSA：or 链每步新名；链尾 w{d}_3 进 store
+                if j == 0:
+                    out.append(f"{indent}%{pfx}.w{d}_0 = or i32 %{pfx}.s{i}, 0")
+                else:
+                    out.append(f"{indent}%{pfx}.w{d}_{j} = or i32 %{pfx}.s{i}, %{pfx}.w{d}_{j-1}")
+            out.append(f"{indent}%{pfx}.dgep{d} = getelementptr i8, {dst}, i64 {d * 4}")
+            out.append(f"{indent}store i32 %{pfx}.w{d}_3, ptr addrspace(3) %{pfx}.dgep{d}, align 4")
+
+    joined = "\n".join(out)
+    if "@llvm.smin.i32" in joined and "declare i32 @llvm.smin.i32" not in text:
+        idx = joined.find("\ndefine ")
+        if idx >= 0:
+            joined = joined[:idx] + "\ndeclare i32 @llvm.smin.i32(i32, i32)\n" + joined[idx:]
+    return joined
 
 
 def _rewrite_mbarriers(text: str) -> str:

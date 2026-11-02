@@ -405,3 +405,35 @@ hipErrorNoKernelImageForDevice）；结果布局/累加器 VGPR 不得与流水�
 drain 数减半。疑点集中在 LGKM/VM 队列在多 wave 下的交互或 s17 记账。修复前
 **不得引用任何全规模 deep 变体带宽数字**；旧注册表 78.4% 数字在重建基准上
 尚未复现。plain1 的 423 GB/s（73-74%）是本轮唯一可引用的全规模数字。
+
+## cp.async 软仿真 lowering（2026-11-03，Python Step 18 落地，Rust 镜像待做）
+
+用户指正 C 微基准不是 kernel 优化本体——真正的落点是 **Rust 路径的 cp.async
+lowering**。取证：cp_async 在 gfx1030 无任何 lowering（24 个裸
+`llvm.nvvm.cp.async.*` 调用直达 llc，cp_async_small 构建 exit 101）。
+
+**Python Step 18 已落地**（translate_amdgcn.py）：
+- `cp.async.ca/cg.shared.global.{4,8,16}` → 同步向量 load(as1) + LDS store(as3)，
+  dst/src 操作数文本原样透传（SSA/全局符号/常量 GEP 表达式 llc 全部原生物化；
+  深度感知逗号切分处理 GEP 内嵌逗号）。
+- `.s` 零填变体（i32 src_size）→ 字节粒度 load + select 零填（const src_size：
+  只读前 S 字节 + 常量零填；runtime：smin 钳制 + select，保证不越界），
+  按 dword zext/shl/or 组装存回。
+- `commit.group` / `wait.all` / `wait.group.N` → 删除（同步仿真：程序序即
+  发射序；LDS 同 wave 程序序可见）。
+- `cp.async.mbarrier.arrive[.noinc][.shared]` → 删除（异步完成跟踪在同步
+  仿真下天然满足；桥接相位由显式 mbarrier_arrive 驱动）。
+- 语义收窄记录：依赖 tx 字节计数的 mbarrier 桥接模式须改用 wait_all。
+- IR 级 lowering 的优势：llc 原生物化所有地址形态，无需手写符号/GEP 物化
+  （对比：微基准需要手写 v_mov/进位加法链）。
+
+**已证**：cp_async_small 完整 .ll（14 调用点）全部 lowering 零残留，
+gfx1030 llc 通过（`--filetype=obj` rc=0）。
+
+**开放（诚实记录）**：真卡 E2E fault——test_cp_async_4 GPU fault
+（0x798eb43ff000，Page not present）；compile_all/bridges 跑完但 out=0
+FAIL（SMEM 读回为零 = cp.async 的数据未进 LDS 或 out 写回未落地）。
+疑点：例程把 SMEM 指针 `as *mut u32` 转成 generic 再传给 cp_async（原
+intrinsic 声明 as3 但值经 generic 铸造）；lowering 的 as3-annotated store
+与 generic 值的交互需要一轮 gdb/printf 定位。**修复前不得宣称 cp.async
+SUPPORTED**。Rust amdgcn.rs 镜像同步待做。
