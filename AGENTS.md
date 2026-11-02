@@ -46,6 +46,31 @@ contribution guide. There is no root `Justfile`. The SIMT recipes live in
 - `docs/` — the umbrella landing page and `docs/build_all_docs.sh`, which builds
   the combined documentation site. The component books retain their own sources.
 
+## GPU adaptation skills
+
+`skills/` holds layered, evidence-marked adaptation knowledge distilled from
+this project (ROCm Rust on RX 6950 XT / gfx1030):
+
+- `skills/gpu-adaptation-methodology/` — platform-agnostic methodology
+  (boundary investigation, gap root-cause classes, substitution strategies,
+  verification design, evidence grading). No ROCm/CUDA/LLVM assumptions.
+- `skills/rocm-adaptation/` — ROCm stack: HIP/HSA, code objects, kernel
+  loading, printf hostcall protocol, rocprofiler capture, container workflow.
+- `skills/rust-gpu-toolchain/` — Rust GPU toolchain integration: codegen
+  backend architecture, GPU ABI/kernarg contract, host/device split,
+  verifier-contract rules.
+- `skills/gfx1030-rdna2/PROFILE.md` — RDNA2/gfx1030 capability profile with
+  per-row evidence markers.
+- `skills/case-studies/rocm-rust-gfx1030/` — decision timeline, root-cause
+  table, failed experiments. Original research archives live in
+  `docs/research/`; the capability matrix is `docs/gfx1030_support_matrix.md`.
+
+When adapting on this stack, read the relevant SKILL.md files first
+(`skills/README.md` describes the layering and load order); add new knowledge
+to the correct layer using the "what invalidates it" test described in
+`CONTRIBUTING.md` of the skills README. ZCode users can symlink
+`skills/<name>/` into `~/.zcode/skills/` for direct discovery.
+
 ## Running the checks
 
 Use `just -f cuda-oxide/Justfile --list` from the repository root to list the
