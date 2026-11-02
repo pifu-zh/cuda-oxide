@@ -65,11 +65,16 @@ this project (ROCm Rust on RX 6950 XT / gfx1030):
   table, failed experiments. Original research archives live in
   `docs/research/`; the capability matrix is `docs/gfx1030_support_matrix.md`.
 
-When adapting on this stack, read the relevant SKILL.md files first
-(`skills/README.md` describes the layering and load order); add new knowledge
-to the correct layer using the "what invalidates it" test described in
-`CONTRIBUTING.md` of the skills README. ZCode users can symlink
-`skills/<name>/` into `~/.zcode/skills/` for direct discovery.
+Before working on ANY task that touches GPU code, HIP/HSA, kernel loading,
+profiling, or device-side Rust semantics, read the relevant SKILL.md files
+first -- at minimum `skills/gpu-adaptation-methodology/SKILL.md`, plus the
+platform/profile/toolchain files matching the task (`skills/README.md`
+describes the layering and load order). These files encode verified
+hardware-level facts and documented pitfalls that contradict plausible-but-
+wrong assumptions; skipping them repeats known failures. Add new knowledge
+to the correct layer using the "what invalidates it" test in
+`skills/README.md`. ZCode users can instead symlink `skills/<name>/` into
+`~/.zcode/skills/` for automatic description-based discovery.
 
 ## Running the checks
 
