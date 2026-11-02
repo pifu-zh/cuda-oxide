@@ -72,6 +72,7 @@
 | 全组 barrier（barrier0 → s.barrier） | FULL | [e2e] barrier_smoke 例 [hist] + 本机 batch | — |
 | 静态共享内存（LDS，undef 初始化契约） | FULL | [hist] sharedmem 例 GPU PASS；[e2e] pytest alloca/addrspace 测试 | — |
 | mbarrier（软件单字状态机：pending/expected/phase） | FULL | [e2e] 本机 test_barrier_mbarrier_software 三 kernel 语义断言全过（补重放 Step 16 后） | expect_tx 字节级（=vmcnt 部分排空等价）待实现 |
+| cp.async（gmem→shared 异步标量拷贝，ca/cg 4/8/16B + zfill + mbarrier 桥接） | **SUPPORTED（SOFTWARE EMULATION，同步形态，2026-11-03）** | [e2e] Step 18 prep-pass lowering：cp.async 内建 → 同步向量 load(as1) + LDS store(as3)（dst/src 操作数文本透传，llc 原生物化 SSA/符号/常量 GEP）；.s 零填 = 字节粒度 load + select（runtime src_size 用 smax/smin 钳制防越界/下溢）；commit/wait 删除（同步语义内化于程序序）；mbarrier.arrive[.noinc] → `__port_mb_arrive`（递减 1——删除会让 count=2 桥的 pending 永不归零，bridges 挂起实证）。**真卡三 kernel 全 PASS**：test_cp_async_4 out[0]=100、compile_all（9 形式 exercise 无 fault）、mbarrier_bridges out[0..3]=input[0..3]（memcmp 通过）；cp_async_zfill 三测试（src_size=4/2/0）全 PASS。Python Step 18 + Rust amdgcn.rs 镜像双管线落地；批回归 101/105 持平 | 语义收窄：异步重叠（vmcnt 深流水）为后续优化（soft_tma_bench 微基准已证机制：lds_b8 正确+75%）；tx 字节计数跟踪内化于同步语义（依赖 tx 计数的模式改用 wait_all） |
 | counted barrier（LDS 计数器+世代自旋，旁观 warp 安全） | FULL | [hist] 128 线程 wave64 含旁观 warp GPU PASS；[e2e] 本机 pytest IR 断言 | id 常量缺 0..15 范围检查（review P1） |
 | warp shuffle 4 模式 × f32/i32 + f64 asm 拆分 + 动态 mask(up,0) | FULL | [hist] 四模式真卡验证；[e2e] 本机 pytest 全形态（含 mbcnt.lo+hi 两段 lane 号，wave64 正确） | — |
 | 部分交换（字面 mask≠-1）/ 非 32 宽度 clamp | PARTIAL(信封) | [static] 信封外保留 nvvm 调用让 llc 显式拒绝（fail-loudly 设计，非静默错） | 按需扩信封 |
