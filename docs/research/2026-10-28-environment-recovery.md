@@ -437,3 +437,27 @@ FAIL（SMEM 读回为零 = cp.async 的数据未进 LDS 或 out 写回未落地�
 intrinsic 声明 as3 但值经 generic 铸造）；lowering 的 as3-annotated store
 与 generic 值的交互需要一轮 gdb/printf 定位。**修复前不得宣称 cp.async
 SUPPORTED**。Rust amdgcn.rs 镜像同步待做。
+
+### cp.async E2E fault 根因 + 修复（2026-11-03 续）
+
+**fault 根因（ptrtoint 仪表化定位）**：index_1d helper 返回 -1 哨兵 →
+cp.async 的 GEP 索引 = -1 → src = d_in - 4 → 4B load 跨入未映射页 → fault。
+链路：Step 5 给 index_1d helper 定义追加了 ntid 形参并在体内引用 %ntid_*，
+但 **MIR 导入的调用点只传 frame ptr**（1 参调 4 参函数）——llc 内联缺参 =
+poison，垃圾寄存器决定 helper 走计算路径还是哨兵路径。
+
+**修复（Step 5b）**：prep pass 给 index_{1,2,3}d 调用点补齐
+`i32 %ntid_x/y/z` 三实参（frame ptr 形态覆盖 as5/as0/裸 %name）。
+**嵌套检测器**：index_1d 体内调 `one_dimensional_launch(frame)`（1-D
+launch 形状检测 = ntid_y==1 && ntid_z==1）——同一缺参问题一层嵌套——
+regex 覆盖 `_dimensional_launch` 后缀（注意 mangling 是 `22one_...`，
+数字前缀与 `_dimensional` 之间有 `one`，不能 `[0-9]+_dimensional`）。
+幂等性已测（二跑不双补）。
+
+**修复后真卡**：test_cp_async_4 **PASS**（out[0]=100= input[0]，rc=0
+无 fault）；compile_all 无 fault（该 kernel 无 out 参数，exercise 形式）。
+
+**剩余开放**：mbarrier_bridges kernel 全序列挂起（逐桥 early-return 均
+独立完成且桥 1 数据正确；全序列挂点在桥间转移，疑 mbarrier_init 相位
+重置与仿真状态的交互）。**修复前 cp.async 报"部分 SUPPORTED"：基本
+ca/cg 形式（4/8/16B + zfill）上卡数据正确；mbarrier 桥接模式待修**。
