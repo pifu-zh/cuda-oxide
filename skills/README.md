@@ -30,5 +30,13 @@
 
 - **ZCode**：`ln -s "$(pwd)/skills/<name>" ~/.zcode/skills/<name>` 即可被
   agent 平台发现加载（SKILL.md 带 YAML frontmatter）。
-- **Codex**：通过仓库根 `AGENTS.md` 的 "GPU Adaptation Skills" 一节引用——
-  Codex 会话自动读取 AGENTS.md，按需读入对应 SKILL.md。
+- **Codex**：两层机制。
+  1. 仓库根 `AGENTS.md`（"GPU adaptation skills" 节，含命令式加载指令）
+     会话启动自动注入；SKILL.md 正文按其中指令读取。
+  2. 斜杠快捷入口：`.codex/prompts/gpu*.md` 已入库——支持项目级 prompts 的
+     Codex 版本里直接生效；不支持的版本复制到用户目录：
+     `mkdir -p ~/.codex/prompts && cp .codex/prompts/*.md ~/.codex/prompts/`
+     之后输入 `/gpu` 即可补全出全部入口：`/gpu`（路由）、`/gpu-methodology`、
+     `/gpu-rocm`、`/gpu-profile`、`/gpu-rust`。
+  3. 描述匹配发现：`ln -sfn "$(pwd)/skills/<name>" ~/.codex/skills/<name>`
+     （SKILL.md frontmatter 同款格式，实测该目录被 Codex 读取）。
