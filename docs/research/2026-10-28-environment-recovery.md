@@ -461,3 +461,24 @@ regex 覆盖 `_dimensional_launch` 后缀（注意 mangling 是 `22one_...`，
 独立完成且桥 1 数据正确；全序列挂点在桥间转移，疑 mbarrier_init 相位
 重置与仿真状态的交互）。**修复前 cp.async 报"部分 SUPPORTED"：基本
 ca/cg 形式（4/8/16B + zfill）上卡数据正确；mbarrier 桥接模式待修**。
+
+### bridges 挂起根因 + 修复（2026-11-03 续二）——cp.async 全绿
+
+**挂起根因**：bridges kernel 的 4 桥中桥 3/4 用 `init(count=2)` + 
+`.noinc` arrive + 显式 arrive = **需要 2 次递减**才归零；Step 18 首版把
+cp.async.mbarrier.arrive 全删 → 只剩显式 arrive → pending 2→1 永不归零
+→ test_wait 自旋挂起。桥 1/2 (count=1) 单 arrive 归零所以通过。
+
+**修复**：cp.async.mbarrier.arrive（plain 和 .noinc）= 一次正常 arrive
+（递减 1）：plain 的"tx 计数递增"在同步仿真下天然满足；.noinc 的"不递
+增"指跳过 tx 跟踪——两者 net = 递减 1。lower 到 `__port_mb_arrive`
+（bar 操作数文本原样透传，llc 物化 SSA/符号/常量 GEP）。
+
+**真卡（三 kernel 全 PASS）**：test_cp_async_4 out[0]=100 ✓；
+compile_all 无 fault ✓；**mbarrier_bridges out[0..3] = input[0..3]
+（memcmp 通过，无挂起无 fault）** ✓✓✓。
+
+**cp.async = SUPPORTED**（SOFTWARE EMULATION 类，同步形态）：ca/cg
+4/8/16B + zfill(.s) + mbarrier 桥接全部真卡逐值验证。语义收窄：异步
+重叠（vmcnt 深流水）为后续优化（微基准已证机制）；tx 字节计数跟踪
+内化于同步语义。

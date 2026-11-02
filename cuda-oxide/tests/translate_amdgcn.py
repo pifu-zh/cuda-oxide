@@ -94,6 +94,19 @@ def translate_nvvm_to_amdgcn(ll_text: str) -> str:
     )
     text = _append_ntid_kernarg_params(text)
 
+    # 5b. [adapt-rocm 2026-11-03] thread::index_{1,2,3}d 调用点补 ntid 实参。
+    #     helper 签名 = (frame ptr, ntid_x, ntid_y, ntid_z)（Step 5 给 helper
+    #     定义追加了形参并在体内引用 %ntid_*），但 MIR 导入的调用点只传
+    #     frame ptr——llc 内联时缺参 = poison，垃圾寄存器决定 helper 走计算
+    #     路径还是 -1 哨兵路径（cp_async_small 实证：垃圾 = 0 → index = -1
+    #     → cp.async GEP -1 → 跨页 load fault）。调用点补齐三实参。
+    text = re.sub(
+        r"((?:tail )?call\s+(?:i64|i1)\s+@_R[\w.$]*?(?:index_1d|index_2d|index_3d|_dimensional_launch)"
+        r"[\w.$]*?\(\s*(?:ptr(?: addrspace\([05]\))?\s*)?%[\w.$]+)\s*\)",
+        r"\1, i32 %ntid_x, i32 %ntid_y, i32 %ntid_z)",
+        text,
+    )
+
     # 6. nctaid .y|.z → 常量 1（1D grid：launch 的 y,z 网格维度为 1；
     #    ntid 不在此列——见步骤 5）
     text = re.sub(
@@ -1840,7 +1853,7 @@ _CP_WAIT_RE = re.compile(
 )
 
 _CP_MBARRIER_RE = re.compile(
-    r"^\s*(?:tail )?call\s+void\s+@llvm\.nvvm\.cp\.async\.mbarrier\."
+    r"^(?P<indent>\s*)(?:tail )?call\s+void\s+@llvm\.nvvm\.cp\.async\.mbarrier\."
     r"arrive(?:\.noinc)?(?:\.shared)?\("
 )
 
@@ -1890,9 +1903,19 @@ def _rewrite_cp_async(text: str) -> str:
         if _CP_DECLARE_RE.match(line):
             continue  # 内建声明删除（lowering 内联在调用点）
 
-        if _CP_COMMIT_RE.match(line) or _CP_WAIT_RE.match(line) \
-                or _CP_MBARRIER_RE.match(line):
-            continue  # 同步仿真：组/等待/异步到达语义均内化于程序序
+        if _CP_COMMIT_RE.match(line) or _CP_WAIT_RE.match(line):
+            continue  # 同步仿真：组/等待语义均内化于程序序
+
+        m = _CP_MBARRIER_RE.match(line)
+        if m:
+            # cp.async.mbarrier.arrive[.noinc] = 一次 arrive（递减 pending）：
+            # plain 形式的"tx 计数递增"在同步仿真下天然满足；.noinc 的
+            # "不递增"指跳过 tx 跟踪——两者 net = 递减 1。删除会让
+            # init(count=2) 的桥（.noinc 形式）永远等不到 pending 归零
+            # （cp_async_small bridges 3/4 挂起实证）。
+            argstr = _CP_ATTR_TAIL_RE.sub("", line[m.end():])
+            out.append(f"{indent}call void @__port_mb_arrive({argstr})")
+            continue
 
         m = _CP_CALL_RE.match(line)
         if not m:
