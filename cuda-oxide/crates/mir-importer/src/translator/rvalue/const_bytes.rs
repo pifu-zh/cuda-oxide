@@ -152,14 +152,67 @@ pub(super) fn rust_array_type_info(
     }
 }
 
+/// Element byte size derived from the dialect type alone. Safe for primitive
+/// scalars (whose width the dialect type carries exactly) and nested arrays of
+/// them; rejected for tuples/structs, whose padding and field order only the
+/// rustc layout knows. This is the anchor for byte materialization without a
+/// rustc type — e.g. synthesized arrays whose bytes come from outside MIR
+/// (device panic messages recovered by the collector).
+fn dialect_element_byte_size(
+    ctx: &Context,
+    element_ty_ptr: TypeHandle,
+) -> TranslationResult<u64> {
+    use pliron::builtin::types::{FP32Type, FP64Type, IntegerType};
+    let elem_obj = element_ty_ptr.deref(ctx);
+    if elem_obj.is::<FP64Type>() {
+        return Ok(8);
+    }
+    if elem_obj.is::<FP32Type>() {
+        return Ok(4);
+    }
+    if elem_obj.is::<MirFP16Type>() {
+        return Ok(2);
+    }
+    if let Some(int_ty) = elem_obj.downcast_ref::<IntegerType>() {
+        let width = int_ty.width();
+        if width % 8 != 0 {
+            return Err(input_error_noloc!(TranslationErr::unsupported(format!(
+                "Dialect-only byte materialization needs byte-sized integer elements, got {width}-bit"
+            ))));
+        }
+        return Ok((width / 8) as u64);
+    }
+    if let Some(nested) = elem_obj.downcast_ref::<dialect_mir::types::MirArrayType>() {
+        let nested_elem = nested.element_type();
+        let nested_count = nested.size();
+        let leaf = dialect_element_byte_size(ctx, nested_elem)?;
+        return nested_count
+            .checked_mul(leaf)
+            .ok_or_else(|| {
+                input_error_noloc!(TranslationErr::unsupported(
+                    "Nested dialect array byte size overflowed"
+                ))
+            });
+    }
+    Err(input_error_noloc!(TranslationErr::unsupported(
+        "Dialect-only byte materialization handles primitive scalars and nested \
+         arrays of them; tuple/struct elements need the rustc-layout path"
+    )))
+}
+
 /// Build a `MirConstructArrayOp` (and the necessary scalar / nested-array
 /// element ops) from a slice of raw bytes for an `array_ty`. Recurses on
 /// `MirArrayType` element types so multi-dimensional arrays (`[[T; M]; N]`,
 /// etc.) are handled by repeated decomposition.
+///
+/// `rust_array_ty` pins the element stride to the rustc layout and
+/// cross-checks the element count; `None` selects the dialect-only stride
+/// (see [`dialect_element_byte_size`]) for synthesized arrays that have no
+/// rustc type behind them.
 fn build_array_op_from_bytes(
     ctx: &mut Context,
     array_ty: TypeHandle,
-    rust_array_ty: rustc_public::ty::Ty,
+    rust_array_ty: Option<rustc_public::ty::Ty>,
     bytes: &[u8],
     block_ptr: Ptr<BasicBlock>,
     prev_op: Option<Ptr<Operation>>,
@@ -180,16 +233,33 @@ fn build_array_op_from_bytes(
         (arr_ty.element_type(), arr_ty.size())
     };
 
-    let (rust_element_ty, rust_element_count) = rust_array_type_info(rust_array_ty, loc.clone())?;
-    if rust_element_count != element_count {
-        return input_err!(
-            loc,
-            TranslationErr::unsupported(format!(
-                "Array constant length mismatch: Rust type has {rust_element_count} elements, dialect type has {element_count}"
-            ))
-        );
+    let element_byte_size;
+    let rust_element_ty_opt: Option<rustc_public::ty::Ty>;
+    match rust_array_ty {
+        Some(rust_array_ty) => {
+            let (rust_element_ty, rust_element_count) =
+                rust_array_type_info(rust_array_ty, loc.clone())?;
+            if rust_element_count != element_count {
+                return input_err!(
+                    loc,
+                    TranslationErr::unsupported(format!(
+                        "Array constant length mismatch: Rust type has {rust_element_count} elements, dialect type has {element_count}"
+                    ))
+                );
+            }
+            element_byte_size = rust_type_layout_size(rust_element_ty, loc.clone())?;
+            rust_element_ty_opt = Some(rust_element_ty);
+        }
+        None => {
+            element_byte_size = usize::try_from(dialect_element_byte_size(ctx, element_ty_ptr)?)
+                .map_err(|_| {
+                    input_error_noloc!(TranslationErr::unsupported(
+                        "Dialect array element byte size does not fit usize"
+                    ))
+                })?;
+            rust_element_ty_opt = None;
+        }
     }
-    let element_byte_size = rust_type_layout_size(rust_element_ty, loc.clone())?;
 
     let element_count_usize = usize::try_from(element_count).map_err(|_| {
         input_error_noloc!(TranslationErr::unsupported(format!(
@@ -393,7 +463,7 @@ fn build_array_op_from_bytes(
             ElemKind::Array => build_array_op_from_bytes(
                 ctx,
                 element_ty_ptr,
-                rust_element_ty,
+                rust_element_ty_opt,
                 chunk,
                 block_ptr,
                 last_op,
@@ -401,7 +471,9 @@ fn build_array_op_from_bytes(
             )?,
             ElemKind::Tuple | ElemKind::Struct => translate_constant_value_from_bytes(
                 ctx,
-                &rust_element_ty,
+                rust_element_ty_opt.as_ref().expect(
+                    "tuple/struct elements are only reachable on the rust-layout path",
+                ),
                 element_ty_ptr,
                 chunk,
                 block_ptr,
@@ -452,7 +524,7 @@ fn translate_array_value_constant_inner(
     build_array_op_from_bytes(
         ctx,
         array_ty,
-        rust_array_ty,
+        Some(rust_array_ty),
         &bytes,
         block_ptr,
         prev_op,
