@@ -370,6 +370,22 @@ const_str_text（tcx eval + try_get_slice_bytes_for_diagnostics）能完整取�
 4. `MirRefOp` 要求 result pointee == operand 的点子（ref 消费的是点子类型的
    值，不是指针）。
 
+**[2026-11-04 进展：地基件落地 bdc2416b0]** `build_array_op_from_bytes` 改为
+`Option<rustc Ty>`：Some 臂保持 rustc-layout 步长与元素数交叉校验（全部既有
+调用不变，1213/1213 测试过）；None 臂 = `dialect_element_byte_size`——从
+dialect 类型直接导出元素字节大小（原始标量 + 其嵌套数组；tuple/struct 拒绝，
+padding/字段序只有 rustc layout 知道）。这打通了「字节来自 MIR 之外」的数组
+合成——panic 消息正是这种（collector 按 span 取文本，importer 无 rustc Ty）。
+四道验证器墙中第 2/3 道（跨点子 cast / 点子精确）不再需要绕过：合成数组值
+走 promoted-const 同款 MirRefOp（同点子 ref）+ GEP-0（正常 GEP 非 cast）。
+
+**剩余管线（精确清单）**：(1) cuda-device 根模块 `__cuda_panic_str(&[u8;64])`
+钩子（printf/hostcall 链打印+换行，§2.5b 基础设施现成）；(2) collector span 键
+注册表（StrConstScan 已遍历 ConstOperand，record by terminator span）；(3)
+importer `is_dropped_panic_call` 臂：查 registry → dialect `[ui8; N]` 数组
+物化（新 None 臂）→ MirRefOp+GEP-0 → call + 既有 trap；(4) 入队臂
+（find_cgu_definition_for_symbol 跨 CGU，已修 ICE 的 mir_keys 扫描形态）；
+(5) 端到端例子 + 测试。估计 = 一个完整会话的子项目。
 **正确路径（下一步工程）**：str/byte-string 常量 → 设备端「按值物化」需要
 `build_array_op_from_bytes` 的无 rustc-Ty 变体（现在强制要 rust_array_ty 做
 元素布局校验），物化成数组值后走 promoted-const 同款
