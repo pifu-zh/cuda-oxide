@@ -2086,6 +2086,14 @@ fn rewrite_vprintf_to_ockl(text: &str) -> String {
                         seq.push(format!("{indent}%{vv}l = zext i32 %{vv} to i64"));
                         slots.push(format!("i64 %{vv}l"));
                     }
+                    "ptr" => {
+                        // 指针槽（panic 消息路径：{ ptr } args 缓冲的 %s 实参）：
+                        // load 后 ptrtoint 升 i64，host 侧 %s 由格式化器解引用
+                        // 设备指针（probe2 真卡实证）。
+                        seq.push(format!("{indent}%{vv} = load ptr, ptr %{gv}, align 8"));
+                        seq.push(format!("{indent}%{vv}l = ptrtoint ptr %{vv} to i64"));
+                        slots.push(format!("i64 %{vv}l"));
+                    }
                     _ => {
                         ok = false;
                         break;

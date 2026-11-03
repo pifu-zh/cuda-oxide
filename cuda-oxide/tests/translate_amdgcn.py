@@ -1161,6 +1161,12 @@ def _emit_arg_slots(indent, args_ptr, args_ty, fields, base, seq):
             seq.append(f"{indent}%{v}x = fpext float %{v} to double")
             seq.append(f"{indent}%{v}b = bitcast double %{v}x to i64")
             vals.append(f"i64 %{v}b")
+        elif ft == "ptr":
+            # 指针槽（panic 消息路径：{ ptr } args 缓冲的 %s 实参）：
+            # load 后 ptrtoint 升 i64，host 侧 %s 由格式化器解引用设备指针。
+            seq.append(f"{indent}%{v} = load ptr, ptr %{g}, align 8")
+            seq.append(f"{indent}%{v}l = ptrtoint ptr %{v} to i64")
+            vals.append(f"i64 %{v}l")
         else:
             return None
     while len(vals) < 7:

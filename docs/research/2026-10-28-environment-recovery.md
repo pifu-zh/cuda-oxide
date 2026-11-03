@@ -400,6 +400,19 @@ padding/字段序只有 rustc layout 知道）。这打通了「字节来自 MIR
    MirCallOp 构造层加一个 pre-materialized 变体）。
 4. 端到端例子 + 卡上测试（host stdout 捕获 "device panic: ..."）+ 双侧镜像
    评估（助手为真实 Rust，预计无需 prep-pass 手术 = 无镜像负担）。
+
+**[2026-11-04 step 2b：%s 探针裁定 + ptr 槽修复]** 独立 %s 探针
+（vprintf("%s\n", {ptr} 缓冲) 走 Python Step 17 全链）暴露**真管线缺口**：
+_emit_arg_slots 无 `ptr` 字段提升分支（信封回落保留 vprintf → llc 变参拒绝）
+——双侧已修（ptrtoint 升 i64 槽）。**%s 语义裁定**：hipcc 的 %s 真卡正常
+（对照 kernel 全对），但 ockl 协议的字符串拷贝发生在**设备侧**（ockl.bc 的
+vprintf 实现对 %s 调 append_string_n 预拷贝进 hostcall buffer）；host 侧
+格式化器**没有**指针解引用服务——我们把裸指针推成 raw slot → host 打出
+乱码（2 字节）。**结论：panic 助手 v4 = 直调 ockl appenders**（cuda-device
+内 `extern "C"` 声明 `__ockl_printf_begin/append_string_n`——真实 foreign
+item 走既有 foreign-callee 机制；ockl.bc 链接门 `contains("__ockl_printf")`
+自动触发；metadata 注入门需同步放宽到"出现 __ockl_printf 即注入"），长度
+由 importer 侧已知（消息全局 N 精确），不走 %s、无 host 依赖。
 **正确路径（下一步工程）**：str/byte-string 常量 → 设备端「按值物化」需要
 `build_array_op_from_bytes` 的无 rustc-Ty 变体（现在强制要 rust_array_ty 做
 元素布局校验），物化成数组值后走 promoted-const 同款
