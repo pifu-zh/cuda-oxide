@@ -379,13 +379,27 @@ padding/字段序只有 rustc layout 知道）。这打通了「字节来自 MIR
 四道验证器墙中第 2/3 道（跨点子 cast / 点子精确）不再需要绕过：合成数组值
 走 promoted-const 同款 MirRefOp（同点子 ref）+ GEP-0（正常 GEP 非 cast）。
 
-**剩余管线（精确清单）**：(1) cuda-device 根模块 `__cuda_panic_str(&[u8;64])`
-钩子（printf/hostcall 链打印+换行，§2.5b 基础设施现成）；(2) collector span 键
-注册表（StrConstScan 已遍历 ConstOperand，record by terminator span）；(3)
-importer `is_dropped_panic_call` 臂：查 registry → dialect `[ui8; N]` 数组
-物化（新 None 臂）→ MirRefOp+GEP-0 → call + 既有 trap；(4) 入队臂
-（find_cgu_definition_for_symbol 跨 CGU，已修 ICE 的 mir_keys 扫描形态）；
-(5) 端到端例子 + 测试。估计 = 一个完整会话的子项目。
+**[2026-11-04 step 2a：ockl 传输探针双绿，0cc085855]** 直调
+`__ockl_printf_append_string_n` 的两个探针 kernel 在真卡打印完整字符串：
+(a) 模块级 constant 指针；(b) addrspace(1) 全局 → addrspacecast → generic——
+**ockl hostcall 的字符串拷贝是设备侧行为，as1 全局指针直接可用**；panic
+消息传输语义钉死（脚本 scripts/panic_probe/，链接配方在文件头注释）。
+
+**[设计 v3（探针后定稿，替代 collector-registry 方案——消息字节就在 panic
+块的 MIR ConstOperand 里，无需 TyCtxt）]**：
+1. cuda-device 加真实 Rust 助手 `__cuda_panic_str(msg: *const u8, len: u64)
+   -> !`：`__gpu_vprintf("%s\n", buf)`（debug.rs:193 既有钩子——真实 FnDef，
+   mir-lower convert_vprintf → Step 17 ockl 展开 → metadata+ockl.bc 链接全部
+   自动）+ `asm!("trap;")`（diverging，调用即终结，无需后继块）。
+2. importer `is_dropped_panic_call` 臂：扫描块内语句的 ConstOperand（Allocated
+   + provenance 跟随，const_alloc 机制现成）取消息字节 → `emit_promoted_
+   immutable_global`（现成，去重）物化 as1 全局 → MirConstantOp(len) →
+   发射**分歧调用**到 `__cuda_panic_str`（与被丢弃 panic 调用同形）替代裸 trap。
+3. 唯一工程点：call 发射原语需接受**预物化 Value** 实参（现 emit_function_call
+   从 value_map 翻译 mir::Operand 局部——合成值不在其中；helpers.rs 的
+   MirCallOp 构造层加一个 pre-materialized 变体）。
+4. 端到端例子 + 卡上测试（host stdout 捕获 "device panic: ..."）+ 双侧镜像
+   评估（助手为真实 Rust，预计无需 prep-pass 手术 = 无镜像负担）。
 **正确路径（下一步工程）**：str/byte-string 常量 → 设备端「按值物化」需要
 `build_array_op_from_bytes` 的无 rustc-Ty 变体（现在强制要 rust_array_ty 做
 元素布局校验），物化成数组值后走 promoted-const 同款
