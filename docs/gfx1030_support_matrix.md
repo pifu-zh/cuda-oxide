@@ -39,7 +39,7 @@
 | f32/f64 算术与数学（libdevice→ocml 符号映射） | FULL | [hist] TANPROBE f32/f64 ≤2ULP；[e2e] pytest ocml 测试 + math_tan 例 batch PASS | ocml 链接需 ocml.bc+oclc_* 配置（cargo-oxide 已自动化） |
 | 整数 dot（dp4a/dp2a） | FULL | [hist] dotprod 例四符号组合 GPU PASS；[e2e] pytest | — |
 | packed FP8/fp4、MFMA/WMMA 矩阵指令 | UNSUPPORTED | [probe] gfx1030 无 v_mfma（缺 mai-insts）/wmma（缺 wmma-256b-insts）；静态 assert 拒绝（RDNA2 硬件事实） | 升级 RDNA3/4 卡后同探针复测 |
-| TMA/块异步拷贝 | UNSUPPORTED(硬件) / PARTIAL(软件等价) | [probe] RDNA2 无 TDM；buffer_load 直通 LDS 仅 b32 [static]；[hist] 软件双缓冲流水 365 GB/s（plain 基线 78.4%，15 配置正确性全绿） | RDNA3 dlds / RDNA4 TDM 出现后按同基准复测 |
+| TMA/块异步拷贝 | UNSUPPORTED(硬件) / **SUPPORTED(软件等价，归约形态 2026-11-04)** | [probe] RDNA2 无 TDM；[hist] buffer_load 直通 LDS 仅 b32（llc）；[e2e] 手写 ISA 微基准：gmem→LDS 归约 553 GB/s=96.1%（8×255MiB 轮转+中位数，verify ok）、gmem→gmem 复制 435 GB/s=75.6%、ds_write_b128/ds_read_b128 真机正确（推翻旧"仅 b32"探针）；分母=经验上限 575.5 GB/s（256-bit，见替代目录 §3） | 复制形态 75.6%→80%+ 为开放优化；RDNA3 dlds/RDNA4 TDM 出现后同基准复测 |
 
 ## 3. Kernel ABI / 参数传递 / Code Object
 
@@ -72,7 +72,7 @@
 | 全组 barrier（barrier0 → s.barrier） | FULL | [e2e] barrier_smoke 例 [hist] + 本机 batch | — |
 | 静态共享内存（LDS，undef 初始化契约） | FULL | [hist] sharedmem 例 GPU PASS；[e2e] pytest alloca/addrspace 测试 | — |
 | mbarrier（软件单字状态机：pending/expected/phase） | FULL | [e2e] 本机 test_barrier_mbarrier_software 三 kernel 语义断言全过（补重放 Step 16 后） | expect_tx 字节级（=vmcnt 部分排空等价）待实现 |
-| cp.async（gmem→shared 异步标量拷贝，ca/cg 4/8/16B + zfill + mbarrier 桥接） | **SUPPORTED（SOFTWARE EMULATION，同步形态，2026-11-03）** | [e2e] Step 18 prep-pass lowering：cp.async 内建 → 同步向量 load(as1) + LDS store(as3)（dst/src 操作数文本透传，llc 原生物化 SSA/符号/常量 GEP）；.s 零填 = 字节粒度 load + select（runtime src_size 用 smax/smin 钳制防越界/下溢）；commit/wait 删除（同步语义内化于程序序）；mbarrier.arrive[.noinc] → `__port_mb_arrive`（递减 1——删除会让 count=2 桥的 pending 永不归零，bridges 挂起实证）。**真卡三 kernel 全 PASS**：test_cp_async_4 out[0]=100、compile_all（9 形式 exercise 无 fault）、mbarrier_bridges out[0..3]=input[0..3]（memcmp 通过）；cp_async_zfill 三测试（src_size=4/2/0）全 PASS。Python Step 18 + Rust amdgcn.rs 镜像双管线落地；批回归 101/105 持平 | 语义收窄：异步重叠（vmcnt 深流水）为后续优化（soft_tma_bench 微基准已证机制：lds_b8 正确+75%）；tx 字节计数跟踪内化于同步语义（依赖 tx 计数的模式改用 wait_all） |
+| cp.async（gmem→shared 异步标量拷贝，ca/cg 4/8/16B + zfill + mbarrier 桥接） | **SUPPORTED（SOFTWARE EMULATION，同步形态，2026-11-03）** | [e2e] Step 18 prep-pass lowering：cp.async 内建 → 同步向量 load(as1) + LDS store(as3)（dst/src 操作数文本透传，llc 原生物化 SSA/符号/常量 GEP）；.s 零填 = 字节粒度 load + select（runtime src_size 用 smax/smin 钳制防越界/下溢）；commit/wait 删除（同步语义内化于程序序）；mbarrier.arrive[.noinc] → `__port_mb_arrive`（递减 1——删除会让 count=2 桥的 pending 永不归零，bridges 挂起实证）。**真卡三 kernel 全 PASS**：test_cp_async_4 out[0]=100、compile_all（9 形式 exercise 无 fault）、mbarrier_bridges out[0..3]=input[0..3]（memcmp 通过）；cp_async_zfill 三测试（src_size=4/2/0）全 PASS。Python Step 18 + Rust amdgcn.rs 镜像双管线落地；批回归 101/105 持平 | 语义收窄：异步重叠（vmcnt 深流水）为后续优化（soft_tma_bench 微基准已证机制：lds_bN 96.1%（2026-11-04 诚实重测，块基址 bug 修正后））；tx 字节计数跟踪内化于同步语义（依赖 tx 计数的模式改用 wait_all） |
 | counted barrier（LDS 计数器+世代自旋，旁观 warp 安全） | FULL | [hist] 128 线程 wave64 含旁观 warp GPU PASS；[e2e] 本机 pytest IR 断言 | id 常量缺 0..15 范围检查（review P1） |
 | warp shuffle 4 模式 × f32/i32 + f64 asm 拆分 + 动态 mask(up,0) | FULL | [hist] 四模式真卡验证；[e2e] 本机 pytest 全形态（含 mbcnt.lo+hi 两段 lane 号，wave64 正确） | — |
 | 部分交换（字面 mask≠-1）/ 非 32 宽度 clamp | PARTIAL(信封) | [static] 信封外保留 nvvm 调用让 llc 显式拒绝（fail-loudly 设计，非静默错） | 按需扩信封 |

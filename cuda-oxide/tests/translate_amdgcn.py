@@ -1961,8 +1961,10 @@ def _rewrite_cp_async(text: str) -> str:
         bytes_out = []
         for i in range(size):
             if not const_s:
-                # runtime src_size：idx = min(i, src_size-1)（钳制不越界）
-                out.append(f"{indent}%{pfx}.lim = add i32 {ssz_val}, -1" if i == 0 else "")
+                # runtime src_size：idx = min(i, max(src_size-1, 0))（smax
+                # 钳底防 src_size=0 下溢为 -1 GEP）
+                out.append(f"{indent}%{pfx}.m1 = sub i32 {ssz_val}, 1" if i == 0 else "")
+                out.append(f"{indent}%{pfx}.lim = call i32 @llvm.smax.i32(i32 %{pfx}.m1, i32 0)" if i == 0 else "")
                 out.append(f"{indent}%{pfx}.idx{i} = call i32 @llvm.smin.i32(i32 {i}, i32 %{pfx}.lim)")
                 out.append(f"{indent}%{pfx}.gep{i} = getelementptr i8, {src}, i32 %{pfx}.idx{i}")
                 out.append(f"{indent}%{pfx}.ld{i} = load i8, ptr addrspace(1) %{pfx}.gep{i}, align 1")
@@ -1990,10 +1992,15 @@ def _rewrite_cp_async(text: str) -> str:
             out.append(f"{indent}store i32 %{pfx}.w{d}_3, ptr addrspace(3) %{pfx}.dgep{d}, align 4")
 
     joined = "\n".join(out)
+    decls = []
     if "@llvm.smin.i32" in joined and "declare i32 @llvm.smin.i32" not in text:
+        decls.append("declare i32 @llvm.smin.i32(i32, i32)")
+    if "@llvm.smax.i32" in joined and "declare i32 @llvm.smax.i32" not in text:
+        decls.append("declare i32 @llvm.smax.i32(i32, i32)")
+    if decls:
         idx = joined.find("\ndefine ")
         if idx >= 0:
-            joined = joined[:idx] + "\ndeclare i32 @llvm.smin.i32(i32, i32)\n" + joined[idx:]
+            joined = joined[:idx] + "\n" + "\n".join(decls) + "\n" + joined[idx:]
     return joined
 
 

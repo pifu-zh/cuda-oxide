@@ -400,11 +400,27 @@ hipErrorNoKernelImageForDevice）；结果布局/累加器 VGPR 不得与流水�
 + ds_write_b128 + vmcnt(B) 部分排空的机制成立；plain1 全规模（320 block）
 也正确（423-427 GB/s，N 口径 73-74%）。
 
-**开放（诚实记录）**：多 wave/CU（8 wave）时 deep 变体在 ~34% 覆盖处提前
-退出且数据不完整（wave 数依赖、无 fault、计时相应缩短）；计数器仪表显示
-drain 数减半。疑点集中在 LGKM/VM 队列在多 wave 下的交互或 s17 记账。修复前
-**不得引用任何全规模 deep 变体带宽数字**；旧注册表 78.4% 数字在重建基准上
-尚未复现。plain1 的 423 GB/s（73-74%）是本轮唯一可引用的全规模数字。
+**开放（诚实记录）→ [2026-11-04 已闭环]**：全规模"~34% 提前退出/FAIL"的
+根因 = **gen_kernels.py prologue 块基址公式错误**：`s_lshl_b32 s11, s10, 4`
+（块基址 = wg×qpb×16），而一个 quad = 32 lane × 16B = **512B**（正确 = <<9）。
+后果：32 路块切片以 26,112B 步长重叠，dst 只被写到前 9,165,312 B，其余未写；
+所报带宽 = 9.16MB footprint 上的事务速率（df4/lds ≈29× 虚高）且 L2 常驻。
+lds 的 5% 容差验证与 block-0 sum 指纹对 4000B 周期 pattern 的基址漂移盲视，
+仅 df4 的逐字节 memcmp（布局敏感）暴露——期间被误判为"vmcnt 竞态""调度
+饥饿""运行时 kernarg 乱序"等假说全部证伪（调试器自身的 region 步长 ÷4、
+dst 步长错位、atoi 占位符 pinning 三个伪影亦被排除）。连带修正：
+(a) 计数器仪表第二半 `v154 += b` 增量此前漏发（cnt 恒 = (qpb/8+1)×b 谎报）；
+(b) verify launch 需 memset→hipDeviceSynchronize→launch 屏障，pass 间需
+hipDeviceSynchronize（大 fill 与 compute kernel 无屏障竞态出洞）；
+(c) vmcnt(N) 流水恢复（"vmcnt 竞态"从未成立），6 变体 × 8 轮转 × 320 块
+全 verify ok。
+**[2026-11-04 诚实全规模数字]**（分母 = 经验上限 575.5 GB/s；256-bit @ 18G，
+由纯读 98.3% + triad 90-95% + 本轮 lds 96.1% 三独立源共证；卡 0x73a5/16GB
+内存配置 256-bit，ROCm props busWidth=256 正确，vBIOS 名"6950 XT"不代表
+512-bit）：lds_bN = 553 GB/s = **96.1-96.2%**（完美替代档）；df4_bN =
+435 GB/s = 75.6-75.7%（良好档，copy 形态开放优化）；plain1 = 464 GB/s =
+80.6%。旧 78.4% 数字正式作废（同族测量伪影）。详录见
+research/gfx1030-substitution-catalogue.md §3。
 
 ## cp.async 软仿真 lowering（2026-11-03，Python Step 18 落地，Rust 镜像待做）
 

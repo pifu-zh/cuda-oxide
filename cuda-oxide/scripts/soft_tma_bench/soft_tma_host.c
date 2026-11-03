@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define CK(x) do { hipError_t _e = (x); if (_e != hipSuccess) { \
     printf("HIP error %s at %d\n", hipGetErrorString(_e), __LINE__); return 1; } } while (0)
@@ -25,6 +26,11 @@ int main(int argc, char** argv) {
     hipDeviceProp_t p; CK(hipGetDeviceProperties(&p, 0));
     printf("device: %s SMs=%d sclk=%dkHz mclk=%dkHz\n", p.name,
            p.multiProcessorCount, p.clockRate, p.memoryClockRate);
+    /* Empirical bandwidth ceiling of this card is ~576 GB/s: pure-read peaked at
+     * 98.3% of 575.5 (2026-11 archive), triad at 90-95%, and the soft-TMA gmem->LDS
+     * kernel below at 96.1% (553/575.5) over cold 255MiB regions. The spec-sheet
+     * "6950 XT" name implies 512-bit@18G (1152), but device 0x73a5 with 16GB is a
+     * 256-bit Navi21 memory config; the ROCm-reported memoryBusWidth=256 is correct. */
     double theory = 16.0 * p.memoryClockRate * 1000.0 * (p.memoryBusWidth / 8.0);
     printf("theory: %.1f GB/s\n", theory / 1e9);
 
@@ -67,13 +73,14 @@ int main(int argc, char** argv) {
     struct { void* src; void* src0; void* dst; long long qpb; } kargs = { src, src, dst, qpb };
 
     /* warm the DVFS state: long loop using the first kernel */
-    {
+    { const char* nw = getenv("STMA_NOWARM");
+    if (!nw) {
         hipFunction_t fn; CK(hipModuleGetFunction(&fn, mod, "plain1"));
         void* args[] = { &kargs.src, &kargs.dst, &kargs.qpb };
         for (int w = 0; w < 1500; w++)
             CK(hipModuleLaunchKernel(fn, blocks, 1, 1, 32, 1, 1, 0, 0, args, NULL));
         CK(hipDeviceSynchronize());
-    }
+    } }
 
     printf("\n%-10s %10s %12s %9s %9s\n", "variant", "ms", "GB/s(r+w)", "%theory", "verify");
     for (int v = 0; v < NV; v++) {
@@ -84,11 +91,14 @@ int main(int argc, char** argv) {
         void* args[] = { &kargs.src, &kargs.dst, &kargs.qpb };
         float times[ROTATIONS];
         hipEvent_t ev0, ev1; CK(hipEventCreate(&ev0)); CK(hipEventCreate(&ev1));
-        for (int r = 0; r < ROTATIONS; r++) {
-            kargs.src = (void*)((float*)kargs.src0 + (long long)r * (bytes / 4));
+        int timed_n = ROTATIONS; { const char* tn = getenv("STMA_TIMED_N"); if (tn) timed_n = atoi(tn); }
+        int timed_rot = 1; { const char* tr = getenv("STMA_TIMED_ROT"); if (tr) timed_rot = atoi(tr); }
+        for (int r = 0; r < timed_n; r++) {
+            kargs.src = (void*)((float*)kargs.src0 + (long long)(timed_rot ? r : 0) * (bytes / 4));
             CK(hipEventRecord(ev0, 0));
             CK(hipModuleLaunchKernel(fn, blocks, 1, 1, 32, 1, 1, 0, 0, args, NULL));
             CK(hipEventRecord(ev1, 0)); CK(hipEventSynchronize(ev1));
+            CK(hipDeviceSynchronize());  /* hard drain: overlapping passes corrupt dst and the clock */
             CK(hipEventElapsedTime(&times[r], ev0, ev1));
         }
         CK(hipEventDestroy(ev0)); CK(hipEventDestroy(ev1));
@@ -129,7 +139,12 @@ int main(int argc, char** argv) {
             }
             free(h); free(hsrc);
         } else {
+            /* verify launch: region 0 (the timed passes rotated regions --
+               their dst writes are per-region and would false-FAIL the
+               memcmp against region 0's reference) */
+            kargs.src = kargs.src0;
             CK(hipMemset(dst, 0, bytes));  /* sentinel: whole dst */
+            CK(hipDeviceSynchronize());  /* barrier: the big fill races the kernel otherwise */
             CK(hipModuleLaunchKernel(fn, blocks, 1, 1, 32, 1, 1, 0, 0, args, NULL));
             CK(hipDeviceSynchronize());
             float* h = (float*)malloc(bytes);
@@ -137,7 +152,9 @@ int main(int argc, char** argv) {
             CK(hipMemcpy(h, dst, bytes, hipMemcpyDeviceToHost));
             CK(hipMemcpy(hsrc, src, bytes, hipMemcpyDeviceToHost));
             bad = memcmp(h, hsrc, bytes) != 0;
-            if (bad) for (long long i = 0; i < bytes/4; i++) if (h[i] != hsrc[i]) { firstbad = i; gv = h[i]; ev = hsrc[i]; break; }
+            if (bad) {
+                for (long long i = 0; i < bytes/4; i++) if (h[i] != hsrc[i]) { firstbad = i; gv = h[i]; ev = hsrc[i]; break; }
+            }
             free(h); free(hsrc);
         }
         printf("%-10s %10.3f %12.1f %8.1f%% %9s", VARIANTS[v].name, best, gbs,

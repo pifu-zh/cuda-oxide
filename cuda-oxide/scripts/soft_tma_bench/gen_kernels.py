@@ -94,10 +94,12 @@ def prologue(name, b):
     out.append(f'{TAB}v_mbcnt_hi_u32_b32 v0, -1, v0')
     out.append(f'{TAB}v_lshlrev_b32 v1, 4, v0')                 # lane byte off (16B/lane)
     out.append(f'{TAB}v_mov_b32 v3, 0')                         # high word of lane off
-    # block byte base (u64) = (u64)wg_x * quads_per_block * 16
+    # block byte base (u64) = (u64)wg_x * quads_per_block * 512
+    # (a quad = 32 lanes x 16B = 512B; the old <<4 made 32 blocks overlap in a
+    #  9.16MB prefix and left the rest of dst untouched)
     out.append(f'{TAB}s_mul_i32 s10, s2, s8')
-    out.append(f'{TAB}s_lshl_b32 s11, s10, 4')                  # low  = base << 4
-    out.append(f'{TAB}s_lshr_b32 s12, s10, 28')                 # high = base >> 28
+    out.append(f'{TAB}s_lshl_b32 s11, s10, 9')                  # low  = base << 9
+    out.append(f'{TAB}s_lshr_b32 s12, s10, 23')                 # high = base >> 23
     out.append(f'{TAB}s_mov_b32 s20, s6')                       # s[20:21] = raw dst (results base)
     out.append(f'{TAB}s_mov_b32 s21, s7')
     out.append(f'{TAB}s_add_u32 s4, s4, s11')
@@ -151,6 +153,7 @@ def kernel_lds(name, b):
     body += ds_read_group(g1, b)
     body.append(f'{TAB}s_waitcnt lgkmcnt(0)')
     body += reduce_group(g1, b)
+    body.append(f'{TAB}v_add_nc_u32 v{ACC+4}, v{ACC+4}, {b}')
     body.append(f'{TAB}s_xor_b32 s16, s16, s18')
     body.append(f'{TAB}s_branch {name}_loop_a')
     # tails: reduce the last-landed group, store one 16B result per lane

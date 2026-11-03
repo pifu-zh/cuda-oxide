@@ -53,8 +53,8 @@
 
 | NV 能力 | 缺口与证据 | 替代策略 | 状态与证据 |
 |---|---|---|---|
-| cp.async（gmem→smem 异步标量） | 无硬件 cp.async | INSTRUCTION COMPOSITION：软件流水（s_clause 批量+vmcnt(N) 部分排空+寄存器中转） | 🔶 已实现+量化（历史微基准 365 GB/s=plain 78.4%；见 §3） |
-| TMA / cp.async.bulk.tensor | RDNA2 无 TDM（真 TMA 等价物 gfx1250/RDNA4 才有） | 同上（双缓冲深流水）；OOB 填零=V# 描述符硬件行为（恒开） | 🔶 功能可行已证明；性能 78.4% 未达 90% 线 |
+| cp.async（gmem→smem 异步标量） | 无硬件 cp.async | INSTRUCTION COMPOSITION：软件流水（s_clause 批量+vmcnt(N) 部分排空+寄存器中转） | 🔶 已实现+量化；同步形态已转 SUPPORTED（能力矩阵 2026-11-03）；流水带宽数字见 §3（2026-11-04 诚实重测） |
+| TMA / cp.async.bulk.tensor | RDNA2 无 TDM（真 TMA 等价物 gfx1250/RDMA4 才有） | 同上（双缓冲深流水）；OOB 填零=V# 描述符硬件行为（恒开） | ✅ [e2e] 2026-11-04 诚实重测：gmem→LDS 归约形态 553 GB/s=**96.1%**（完美替代档）；gmem→gmem 复制形态 435 GB/s=75.6%（良好档）；旧 78.4% 作废（测量伪影，见 §3） |
 | TensorMap 硬件 swizzle | 无硬件 swizzle | ALGORITHM SUBSTITUTION：软件 padding（行距 272/144B 先例） | ✅ [hist] aiter mha 实证 |
 
 ### 2.4 数学/数值
@@ -75,7 +75,7 @@
 | WMMA | [probe] 缺 wmma-256b-insts | HARDWARE_LIMITED |
 | fp8/fp4 硬件转换 | RDNA2 无（软件位操作解码可行=DeepGEMM 实证） | HARDWARE_LIMITED（功能可软替代） |
 | thread-block cluster / switch multicast | RDNA2 无（上游 CUDA 13 同样硬件门控） | HARDWARE_LIMITED；shim 显式 NOT_SUPPORTED |
-| 直通 LDS 宽度 | [probe] 汇编器拒 dwordx2/x4（仅 b32） | 硬件事实（soft-TMA 78.4% 上限的根因之一） |
+| ~~直通 LDS 宽度仅 b32~~ | **[2026-11-04 推翻]**：重建微基准 ds_write_b128/ds_read_b128 全变体真机正确（旧负探针结论有误，原始探针脚本毁于 10-19 无法复核） | buffer_load 直通 LDS 仍以 b32 为 llc 实测上限；手写 ISA 可用 b128 |
 
 ### 2.5b 设备端 printf（vprintf → ockl hostcall）——2026-10-26 新增
 
@@ -108,8 +108,8 @@
 
 **过程**（本节即 goal §7.5 的完整示范：研究不得停留在文档）：
 1. **源码侦查**：aiter 仅 gfx942 用 buffer_load→LDS 直通；gfx1030 路径退化为同步寄存器中转（上游未利用的优化通道）。aiter 在 gfx1030 的实际做法 = s_clause 批量 + vmcnt(N) 部分排空软件流水。
-2. **原语自证**（不信上游声明）：汇编器负探针确立直通 LDS 仅 b32；V# 描述符 OOB 硬件填零恒开（真机 8 组 flags）；vmcnt FIFO 序实证。
-3. **自研微基准**：双缓冲深流水 gmem→LDS，15 配置正确性全绿，最优 **365 GB/s = plain 基线 78.4%**——瓶颈结构性 = b32 宽度致指令密度 4-7×。流水机制本身有效（A→C +30%）。**[2026-11-02 收线]** 用户定档成绩梯度（软件替代功能，相对参照路径）：**60% 及格 / 70% 良好 / 80% 优秀 / 90% 完美替代 / 超硬件理论 = 超级大发现**。78.4% → **良好档**，本线关闭不再调优。RDNA3 dlds / RDNA4 TDM 硬件出现后同基准复跑（升级条件不变）。
+2. **原语自证**（不信上游声明）：V# 描述符 OOB 硬件填零恒开（真机 8 组 flags）；vmcnt FIFO 序实证。~~直通 LDS 仅 b32~~ 已被 2026-11-04 重建微基准推翻（ds_write_b128/ds_read_b128 全变体真机正确；旧负探针脚本毁于 10-19 无法复核）。
+3. **自研微基准**（2026-11-02 重建，2026-11-04 全规模闭环）：7 个手写 gfx1030 ISA kernel（plain1 串行参考 / df4_bN 深流水 gmem→VGPR→gmem 复制 / lds_bN 深流水 gmem→LDS→归约），8×255MiB 区域轮转 + 中位数协议。**历史 365 GB/s = 78.4% 数字作废**：该测量 kernel 的 prologue 块基址公式为 wg×qpb×16，正确值 = ×512（一个 quad = 32 lane × 16B = 512B）；32 路块切片重叠只覆盖 dst 前 9,165,312 B，其余未写——所报"带宽" = 9.16 MB footprint 上的事务速率（df4/lds ≈29× 虚高）且 L2 常驻，验证路径（lds 5% 容差、block-0 指纹）对 4000B 周期 pattern 的基址漂移盲视，仅 df4 memcmp（布局敏感）最终暴露。**2026-11-04 诚实数字（修正块基址 + 恢复 vmcnt(N) 流水 + 补齐计数器第二半增量后，7 变体 × 8 轮转 × 320 块全 verify ok）**：lds_bN = **553 GB/s = 96.1-96.2%（完美替代档）**；df4_bN = 435 GB/s = 75.6-75.7%（良好档，copy 形态未收线 = 开放优化项：深流水尚不及 plain1 串行参考，store 路径拖累）；plain1 = 464 GB/s = 80.6%（优秀档）。分母 = **经验上限 575.5 GB/s**（256-bit @ 18G；纯读 98.3% + triad 90-95% + 本轮 lds 96.1% 三独立源共证；卡 0x73a5 / 16GB / vBIOS 名"6950 XT"但内存配置为 256-bit，ROCm props 的 memoryBusWidth=256 正确，spec-sheet 1152 不适用于本卡）。附带修正：微基准驱动 side 的 verify launch 需 memset→hipDeviceSynchronize→launch 屏障（大 fill 与 compute kernel 无屏障会竞态出洞）；pass 间需 hipDeviceSynchronize 防重叠。RDNA3 dlds / RDNA4 TDM 硬件出现后同基准复跑。
 4. **意外发现**：LDS 消费者越界伪装硬件竞态（须线性恒等映射）；LLVM IV 链模 2³² 重关联致 MUBUF 基址 wrap（num_records clamp 解）；显式 vmcnt 后 LLVM 不插额外排空。
 5. **升级条件**：RDNA3 dlds / RDNA4 TDM 硬件出现后同基准复跑。
 

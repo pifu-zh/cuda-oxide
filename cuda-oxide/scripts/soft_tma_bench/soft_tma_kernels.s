@@ -15,8 +15,8 @@ plain1:
 	v_lshlrev_b32 v1, 4, v0
 	v_mov_b32 v3, 0
 	s_mul_i32 s10, s2, s8
-	s_lshl_b32 s11, s10, 4
-	s_lshr_b32 s12, s10, 28
+	s_lshl_b32 s11, s10, 9
+	s_lshr_b32 s12, s10, 23
 	s_mov_b32 s20, s6
 	s_mov_b32 s21, s7
 	s_add_u32 s4, s4, s11
@@ -133,8 +133,8 @@ df4_b4:
 	v_lshlrev_b32 v1, 4, v0
 	v_mov_b32 v3, 0
 	s_mul_i32 s10, s2, s8
-	s_lshl_b32 s11, s10, 4
-	s_lshr_b32 s12, s10, 28
+	s_lshl_b32 s11, s10, 9
+	s_lshr_b32 s12, s10, 23
 	s_mov_b32 s20, s6
 	s_mov_b32 s21, s7
 	s_add_u32 s4, s4, s11
@@ -364,8 +364,8 @@ df4_b8:
 	v_lshlrev_b32 v1, 4, v0
 	v_mov_b32 v3, 0
 	s_mul_i32 s10, s2, s8
-	s_lshl_b32 s11, s10, 4
-	s_lshr_b32 s12, s10, 28
+	s_lshl_b32 s11, s10, 9
+	s_lshr_b32 s12, s10, 23
 	s_mov_b32 s20, s6
 	s_mov_b32 s21, s7
 	s_add_u32 s4, s4, s11
@@ -735,8 +735,8 @@ df4_b16:
 	v_lshlrev_b32 v1, 4, v0
 	v_mov_b32 v3, 0
 	s_mul_i32 s10, s2, s8
-	s_lshl_b32 s11, s10, 4
-	s_lshr_b32 s12, s10, 28
+	s_lshl_b32 s11, s10, 9
+	s_lshr_b32 s12, s10, 23
 	s_mov_b32 s20, s6
 	s_mov_b32 s21, s7
 	s_add_u32 s4, s4, s11
@@ -1386,8 +1386,8 @@ lds_b4:
 	v_lshlrev_b32 v1, 4, v0
 	v_mov_b32 v3, 0
 	s_mul_i32 s10, s2, s8
-	s_lshl_b32 s11, s10, 4
-	s_lshr_b32 s12, s10, 28
+	s_lshl_b32 s11, s10, 9
+	s_lshr_b32 s12, s10, 23
 	s_mov_b32 s20, s6
 	s_mov_b32 s21, s7
 	s_add_u32 s4, s4, s11
@@ -1558,6 +1558,7 @@ lds_b4_loop_a:
 	v_add_f32 v151, v45, v151
 	v_add_f32 v152, v46, v152
 	v_add_f32 v153, v47, v153
+	v_add_nc_u32 v154, v154, 4
 	s_xor_b32 s16, s16, s18
 	s_branch lds_b4_loop_a
 lds_b4_tail_g0:
@@ -1739,8 +1740,8 @@ lds_b8:
 	v_lshlrev_b32 v1, 4, v0
 	v_mov_b32 v3, 0
 	s_mul_i32 s10, s2, s8
-	s_lshl_b32 s11, s10, 4
-	s_lshr_b32 s12, s10, 28
+	s_lshl_b32 s11, s10, 9
+	s_lshr_b32 s12, s10, 23
 	s_mov_b32 s20, s6
 	s_mov_b32 s21, s7
 	s_add_u32 s4, s4, s11
@@ -2051,6 +2052,7 @@ lds_b8_loop_a:
 	v_add_f32 v151, v77, v151
 	v_add_f32 v152, v78, v152
 	v_add_f32 v153, v79, v153
+	v_add_nc_u32 v154, v154, 8
 	s_xor_b32 s16, s16, s18
 	s_branch lds_b8_loop_a
 lds_b8_tail_g0:
@@ -2312,8 +2314,8 @@ lds_b16:
 	v_lshlrev_b32 v1, 4, v0
 	v_mov_b32 v3, 0
 	s_mul_i32 s10, s2, s8
-	s_lshl_b32 s11, s10, 4
-	s_lshr_b32 s12, s10, 28
+	s_lshl_b32 s11, s10, 9
+	s_lshr_b32 s12, s10, 23
 	s_mov_b32 s20, s6
 	s_mov_b32 s21, s7
 	s_add_u32 s4, s4, s11
@@ -2904,6 +2906,7 @@ lds_b16_loop_a:
 	v_add_f32 v151, v141, v151
 	v_add_f32 v152, v142, v152
 	v_add_f32 v153, v143, v153
+	v_add_nc_u32 v154, v154, 16
 	s_xor_b32 s16, s16, s18
 	s_branch lds_b16_loop_a
 lds_b16_tail_g0:
