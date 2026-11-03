@@ -21,6 +21,8 @@
 //! into `core::panicking` lowers to a device trap alone, statements included
 //! (see [`translate_block`]).
 
+use crate::translator::location::span_to_location;
+use super::rvalue;
 use super::statement;
 use super::statement_debug;
 use super::terminator;
@@ -58,7 +60,7 @@ pub fn translate_block(
     ctx: &mut Context,
     body: &mir::Body,
     mir_block: &mir::BasicBlock,
-    _idx: usize,
+    idx: usize,
     block_ptr: Ptr<BasicBlock>,
     value_map: &mut ValueMap,
     block_map: &[Ptr<BasicBlock>],
@@ -84,6 +86,31 @@ pub fn translate_block(
     // the trap aborts the kernel, and the memory state of an aborted kernel is
     // unspecified, so the store has no defined observer either way.
     if terminator::is_dropped_panic_call(&mir_block.terminator) {
+        // A recorded message turns the plain trap into report-then-trap: the
+        // collector scanned this same body and keyed the message by
+        // (function export name, block index).
+        let message = crate::translator::facts::panic_message_for(
+            &crate::translator::facts::current_function(),
+            idx as u32,
+        );
+        if let Some(bytes) = message {
+            let loc = span_to_location(ctx, mir_block.terminator.source_info.span);
+            if let Some(report) = rvalue::panic_report::emit_panic_message_report(
+                ctx,
+                &bytes,
+                block_ptr,
+                prev_op,
+                loc.clone(),
+            ) {
+                terminator::emit_dropped_panic_trap(
+                    ctx,
+                    &mir_block.terminator,
+                    block_ptr,
+                    Some(report),
+                );
+                return Ok(());
+            }
+        }
         terminator::emit_dropped_panic_trap(ctx, &mir_block.terminator, block_ptr, prev_op);
         return Ok(());
     }

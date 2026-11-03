@@ -1175,7 +1175,9 @@ def _emit_arg_slots(indent, args_ptr, args_ty, fields, base, seq):
 
 
 def _rewrite_vprintf(text: str) -> str:
-    if "@vprintf(" not in text:
+    # Modules with direct __ockl calls (the __cuda_panic_str helper) need the
+    # declares + the hostcall metadata even without a vprintf call to expand.
+    if "@vprintf(" not in text and "__ockl_printf" not in text:
         return text
     lines = text.split("\n")
 
@@ -1308,7 +1310,10 @@ def _rewrite_vprintf(text: str) -> str:
         used = True
 
     text = "\n".join(out)
-    if not used:
+    if not used and "__ockl_printf" not in text:
+        # Either a vprintf call was expanded, or the module already carries
+        # direct __ockl calls (the __cuda_panic_str helper): both need the
+        # ockl declares and the hostcall metadata.
         return text
     text = re.sub(r"declare i32 @vprintf\([^)]*\)\n?", "", text)
     decls = (

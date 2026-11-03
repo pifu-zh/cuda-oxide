@@ -497,6 +497,48 @@ pub fn emit_function_call(
     ))
 }
 
+/// Emit a call whose arguments are already-materialized MIR values.
+///
+/// The terminator-level call path ([`emit_function_call`]) translates
+/// `mir::Operand`s through the value map; the panic-report arm synthesizes
+/// values that exist in no MIR local (the message global pointer and the
+/// byte-length constant), so it needs this operand-free entry. The callee is
+/// a real in-module function (the collector enqueues its body), so no
+/// external signature is attached and the ordinary signature verification
+/// applies. The call is a plain mid-block op: the caller emits the ops that
+/// follow it (the trap) itself.
+pub(crate) fn emit_raw_call(
+    ctx: &mut Context,
+    callee_name: &str,
+    arg_values: Vec<Value>,
+    return_type: TypeHandle,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    loc: Location,
+) -> Ptr<Operation> {
+    use pliron::builtin::attributes::StringAttr;
+    let call_op = Operation::new(
+        ctx,
+        MirCallOp::get_concrete_op_info(),
+        vec![return_type],
+        arg_values,
+        vec![],
+        0,
+    );
+    call_op.deref_mut(ctx).set_loc(loc.clone());
+    let callee_attr = StringAttr::new(callee_name.into());
+    call_op.deref_mut(ctx).attributes.set(
+        pliron::identifier::Identifier::try_from("callee").unwrap(),
+        callee_attr,
+    );
+    if let Some(prev) = prev_op {
+        call_op.insert_after(ctx, prev);
+    } else {
+        call_op.insert_at_front(block_ptr, ctx);
+    }
+    call_op
+}
+
 /// Adapt a call pointer argument only when the address space is the
 /// sole difference from its declared ABI parameter type.
 fn normalize_call_pointer_argument(

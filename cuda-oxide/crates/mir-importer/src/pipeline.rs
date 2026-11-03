@@ -503,11 +503,13 @@ pub fn run_pipeline(
     device_externs: &[DeviceExternDecl],
     config: &PipelineConfig,
     known_defs: crate::translator::facts::KnownDefs,
+    panic_messages: std::collections::BTreeMap<(String, u32), Vec<u8>>,
 ) -> Result<CompilationResult, PipelineError> {
     // Install the driver-resolved lang-item ids and emitted-function identities
     // for this run. Replace (rather than merge) both thread-local sets so
     // stale state from a previous run on this thread cannot survive.
     crate::translator::facts::set_known_defs(known_defs);
+    crate::translator::facts::set_panic_messages(panic_messages);
     crate::translator::facts::set_emitted_functions(
         functions
             .iter()
@@ -537,6 +539,7 @@ pub fn run_pipeline(
 
     // Step 3: Translate all functions
     for func in functions {
+        crate::translator::facts::set_current_function(&func.export_name);
         if config.verbose {
             eprintln!(
                 "Translating {}: {}",
@@ -589,6 +592,24 @@ pub fn run_pipeline(
             eprintln!("{}", func_op_ptr.deref(&ctx).disp(&ctx));
         }
 
+        if let Err(verify_error) = verify_operation(&ctx, func_op_ptr, &func.export_name) {
+            // Temporary panic-path debugging: dump the failing function's
+            // blocks so the offending op sequence is visible.
+            eprintln!(
+                "[panic-report-debug] verify failed: {verify_error}"
+            );
+            use pliron::printable::Printable;
+            let func_ref = func_op_ptr.deref(&ctx);
+            for region in func_ref.regions() {
+                for block in region.deref(&ctx).iter(&ctx) {
+                    eprintln!("[panic-report-debug] block:");
+                    for op in block.deref(&ctx).iter(&ctx) {
+                        eprintln!("    {}", op.disp(&ctx));
+                    }
+                }
+            }
+            return Err(verify_error);
+        }
         verify_operation(&ctx, func_op_ptr, &func.export_name)?;
 
         if func.is_kernel
@@ -1371,7 +1392,14 @@ fn adversarial_export_name() -> u64 {
             allow_fma_contraction: true,
             module_disambiguator: None,
         };
-        let result = run_pipeline(&[], &[], &config, Default::default()).expect("pipeline run");
+        let result = run_pipeline(
+            &[],
+            &[],
+            &config,
+            Default::default(),
+            Default::default(),
+        )
+        .expect("pipeline run");
 
         assert_eq!(result.artifact_kind, CompilationArtifactKind::NvvmIr);
         assert_ne!(fs::read(&result.ll_path).unwrap(), b"stale");
@@ -1428,7 +1456,14 @@ fn adversarial_export_name() -> u64 {
             module_disambiguator: None,
         };
 
-        let result = run_pipeline(&[], &[], &config, Default::default()).expect("pipeline run");
+        let result = run_pipeline(
+            &[],
+            &[],
+            &config,
+            Default::default(),
+            Default::default(),
+        )
+        .expect("pipeline run");
 
         assert!(output_dir.is_dir());
         assert!(result.ll_path.is_file());
@@ -1529,7 +1564,14 @@ fn adversarial_export_name() -> u64 {
         }];
 
         let result =
-            run_pipeline(&[], &externs, &config, Default::default()).expect("pipeline run");
+            run_pipeline(
+                &[],
+                &externs,
+                &config,
+                Default::default(),
+                Default::default(),
+            )
+            .expect("pipeline run");
         let ir = fs::read_to_string(result.ll_path).expect("read exported IR");
         assert!(
             ir.contains("declare void @consume_float(float*)"),

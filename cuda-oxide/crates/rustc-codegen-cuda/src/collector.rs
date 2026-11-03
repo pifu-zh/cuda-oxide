@@ -529,6 +529,10 @@ pub struct CollectionResult<'tcx> {
     /// External device function declarations (no MIR, emit as `declare`).
     pub device_externs: Vec<DeviceExternDecl>,
 
+    /// Panic messages keyed by (function export name, basic block index);
+    /// see [`DeviceCollector::ensure_panic_helper_enqueued`].
+    pub panic_messages: std::collections::BTreeMap<(String, u32), Vec<u8>>,
+
     /// Whether this crate needs the run-time loader to merge PTX bundles.
     ///
     /// This is true for a `#[cuda_module]` containing a generic kernel and
@@ -1456,6 +1460,12 @@ struct DeviceCollector<'tcx> {
     /// shims in dependency crates never appear in mir_keys locally).
     cgus: Option<&'tcx [CodegenUnit<'tcx>]>,
     cgus_input: &'tcx [CodegenUnit<'tcx>],
+    /// Panic messages keyed by (function export name, basic block index).
+    /// The importer materializes each as an immutable device global and
+    /// calls the `__cuda_panic_str` helper before the kernel trap.
+    panic_messages: std::collections::BTreeMap<(String, u32), Vec<u8>>,
+    /// Whether the `__cuda_panic_str` helper has been enqueued.
+    panic_helper_enqueued: bool,
 }
 
 impl<'tcx> DeviceCollector<'tcx> {
@@ -1472,6 +1482,8 @@ impl<'tcx> DeviceCollector<'tcx> {
             warned_dynamic_shared_array: false,
             verbose,
             local_shim_defs: None,
+            panic_messages: std::collections::BTreeMap::new(),
+            panic_helper_enqueued: false,
             cgus: None,
             cgus_input: &[],
         }
@@ -1638,6 +1650,7 @@ impl<'tcx> DeviceCollector<'tcx> {
         CollectionResult {
             functions: self.result,
             device_externs: self.device_externs,
+            panic_messages: self.panic_messages,
             requires_ptx_bundle_merge: false,
             tile_exports: Vec::new(),
         }
@@ -3373,8 +3386,94 @@ impl<'tcx> DeviceCollector<'tcx> {
     /// public stub and got its host-only panicking body inlined. Lowering
     /// that to a trap would turn "you forgot an annotation" into a thread
     /// that silently aborts the kernel, so it is reported here instead.
+    /// Enqueue the `__cuda_panic_str` device helper (once) so its body is
+    /// emitted into the module and the importer's report call finds a
+    /// `mir.func` to verify against. The helper lives in the cuda-device
+    /// crate and is referenced by no user code, so the CGU scan misses it;
+    /// the definition comes through the crate metadata instead.
+    fn ensure_panic_helper_enqueued(&mut self, ctx: &DiscoveryCtx) {
+        if self.panic_helper_enqueued {
+            return;
+        }
+        let Some(instance) = self.find_cuda_device_fn(&["debug"], "__cuda_panic_str") else {
+            if self.verbose {
+                eprintln!("[panic-report] helper not found; panic paths stay plain traps");
+            }
+            return;
+        };
+        let mangled = self.tcx.symbol_name(instance).name.to_string();
+        self.discovery.insert(
+            mangled.clone(),
+            DiscoveryCtx {
+                root_name: "__cuda_panic_str".into(),
+                root_is_kernel: false,
+                user_span: self.tcx.def_span(instance.def_id()),
+            },
+        );
+        self.seen.insert(mangled);
+        self.used_export_names.insert("__cuda_panic_str".into());
+        self.worklist.push_back(CollectedFunction {
+            instance,
+            is_kernel: false,
+            export_name: "__cuda_panic_str".to_string(),
+        });
+        self.panic_helper_enqueued = true;
+        let _ = ctx;
+    }
+
+    /// Locate a function in the cuda-device crate by its (no_mangle) symbol.
+    ///
+    /// The crate's HIR is not part of this session, but the module tree and
+    /// MIR come through the crate metadata. The walk targets the module path
+    /// directly: the crate's full module tree is far too large for an
+    /// exhaustive scan (the previous walk hit an 8192-def cap inside the
+    /// sysroot-shaped re-export forest without reaching `debug`).
+    fn find_cuda_device_fn(&self, module_path: &[&str], symbol: &str) -> Option<Instance<'tcx>> {
+        use rustc_hir::def_id::{CRATE_DEF_INDEX, DefId};
+        let crate_root = self
+            .tcx
+            .crates(())
+            .iter()
+            .copied()
+            .find(|cnum| self.tcx.crate_name(*cnum).as_str() == "cuda_device")
+            .map(|cnum| DefId { krate: cnum, index: CRATE_DEF_INDEX })?;
+        let mut module = crate_root;
+        for segment in module_path {
+            let child_did = self
+                .tcx
+                .module_children(module)
+                .iter()
+                .find(|child| {
+                    child.ident.as_str() == *segment
+                        && matches!(
+                            child.res,
+                            rustc_hir::def::Res::Def(rustc_hir::def::DefKind::Mod, _)
+                        )
+                })
+                .and_then(|child| match child.res {
+                    rustc_hir::def::Res::Def(_, did) => Some(did),
+                    _ => None,
+                })?;
+            module = child_did;
+        }
+        for child in self.tcx.module_children(module).iter() {
+            if let rustc_hir::def::Res::Def(rustc_hir::def::DefKind::Fn, did) = child.res {
+                // Instance::mono ICEs on const/type-generic definitions; a
+                // no_mangle runtime helper is non-generic by construction.
+                if !self.tcx.generics_of(did).own_params.is_empty() {
+                    continue;
+                }
+                let instance = Instance::mono(self.tcx, did);
+                if self.tcx.symbol_name(instance).name == symbol {
+                    return Some(instance);
+                }
+            }
+        }
+        None
+    }
+
     fn check_panic_machinery(
-        &self,
+        &mut self,
         mir: &rustc_middle::mir::Body<'tcx>,
         func: &CollectedFunction<'tcx>,
         ctx: &DiscoveryCtx,
@@ -3417,6 +3516,32 @@ impl<'tcx> DeviceCollector<'tcx> {
             // importer skips them and the path lowers to a device trap. Note
             // it under `--verbose` so the dropped message stays traceable.
             let Some((_, _, marker_text)) = stub_marker else {
+                // [panic-report] A literal-message panic (exactly one &str
+                // constant in the block) rides the (export name, block index)
+                // key to the importer, which materializes the bytes and calls
+                // __cuda_panic_str before the trap. Format-arg panics
+                // (multiple pieces) stay plain traps: rendering the pieces
+                // needs runtime Debug support the device pipeline does not
+                // have yet.
+                // The longest &str in the block is the message: the inlined
+                // panic machinery also carries the location string (file!()),
+                // which is always shorter.
+                if let Some((_, _, text)) = scan
+                    .found
+                    .iter()
+                    .max_by_key(|(_, _, text)| text.chars().count())
+                {
+                    self.panic_messages
+                        .entry((func.export_name.clone(), bb.as_u32()))
+                        .or_insert_with(|| text.as_bytes().to_vec());
+                    self.ensure_panic_helper_enqueued(ctx);
+                } else if self.verbose && !scan.found.is_empty() {
+                    eprintln!(
+                        "[collector] Panic message with format args stays a plain trap                          ({} pieces, in `{}`)",
+                        scan.found.len(),
+                        self.tcx.def_path_str(func.instance.def_id())
+                    );
+                }
                 if self.verbose
                     && let Some((_, _, text)) = scan.found.first()
                 {

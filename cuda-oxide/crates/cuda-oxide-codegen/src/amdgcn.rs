@@ -1809,7 +1809,9 @@ fn rewrite_ocml(ll: &str) -> String {
 /// The ockl.bc link itself happens in ptx.rs (oclc_isa_version_<gfx>.bc
 /// configuration), and the module gains the `amdgpu_printf_kind` metadata.
 fn rewrite_vprintf_to_ockl(text: &str) -> String {
-    if !text.contains("@vprintf(") {
+    // Modules with direct __ockl calls (the __cuda_panic_str helper) need the
+    // declares + the hostcall metadata even without a vprintf call to expand.
+    if !text.contains("@vprintf(") && !text.contains("__ockl_printf") {
         return text.to_string();
     }
 
@@ -2140,7 +2142,7 @@ fn rewrite_vprintf_to_ockl(text: &str) -> String {
     }
 
     let mut text = out.join("\n");
-    if !used {
+    if !used && !text.contains("__ockl_printf") {
         return text;
     }
     // vprintf declare 移除 + ockl declares + hostcall 元数据
@@ -2149,11 +2151,22 @@ fn rewrite_vprintf_to_ockl(text: &str) -> String {
         .filter(|l| !l.starts_with("declare i32 @vprintf("))
         .collect::<Vec<_>>()
         .join("\n");
-    let decls = "declare i64 @__ockl_printf_begin(i64)\n\
-declare i64 @__ockl_printf_append_args(i64, i32, i64, i64, i64, i64, i64, i64, i64, i32)\n\
-declare i64 @__ockl_printf_append_string_n(i64, ptr, i64, i32)\n";
-    if let Some(idx) = text.find("\ndefine ") {
-        text = format!("{}\n{}{}", &text[..idx], decls, &text[idx..]);
+    // Per-symbol dedup: the device-extern pipeline may already have emitted
+    // declares for these symbols (the __cuda_panic_str helper's externs), and
+    // llvm-link rejects a redefinition.
+    let needed = ["__ockl_printf_begin", "__ockl_printf_append_args", "__ockl_printf_append_string_n"]
+        .iter()
+        .filter(|sym| !text.contains(&format!("declare i64 @{sym}(")))
+        .copied()
+        .map(|sym| match sym {
+            "__ockl_printf_begin" => "declare i64 @__ockl_printf_begin(i64)".to_string(),
+            "__ockl_printf_append_args" => "declare i64 @__ockl_printf_append_args(i64, i32, i64, i64, i64, i64, i64, i64, i64, i32)".to_string(),
+            _ => "declare i64 @__ockl_printf_append_string_n(i64, ptr, i64, i32)".to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !needed.is_empty() && let Some(idx) = text.find("\ndefine ") {
+        text = format!("{}\n{}\n{}", &text[..idx], needed, &text[idx..]);
     }
     if !text.contains("amdgpu_printf_kind") {
         // 编号接力：现有最大编号引用 + 1（无编号引用时用 1000 避开 !0）

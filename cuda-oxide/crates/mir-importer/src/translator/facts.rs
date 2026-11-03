@@ -91,6 +91,38 @@ thread_local! {
     // call classification must not depend on Legaliser ordering or spelling.
     static EMITTED_FUNCTIONS: std::cell::RefCell<std::collections::BTreeSet<String>> =
         const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+    // Device panic messages keyed by (function export name, basic block
+    // index). Both sides of the handoff - the collector's MIR scan and the
+    // importer's block translation - walk the same monomorphized bodies, so
+    // the pair is a stable key without relying on spans.
+    static PANIC_MESSAGES: std::cell::RefCell<
+        std::collections::BTreeMap<(String, u32), Vec<u8>>,
+    > = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+    // Export name of the function currently being translated.
+    static CURRENT_FUNCTION: std::cell::RefCell<String> =
+        const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Replace the panic-message registry for this pipeline run.
+pub(crate) fn set_panic_messages(
+    messages: std::collections::BTreeMap<(String, u32), Vec<u8>>,
+) {
+    PANIC_MESSAGES.with(|cell| *cell.borrow_mut() = messages);
+}
+
+/// The message bytes recorded for a function's panic block, if any.
+pub(crate) fn panic_message_for(func: &str, block: u32) -> Option<Vec<u8>> {
+    PANIC_MESSAGES.with(|cell| cell.borrow().get(&(func.to_string(), block)).cloned())
+}
+
+/// Set the export name of the function currently being translated.
+pub(crate) fn set_current_function(name: &str) {
+    CURRENT_FUNCTION.with(|cell| *cell.borrow_mut() = name.to_string());
+}
+
+/// The export name of the function currently being translated.
+pub(crate) fn current_function() -> String {
+    CURRENT_FUNCTION.with(|cell| cell.borrow().clone())
 }
 
 /// Installs the driver-resolved lang-item ids for this pipeline run,

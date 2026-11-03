@@ -41,6 +41,7 @@ mod fn_ptr;
 mod operand;
 mod place_addr;
 mod place_iter;
+pub(super) mod panic_report;
 mod place_read;
 mod pointee;
 mod promoted;

@@ -401,6 +401,31 @@ padding/字段序只有 rustc layout 知道）。这打通了「字节来自 MIR
 4. 端到端例子 + 卡上测试（host stdout 捕获 "device panic: ..."）+ 双侧镜像
    评估（助手为真实 Rust，预计无需 prep-pass 手术 = 无镜像负担）。
 
+**[2026-11-04 step 3：管线全链落地（代码完成，最后一环 = abort 时排水）]**
+全部组件就位并经真机编译运行：(1) cuda-device `__cuda_panic_str(msg,len)`
+助手——`#[device] extern` 声明 ockl begin/append_string_n（走 device-extern
+管线的 declare 发射 + 原符号链接；**教训：裸 `unsafe extern "C"` 不带
+DEVICE_EXTERN_PREFIX，collector 不识别 → declare 缺失 → lowered 验证
+"Symbol not found"**），常量用数组值（`&[u8]` 切片常量无翻译 handler）；
+(2) collector：check_panic_machinery 内按块扫消息（**取最长 &str——内联
+panic 机器同时携带 file!() 位置串，"恰好一个"判据会漏**），(导出名,块号)
+键注册 + 助手入队（**module_children 定向走 cuda_device::debug 路径——
+全树扫描撞 8192 上限；扫中 generic 兄弟须 own_params 守卫防 Instance::mono
+ICE**）；(3) importer 臂：emit_promoted_immutable_global 物化 →
+**StaticAddress authority cast（Erased 全局指针 → 声明类型，这是全局指针
+ establishment 的唯一合法通道；注意 ArrayToPointer 验证要求 source/target
+同 addrspace 且 raw kind，PtrToPtr 要求同点子——三墙叠加的合法序列 =
+Erased 全局 → authority retype → 同 as ArrayToPtr）** → emit_raw_call
+（预物化 Value 变体）→ 既有 trap；(4) vprintf 门两处放宽（**真正生效的门
+在 fn 首行 `!contains("@vprintf(")`——行 2143 的次级门是死代码**）+ declare
+按符号去重（llvm-link 拒重定义）+ metadata 门（__ockl_printf 即注入）。
+端到端：panic_message 例编译→加载→launch→**trap 真触发**（HSA exception
+实证）；**最后一环 = 消息排水**：ockl preview hostcall 是 fire-and-forget，
+缓冲在内核完成时排干，而 trap 中止队列 → 消息丢失（延迟自旋探针无效——
+abort 路径不看缓冲）。**修复方向已定 = 阻塞式 hostcall
+（__ockl_hostcall_internal，设备自旋等 host 完成包）重构消息发射**，一个
+聚焦会话可完成。1213/1213 回归过。
+
 **[2026-11-04 step 2b：%s 探针裁定 + ptr 槽修复]** 独立 %s 探针
 （vprintf("%s\n", {ptr} 缓冲) 走 Python Step 17 全链）暴露**真管线缺口**：
 _emit_arg_slots 无 `ptr` 字段提升分支（信封回落保留 vprintf → llc 变参拒绝）

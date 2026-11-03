@@ -815,6 +815,7 @@ impl CodegenBackend for CudaCodegenBackend {
                             tcx,
                             device_functions,
                             &collection_result.device_externs,
+                            &collection_result.panic_messages,
                             &device_config,
                         )
                     }));
