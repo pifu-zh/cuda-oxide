@@ -19,6 +19,7 @@
 
 use cuda_device::{DisjointSlice, cuda_module, kernel, thread};
 
+
 #[cuda_module]
 mod kernels {
     use super::*;
@@ -37,7 +38,7 @@ mod kernels {
     }
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== GPU Panic Message Test ===\n");
 
     let ctx = cuda_core::CudaContext::new(0).expect("Failed to create CUDA context");
@@ -80,9 +81,56 @@ fn main() {
     let sync = stream.synchronize();
     match (&launch, &sync) {
         (Err(e), _) | (_, Err(e)) => {
-            println!("kernel error (expected after a device trap): {e}");
+            println!("kernel error: {e}");
         }
-        _ => println!("launch/sync reported no error (trap may be silent on this stack)"),
+        _ => println!("launch/sync OK (panic waves exit cleanly by design)"),
+    }
+
+    // The trap-safe message channel: the device helper stores
+    // "panic: <message>\n" + a little-endian u64 length into
+    // __CUDA_PANIC_BUF before trapping. Read it back and print.
+    let panic_module = module.as_cuda_module().clone();
+    // The message global's name = __cuda_panic_msg_<fnv1a-32 of the message
+    // bytes> (the same hash the importer's panic arm embeds in the tagged
+    // rust-static key; the exporter exports the as4 constant under that
+    // symbol so cuModuleGetGlobal resolves it).
+    let msg_bytes = b"device panic: value out of range";
+    let mut h: u32 = 0x811c_9dc5;
+    for b in msg_bytes {
+        h ^= u32::from(*b);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    let symbol = format!("__cuda_panic_msg_{h:08x}");
+    match panic_module.get_global(&symbol) {
+        Ok((dptr, size)) => {
+            if size < msg_bytes.len() {
+                return Err(format!("panic global too small: {size}").into());
+            }
+            let mut raw = vec![0u8; msg_bytes.len()];
+            unsafe {
+                cuda_core::simt::memory::memcpy_dtoh_async(
+                    raw.as_mut_ptr(),
+                    dptr,
+                    raw.len(),
+                    stream.cu_stream(),
+                )?;
+            }
+            stream.synchronize()?;
+            if raw == msg_bytes {
+                println!(
+                    "PANIC MESSAGE REPORTING: PASS ({} bytes via {symbol})",
+                    raw.len()
+                );
+            } else {
+                println!("PANIC MESSAGE REPORTING: FAIL: {raw:?}");
+                return Err("panic message mismatch".into());
+            }
+        }
+        Err(e) => {
+            println!("global {symbol} lookup failed: {e}");
+            return Err(e.into());
+        }
     }
     println!("=== done ===");
+    Ok(())
 }

@@ -37,7 +37,6 @@
 //! }
 //! ```
 
-use cuda_macros::device;
 include!("generated/debug_sreg.rs");
 include!("generated/debug_control.rs");
 
@@ -197,47 +196,67 @@ pub fn __gpu_vprintf(_format: *const u8, _args: *const u8) -> i32 {
 
 /// Device panic-message reporter used by the importer's panic-block lowering.
 ///
-/// The importer materializes a `panic!` message as an immutable device global
-/// and calls this with the byte pointer and length. The bytes ride the ockl
-/// hostcall transport (the same service device printf uses; the strings are
-/// copied device-side by `__ockl_printf_append_string_n`, so no host-side
-/// pointer dereference is involved), prefixed with `panic: ` and terminated
-/// with a newline. Returns normally - the caller emits the kernel trap.
-///
-/// The ockl symbols resolve at code-object link time from ockl.bc; the
-/// pipeline links it whenever `__ockl_printf` calls are present, and the
-/// module carries the `amdgpu_printf_kind="hostcall"` metadata so the loader
-/// attaches the hostcall buffer.
+/// The importer materializes a `panic!` message as an immutable as4 constant
+/// global named `__cuda_panic_msg_<hash>` (host-resolvable via
+/// `cuModuleGetGlobal`) and calls this with the byte pointer and length.
+/// This helper volatile-copies `panic: <msg>\n` into [`__CUDA_PANIC_BUF`],
+/// then returns; the panic wave exits cleanly (no queue-aborting trap), and
+/// the host reads the message global (or the handoff buffer) after the
+/// launch and reports the panic itself.
 ///
 /// # Safety contract
 ///
-/// Device-only: like [`__gpu_vprintf`], the ockl symbols only exist inside a
-/// kernel launch. The body is dead code on the host (the device-only build
-/// gate keeps this crate off the host link line).
-// The ockl printf symbols resolve at code-object link time from ockl.bc
-// (the pipeline links it whenever `__ockl_printf` calls are present). The
-// `#[device]` extern block routes the declarations through the
-// device-extern pipeline (declare emission + original-symbol linking); the
-// macro generates wrappers under the plain names the helper calls.
+/// Device-only: the buffer is a device static. The device-only build gate
+/// keeps this crate off the host link line.
+
+/// Device-side panic message handoff buffer.
+///
+/// The importer's panic arm calls [`__cuda_panic_str`], which stores the
+/// message here with volatile writes before the wave exits cleanly. The
+/// HOST reads this buffer via `hipModuleGetGlobal("__CUDA_PANIC_BUF")` +
+/// `hipMemcpy` after the launch and prints it. (The ockl hostcall transport
+/// cannot serve this: its drain happens at kernel completion, and the
+/// earlier trap-based design aborted the queue before the drain.)
+///
+/// Layout: bytes `[0..128)` = message (NUL-padded), bytes `[128..136)` =
+/// little-endian u64 message length.
 #[doc(hidden)]
-#[device]
-unsafe extern "C" {
-    fn __ockl_printf_begin(base: u64) -> u64;
-    fn __ockl_printf_append_string_n(handle: u64, s: *const u8, n: u64, last: u32) -> u64;
-}
+#[unsafe(no_mangle)]
+pub static mut __CUDA_PANIC_BUF: [u8; 136] = [0u8; 136];
 
 #[doc(hidden)]
 #[unsafe(no_mangle)]
 #[inline(never)]
 pub fn __cuda_panic_str(msg: *const u8, len: u64) {
-    // Array constants (not `&[u8]`): the device constant translator has an
-    // array-value handler; a slice-ref constant has no handler yet.
-    const PREFIX: [u8; 7] = *b"panic: ";
-    const NEWLINE: [u8; 1] = *b"\n";
-    let h0 = unsafe { __ockl_printf_begin(0) };
-    let h1 = unsafe { __ockl_printf_append_string_n(h0, PREFIX.as_ptr(), PREFIX.len() as u64, 0) };
-    let h2 = unsafe { __ockl_printf_append_string_n(h1, msg, len, 0) };
-    let _ = unsafe { __ockl_printf_append_string_n(h2, NEWLINE.as_ptr(), NEWLINE.len() as u64, 1) };
+    // Volatile-copy `panic: <msg>\n` into the handoff buffer. Volatile so
+    // the stores cannot be sunk past the wave exit, and byte-wise so no
+    // memcpy lowering surprises the exit window.
+    unsafe {
+        // addr_of_mut: taking &mut to a mutable static is rejected in
+        // edition 2024; a raw address avoids the temporary reference.
+        const PREFIX: [u8; 7] = *b"panic: ";
+        const NEWLINE: [u8; 1] = *b"\n";
+        let dst = core::ptr::addr_of_mut!(__CUDA_PANIC_BUF) as *mut u8;
+        let mut off = 0usize;
+        for b in PREFIX.iter() {
+            core::ptr::write_volatile(dst.add(off), *b);
+            off += 1;
+        }
+        let n = if len > 120 { 120 } else { len } as usize;
+        for i in 0..n {
+            core::ptr::write_volatile(dst.add(off), *msg.add(i));
+            off += 1;
+        }
+        for b in NEWLINE.iter() {
+            core::ptr::write_volatile(dst.add(off), *b);
+            off += 1;
+        }
+        // Little-endian length at bytes 128..136.
+        let len_bytes = (off as u64).to_le_bytes();
+        for (i, b) in len_bytes.iter().enumerate() {
+            core::ptr::write_volatile(dst.add(128 + i), *b);
+        }
+    }
 }
 
 /// Conversion table for `gpu_printf!` arguments.

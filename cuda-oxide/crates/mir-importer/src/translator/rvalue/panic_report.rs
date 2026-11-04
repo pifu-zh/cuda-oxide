@@ -14,8 +14,6 @@
 //! emitted by the existing dropped-panic path right after the call.
 
 use crate::error::{TranslationErr, TranslationResult};
-use crate::translator::rvalue::promoted;
-use crate::translator::rvalue::statics::GlobalInitializerData;
 use crate::translator::rvalue::coerce::cast_to_declared_rust_pointer_type_if_needed;
 use crate::translator::terminator::helpers::emit_raw_call;
 use dialect_mir::attributes::MirPointerKindAuthorityAttr;
@@ -38,8 +36,8 @@ const PANIC_HELPER_SYMBOL: &str = "__cuda_panic_str";
 
 /// Emit `__cuda_panic_str(msg_ptr, len)` for a recorded panic message.
 ///
-/// Returns the operation to chain the trap after, or `None` when the call
-/// could not be emitted (the caller falls back to the plain trap).
+/// Returns the operation to chain the wave-exit after, or `None` when the
+/// call could not be emitted (the caller falls back to the plain trap).
 pub(crate) fn emit_panic_message_report(
     ctx: &mut Context,
     bytes: &[u8],
@@ -74,26 +72,62 @@ fn emit_panic_message_report_inner(
         )));
     }
 
-    // 1. The message global: an immutable `[u8; N]` in global memory, via
-    //    the shared promoted machinery (its result pointer is Erased, which
-    //    is what MirGlobalAllocOp's verifier requires).
+    // 1. The message global: an immutable `[u8; N]` in CONSTANT memory (as4)
+    //    with a tagged rust-static key. The as4 naming branch exports it under
+    //    the embedded symbol name, so the host resolves the message via
+    //    cuModuleGetGlobal after a panic (the ockl hostcall buffer cannot be
+    //    used for this: its drain happens at kernel completion and a trap
+    //    aborts the queue first; here the panic wave exits cleanly instead).
     let u8_ty: TypeHandle = IntegerType::get(ctx, 8, Signedness::Unsigned).into();
     let array_ty: TypeHandle = MirArrayType::get(ctx, u8_ty, bytes.len() as u64).into();
-    let initializer = GlobalInitializerData {
-        bytes: bytes.to_vec(),
-        alignment: 1,
-        relocations: Vec::new(),
-    };
-    let global = promoted::emit_promoted_immutable_global(
+    let symbol = format!("__cuda_panic_msg_{:08x}", fnv1a(bytes));
+    let global_key = format!(
+        "cuda-oxide:rust-static:v1:{}:{}",
+        symbol.len(),
+        symbol
+    );
+    let global_ptr_ty: TypeHandle = MirPtrType::get_with_kind(
         ctx,
         array_ty,
-        &initializer,
-        block_ptr,
-        prev_op,
-        loc.clone(),
+        false,
+        dialect_mir::types::address_space::CONSTANT,
+        MirPointerKind::Erased,
+    )
+    .into();
+    let global_op = Operation::new(
+        ctx,
+        dialect_mir::ops::MirGlobalAllocOp::get_concrete_op_info(),
+        vec![global_ptr_ty],
+        vec![],
+        vec![],
+        0,
     );
-    let mut last_op = Some(global.get_operation());
-    let global_ptr = global.get_operation().deref(ctx).get_result(0);
+    global_op.deref_mut(ctx).set_loc(loc.clone());
+    let global_alloc = dialect_mir::ops::MirGlobalAllocOp::new(global_op);
+    global_alloc.set_attr_global_type(ctx, TypeAttr::new(array_ty));
+    global_alloc.set_attr_global_key(ctx, StringAttr::new(global_key.into()));
+    let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    {
+        // The promoted helper's hex-attr setter is pub(super) in statics.rs;
+        // inline the two-line attribute write here (same attribute key).
+        let key = pliron::identifier::Identifier::try_new(
+            "global_initializer_hex".to_string(),
+        )
+        .expect("valid identifier");
+        global_alloc
+            .get_operation()
+            .deref_mut(ctx)
+            .attributes
+            .set(key, StringAttr::new(hex.clone().into()));
+    }
+    global_alloc.set_alignment_value(ctx, 1);
+    global_alloc.mark_immutable(ctx);
+    match prev_op {
+        Some(prev) => global_alloc.get_operation().insert_after(ctx, prev),
+        None => global_alloc.get_operation().insert_at_front(block_ptr, ctx),
+    }
+    let mut last_op = Some(global_alloc.get_operation());
+    let global_ptr = global_alloc.get_operation().deref(ctx).get_result(0);
 
     // 2. Establish the raw pointer the helper takes, in two sanctioned steps.
     //    (a) The StaticAddress-authority boundary cast turns the Erased
@@ -177,6 +211,17 @@ fn emit_panic_message_report_inner(
         loc,
     );
     Ok(call_ptr)
+}
+
+/// FNV-1a over the message bytes; names the per-site message global so the
+/// host can resolve it deterministically without a rustc StaticDef.
+fn fnv1a(bytes: &[u8]) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for b in bytes {
+        hash ^= u32::from(*b);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
 }
 
 /// Decay the message-global pointer (`ptr<as1, [u8; N]>`) to the helper's

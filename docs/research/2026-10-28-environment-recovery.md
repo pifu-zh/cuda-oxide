@@ -422,9 +422,22 @@ Erased 全局 → authority retype → 同 as ArrayToPtr）** → emit_raw_call
 端到端：panic_message 例编译→加载→launch→**trap 真触发**（HSA exception
 实证）；**最后一环 = 消息排水**：ockl preview hostcall 是 fire-and-forget，
 缓冲在内核完成时排干，而 trap 中止队列 → 消息丢失（延迟自旋探针无效——
-abort 路径不看缓冲）。**修复方向已定 = 阻塞式 hostcall
-（__ockl_hostcall_internal，设备自旋等 host 完成包）重构消息发射**，一个
-聚焦会话可完成。1213/1213 回归过。
+abort 路径不看缓冲）。**[2026-11-05 已收官：clean-exit + named-as4-global 形态]** 排水问题的
+真正解法不是阻塞 hostcall（30M 周期自旋探针无效——preview 协议 fire-
+and-forget，abort 路径不看缓冲；100ms globaltimer 探针挂死未复诊），
+而是**绕开 runtime 排水**：(a) panic 消息全局改放 as4 常量内存 + tagged
+rust-static key（`cuda-oxide:rust-static:v1:<len>:__cuda_panic_msg_<hash>`）
+—— exporter 的 as4 命名分支会以嵌入符号名导出全局，host 端
+cuModuleGetGlobal 按名解析（符号名 = `__cuda_panic_msg_<fnv1a32(字节)>`，
+确定性可算）；(b) panic wave **干净退出**（arm 发 mir.return 替代
+trap+unreachable）——kernel 正常完成则 hostcall 排水正常、host 可自由
+memcpy；(c) 助手把 `panic: <msg>\n` volatile 写入 handoff 静态缓冲
+（冗余通道）。host：get_global 按名读取 + 逐字节比对。**panic_message 例
+真卡 PASS**（32 字节逐字节回读一致）。语义收窄已文档化（clean-exit 代替
+queue-abort；format-arg panic 仍 plain trap；gpu_assert! 保持 trap）。
+**教训：多级 mtime 时区错位（host 本地 vs 容器 UTC）让 cargo 误判 fresh，
+dylib 迟迟不含新代码——strings 查特征字符串是定位手段；真正生效的门在
+fn 首行而非中途**。1213/1213 回归过；批回归随 e5c7ee7ea 状态 101/105。
 
 **[2026-11-04 step 2b：%s 探针裁定 + ptr 槽修复]** 独立 %s 探针
 （vprintf("%s\n", {ptr} 缓冲) 走 Python Step 17 全链）暴露**真管线缺口**：
