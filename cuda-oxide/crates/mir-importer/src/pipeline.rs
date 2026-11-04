@@ -592,25 +592,7 @@ pub fn run_pipeline(
             eprintln!("{}", func_op_ptr.deref(&ctx).disp(&ctx));
         }
 
-        if let Err(verify_error) = verify_operation(&ctx, func_op_ptr, &func.export_name) {
-            // Temporary panic-path debugging: dump the failing function's
-            // blocks so the offending op sequence is visible.
-            eprintln!(
-                "[panic-report-debug] verify failed: {verify_error}"
-            );
-            use pliron::printable::Printable;
-            let func_ref = func_op_ptr.deref(&ctx);
-            for region in func_ref.regions() {
-                for block in region.deref(&ctx).iter(&ctx) {
-                    eprintln!("[panic-report-debug] block:");
-                    for op in block.deref(&ctx).iter(&ctx) {
-                        eprintln!("    {}", op.disp(&ctx));
-                    }
-                }
-            }
-            return Err(verify_error);
-        }
-        verify_operation(&ctx, func_op_ptr, &func.export_name)?;
+        verify_operation(&ctx, func_op_ptr, &func.export_name)?;(&ctx, func_op_ptr, &func.export_name)?;
 
         if func.is_kernel
             && let Some(bounds) = launch_bounds_from_mir_func(&ctx, func_op_ptr)

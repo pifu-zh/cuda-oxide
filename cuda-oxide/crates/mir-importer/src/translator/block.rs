@@ -102,12 +102,26 @@ pub fn translate_block(
                 prev_op,
                 loc.clone(),
             ) {
-                terminator::emit_dropped_panic_trap(
+                // Clean wave exit: the helper has stored the message into
+                // __CUDA_PANIC_BUF; a queue-aborting trap would kill the
+                // process before the host drains the hostcall buffer AND
+                // before the host can read the handoff buffer, so the panic
+                // block exits the wave normally instead. The host reads the
+                // buffer and reports the panic (see the panic_message
+                // example). Panic-block semantics note: sibling waves are
+                // unaffected - documented narrowing, gpu_assert! keeps trap.
+                use dialect_mir::ops::MirReturnOp;
+                use pliron::op::Op;
+                let ret_op = Operation::new(
                     ctx,
-                    &mir_block.terminator,
-                    block_ptr,
-                    Some(report),
+                    MirReturnOp::get_concrete_op_info(),
+                    vec![],
+                    vec![],
+                    vec![],
+                    0,
                 );
+                ret_op.deref_mut(ctx).set_loc(loc);
+                ret_op.insert_after(ctx, report);
                 return Ok(());
             }
         }
