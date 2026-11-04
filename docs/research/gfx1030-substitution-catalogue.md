@@ -73,7 +73,7 @@
 |---|---|---|
 | MFMA 矩阵核 | [probe] gfx1030 缺 mai-insts（编译探针）；LLVM 拒绝 | HARDWARE_LIMITED；FFMA 回退先例 [hist]（DeepGEMM 路线 3.05 TFLOPS 功能正确） |
 | WMMA | [probe] 缺 wmma-256b-insts | HARDWARE_LIMITED |
-| fp8/fp4 硬件转换 | RDNA2 无（软件位操作解码可行=DeepGEMM 实证） | HARDWARE_LIMITED（功能可软替代） |
+| fp8/fp4 硬件转换 | RDNA2 无（软件位操作解码可行=DeepGEMM 实证） | **✅ SUPPORTED（SOFTWARE EMULATION，2026-11-05）**：E4M3FN/E5M2/E2M1 ↔ f32 纯软件位操作转换（cuda-device::fp8），真卡穷举验证（256+256+16 pattern 解码 + 5180 编码值逐字节一致，独立双实现比对）；标量标量转换收口，向量打包转换后续项 |
 | thread-block cluster / switch multicast | RDNA2 无（上游 CUDA 13 同样硬件门控） | HARDWARE_LIMITED；shim 显式 NOT_SUPPORTED |
 | ~~直通 LDS 宽度仅 b32~~ | **[2026-11-04 推翻]**：重建微基准 ds_write_b128/ds_read_b128 全变体真机正确（旧负探针结论有误，原始探针脚本毁于 10-19 无法复核） | buffer_load 直通 LDS 仍以 b32 为 llc 实测上限；手写 ISA 可用 b128 |
 

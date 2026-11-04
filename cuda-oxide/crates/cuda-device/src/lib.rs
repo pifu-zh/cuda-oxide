@@ -37,6 +37,7 @@ pub mod f16x2;
 pub mod f32x2;
 pub mod fence;
 pub mod float;
+pub mod fp8;
 pub mod heap;
 pub mod grid;
 pub mod i16x2;

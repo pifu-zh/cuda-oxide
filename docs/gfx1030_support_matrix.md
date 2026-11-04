@@ -39,7 +39,7 @@
 | opt -O2 中端（prep pass 拆两段：opt 前 alloca / opt 后 sreg-ntid） | FULL | [e2e] batch 集成维度 14/17 hsaco（本机 2026-10-20，双管线持平） | — |
 | f32/f64 算术与数学（libdevice→ocml 符号映射） | FULL | [hist] TANPROBE f32/f64 ≤2ULP；[e2e] pytest ocml 测试 + math_tan 例 batch PASS | ocml 链接需 ocml.bc+oclc_* 配置（cargo-oxide 已自动化） |
 | 整数 dot（dp4a/dp2a） | FULL | [hist] dotprod 例四符号组合 GPU PASS；[e2e] pytest | — |
-| packed FP8/fp4、MFMA/WMMA 矩阵指令 | UNSUPPORTED | [probe] gfx1030 无 v_mfma（缺 mai-insts）/wmma（缺 wmma-256b-insts）；静态 assert 拒绝（RDNA2 硬件事实） | 升级 RDNA3/4 卡后同探针复测 |
+| packed FP8/fp4、MFMA/WMMA 矩阵指令 | UNSUPPORTED（硬件）/ **fp8/fp4 软件转换 SUPPORTED（2026-11-05）** | [probe] gfx1030 无 v_mfma（缺 mai-insts）/wmma（缺 wmma-256b-insts）；静态 assert 拒绝（RDNA2 硬件事实）；[e2e] fp8_decode 例真卡 PASS：E4M3FN/E5M2 全 256 pattern 穷举解码 + E2M1 16 pattern 逐字节一致（host 独立参考实现比对），三编码器 5180 个边界/中点/特殊值 RNE+satfinite 逐字节一致（cuda-device::fp8 纯软件位操作） | MFMA/WMMA 升级 RDNA3/4 卡后同探针复测；向量级打包转换（__nv_fp8x2_e4m3 系列）后续项 |
 | TMA/块异步拷贝 | UNSUPPORTED(硬件) / **SUPPORTED(软件等价，归约形态 2026-11-04)** | [probe] RDNA2 无 TDM；[hist] buffer_load 直通 LDS 仅 b32（llc）；[e2e] 手写 ISA 微基准：gmem→LDS 归约 553 GB/s=96.1%（8×255MiB 轮转+中位数，verify ok）、gmem→gmem 复制 435 GB/s=75.6%（对厂商 hipMemcpy D2D 参照 476.3 = 91.4%，达完美替代线）、ds_write_b128/ds_read_b128 真机正确（推翻旧"仅 b32"探针）；分母=经验上限 575.5 GB/s（256-bit，见替代目录 §3） | 复制形态相对参照已达 91.4%（绝对口径 75.6%→80%+ 可选调优）；RDNA3 dlds/RDNA4 TDM 出现后同基准复测 |
 
 ## 3. Kernel ABI / 参数传递 / Code Object
