@@ -437,7 +437,22 @@ memcpy；(c) 助手把 `panic: <msg>\n` volatile 写入 handoff 静态缓冲
 queue-abort；format-arg panic 仍 plain trap；gpu_assert! 保持 trap）。
 **教训：多级 mtime 时区错位（host 本地 vs 容器 UTC）让 cargo 误判 fresh，
 dylib 迟迟不含新代码——strings 查特征字符串是定位手段；真正生效的门在
-fn 首行而非中途**。1213/1213 回归过；批回归随 e5c7ee7ea 状态 101/105。
+fn 首行而非中途**。1213/1213 回归过。
+
+**[批回归判定（两轮对照）]** 清理 94GB 批 scratch 后的干净重建批 =
+91/105 llc-pass，对照缓存增量批的 101/105：差集 = (a) e5c7ee7ea 臂在非
+kernel 函数 fire 引入的 10 个 phase-2 build-fail（fold 等非 unit 返回的
+core 函数收 bare return → 验证器拒）——**is_kernel 过滤修复**（clean-exit
+只在 kernel panic 块发射；非 kernel 回落 plain trap）；(b) 6 个 `%ntid_x`
+llc-fail（copy_nonoverlapping/nested_index_assignment/select_unpredictable/
+slice_from_raw_parts_cast/struct_constant_provenance/switchint_128bit）——
+**既有 Step-5 传递性缺口，非 panic 回归**：这些模块 0 个 panic 符号（改动
+不可达），且失败行在两轮批日志 diff 中不变（被批 runner 的缓存 hsaco 掩盖，
+干净重建现形）。根因 = Step-5 ntid 重写的 call 侧改写了
+`Index1D::from_scope` 内部的 index_1d 调用（传 ntid 三参），但 from_scope
+的 define 未加参数（其 MIR 无直接 sreg 读）——transitive ntid 线程穿透缺
+口。修复方向 = ntid 重写按调用图传递（callee 得参数 → caller 定义同步加
+参 + 所有调用点传参），独立会话处理。
 
 **[2026-11-04 step 2b：%s 探针裁定 + ptr 槽修复]** 独立 %s 探针
 （vprintf("%s\n", {ptr} 缓冲) 走 Python Step 17 全链）暴露**真管线缺口**：

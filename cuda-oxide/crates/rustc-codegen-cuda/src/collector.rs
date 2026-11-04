@@ -3526,10 +3526,17 @@ impl<'tcx> DeviceCollector<'tcx> {
                 // The longest &str in the block is the message: the inlined
                 // panic machinery also carries the location string (file!()),
                 // which is always shorter.
+                // Kernel functions only: the report arm's clean wave exit
+                // (a bare mir.return) is only valid for a unit-return kernel.
+                // Panic blocks in device fns with non-unit returns (core
+                // Iterator combinators etc.) keep the plain trap - emitting a
+                // return there would need a fabricated value of the return
+                // type.
                 if let Some((_, _, text)) = scan
                     .found
                     .iter()
                     .max_by_key(|(_, _, text)| text.chars().count())
+                    .filter(|_| func.is_kernel)
                 {
                     self.panic_messages
                         .entry((func.export_name.clone(), bb.as_u32()))
