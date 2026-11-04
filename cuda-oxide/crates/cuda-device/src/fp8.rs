@@ -20,6 +20,10 @@
 //!
 //! All encodes round to nearest, ties to even (RNE). Decodes are exact:
 //! every FP8/FP4 value is representable in `f32`.
+//!
+//! The packed x2 forms at the bottom (`__nv_fp8x2_*` / `__nv_fp4x2_*`) compose
+//! the scalar rules per lane: lane 0 (x) in the low byte/nibble, lane 1 (y)
+//! in the high byte/nibble.
 
 /// Decodes one E4M3FN byte (CUDA `__nv_fp8_e4m3` layout) to `f32`, exactly.
 #[inline(always)]
@@ -226,4 +230,53 @@ pub fn f32_to_e2m1_rne_satfinite(x: f32) -> u8 {
         return (s << 3) | 0b0111;
     }
     (s << 3) | (((e2 as u8) << 1) | (m2 as u8))
+}
+
+// ---------------------------------------------------------------------------
+// Packed x2 forms — CUDA `__nv_fp8x2_e4m3` / `__nv_fp8x2_e5m2` /
+// `__nv_fp4x2_e2m1` semantics: two values per storage unit, lane 0 (x) in the
+// LOW byte (bits [7:0], or the low nibble for FP4) and lane 1 (y) in the high
+// byte (bits [15:8], high nibble). Each lane converts with the scalar rules
+// above; the packing itself is the only added behavior. There is no fp8/fp4
+// hardware on gfx1030 to match bit-for-bit, so the convention is pinned to
+// the CUDA header layout and verified lane-exhaustively in fp8_decode.
+// ---------------------------------------------------------------------------
+
+/// Decodes a packed E4M3 x2 (`__nv_fp8x2_e4m3`) to `(x, y)` exactly.
+#[inline(always)]
+pub fn e4m3x2_to_f32x2(bits: u16) -> (f32, f32) {
+    (e4m3_to_f32(bits as u8), e4m3_to_f32((bits >> 8) as u8))
+}
+
+/// Decodes a packed E5M2 x2 (`__nv_fp8x2_e5m2`) to `(x, y)` exactly.
+#[inline(always)]
+pub fn e5m2x2_to_f32x2(bits: u16) -> (f32, f32) {
+    (e5m2_to_f32(bits as u8), e5m2_to_f32((bits >> 8) as u8))
+}
+
+/// Decodes a packed E2M1 x2 (`__nv_fp4x2_e2m1`) to `(x, y)` exactly.
+#[inline(always)]
+pub fn e2m1x2_to_f32x2(bits: u8) -> (f32, f32) {
+    (e2m1_to_f32(bits & 0xF), e2m1_to_f32(bits >> 4))
+}
+
+/// Packs two `f32` into one E4M3 x2: each lane RNE + satfinite (the scalar
+/// rules); `x` in the low byte.
+#[inline(always)]
+pub fn f32x2_to_e4m3x2_rne_satfinite(x: f32, y: f32) -> u16 {
+    u16::from(f32_to_e4m3_rne_satfinite(x)) | (u16::from(f32_to_e4m3_rne_satfinite(y)) << 8)
+}
+
+/// Packs two `f32` into one E5M2 x2: each lane RNE with IEEE overflow
+/// (scalar rules); `x` in the low byte.
+#[inline(always)]
+pub fn f32x2_to_e5m2x2_rne(x: f32, y: f32) -> u16 {
+    u16::from(f32_to_e5m2_rne(x)) | (u16::from(f32_to_e5m2_rne(y)) << 8)
+}
+
+/// Packs two `f32` into one E2M1 x2: each lane RNE + satfinite (scalar
+/// rules); `x` in the low nibble.
+#[inline(always)]
+pub fn f32x2_to_e2m1x2_rne_satfinite(x: f32, y: f32) -> u8 {
+    f32_to_e2m1_rne_satfinite(x) | (f32_to_e2m1_rne_satfinite(y) << 4)
 }

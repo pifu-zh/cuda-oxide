@@ -5,16 +5,29 @@
 
 //! Software FP8/FP4 <-> f32 conversion test (RDNA2 has no fp8/fp4 hardware).
 //!
-//! The kernel exhaustively decodes every E4M3/E5M2 byte (256 each) and every
-//! E2M1 nibble (16), and encodes a host-generated spread of f32 test values
-//! (boundaries, exact RNE midpoints, one-ulp-off cases, specials) with the
-//! three encoders. The host cross-checks everything against independent
-//! reference implementations and reports PASS/FAIL per family.
+//! Scalar families: the kernels exhaustively decode every E4M3/E5M2 byte
+//! (256 each) and every E2M1 nibble (16), and encode a host-generated spread
+//! of f32 test values (boundaries, exact RNE midpoints, one-ulp-off cases,
+//! specials) with the three encoders.
+//!
+//! Packed x2 families (CUDA `__nv_fp8x2_*` / `__nv_fp4x2_*` semantics, lane 0
+//! in the low byte/nibble): every packed pattern is decoded exhaustively
+//! (2^16 for each FP8 pair type, 2^8 for FP4 x2), every packed pattern is
+//! round-tripped decode->encode against the per-lane host reference (which
+//! also pins the NaN canonicalization), and the RNE midpoint/boundary spread
+//! is encoded as lane-mixed pairs (forward x mirrored) so a lane swap or
+//! wrong shift cannot hide.
+//!
+//! The host cross-checks everything against independent reference
+//! implementations and reports PASS/FAIL per family.
 //!
 //! Run: cargo oxide run fp8_decode
 
-use cuda_device::fp8::{e2m1_to_f32, e4m3_to_f32, e5m2_to_f32, f32_to_e2m1_rne_satfinite,
-    f32_to_e4m3_rne_satfinite, f32_to_e5m2_rne};
+use cuda_device::fp8::{
+    e2m1_to_f32, e2m1x2_to_f32x2, e4m3_to_f32, e4m3x2_to_f32x2, e5m2_to_f32, e5m2x2_to_f32x2,
+    f32_to_e2m1_rne_satfinite, f32_to_e4m3_rne_satfinite, f32_to_e5m2_rne,
+    f32x2_to_e2m1x2_rne_satfinite, f32x2_to_e4m3x2_rne_satfinite, f32x2_to_e5m2x2_rne,
+};
 use cuda_device::{DisjointSlice, cuda_module, kernel, thread};
 
 #[cuda_module]
@@ -72,6 +85,120 @@ mod kernels {
         let idx = thread::index_1d().get();
         if let Some(o) = out.get_mut(thread::index_1d()) {
             *o = f32_to_e2m1_rne_satfinite(values[idx]);
+        }
+    }
+
+    // ---- packed x2 families ------------------------------------------------
+
+    /// Decodes every E4M3 x2 pattern (idx 0..65536) into the (x, y) lanes.
+    #[kernel]
+    pub fn decode_e4m3x2(
+        values: &[u16],
+        mut out_x: DisjointSlice<f32>,
+        mut out_y: DisjointSlice<f32>,
+    ) {
+        let idx = thread::index_1d().get();
+        let (x, y) = e4m3x2_to_f32x2(values[idx]);
+        if let Some(o) = out_x.get_mut(thread::index_1d()) {
+            *o = x;
+        }
+        if let Some(o) = out_y.get_mut(thread::index_1d()) {
+            *o = y;
+        }
+    }
+
+    /// Decodes every E5M2 x2 pattern (idx 0..65536) into the (x, y) lanes.
+    #[kernel]
+    pub fn decode_e5m2x2(
+        values: &[u16],
+        mut out_x: DisjointSlice<f32>,
+        mut out_y: DisjointSlice<f32>,
+    ) {
+        let idx = thread::index_1d().get();
+        let (x, y) = e5m2x2_to_f32x2(values[idx]);
+        if let Some(o) = out_x.get_mut(thread::index_1d()) {
+            *o = x;
+        }
+        if let Some(o) = out_y.get_mut(thread::index_1d()) {
+            *o = y;
+        }
+    }
+
+    /// Decodes every E2M1 x2 pattern (idx 0..256) into the (x, y) lanes.
+    #[kernel]
+    pub fn decode_e2m1x2(
+        values: &[u8],
+        mut out_x: DisjointSlice<f32>,
+        mut out_y: DisjointSlice<f32>,
+    ) {
+        let idx = thread::index_1d().get();
+        let (x, y) = e2m1x2_to_f32x2(values[idx]);
+        if let Some(o) = out_x.get_mut(thread::index_1d()) {
+            *o = x;
+        }
+        if let Some(o) = out_y.get_mut(thread::index_1d()) {
+            *o = y;
+        }
+    }
+
+    /// Round-trips every E4M3 x2 pattern: decode -> encode (per-lane RNE +
+    /// satfinite; NaN lanes canonicalize).
+    #[kernel]
+    pub fn roundtrip_e4m3x2(values: &[u16], mut out: DisjointSlice<u16>) {
+        let idx = thread::index_1d().get();
+        if let Some(o) = out.get_mut(thread::index_1d()) {
+            let (x, y) = e4m3x2_to_f32x2(values[idx]);
+            *o = f32x2_to_e4m3x2_rne_satfinite(x, y);
+        }
+    }
+
+    /// Round-trips every E5M2 x2 pattern: decode -> encode (per-lane RNE,
+    /// IEEE overflow; NaN lanes canonicalize).
+    #[kernel]
+    pub fn roundtrip_e5m2x2(values: &[u16], mut out: DisjointSlice<u16>) {
+        let idx = thread::index_1d().get();
+        if let Some(o) = out.get_mut(thread::index_1d()) {
+            let (x, y) = e5m2x2_to_f32x2(values[idx]);
+            *o = f32x2_to_e5m2x2_rne(x, y);
+        }
+    }
+
+    /// Round-trips every E2M1 x2 pattern: decode -> encode (per-lane RNE +
+    /// satfinite).
+    #[kernel]
+    pub fn roundtrip_e2m1x2(values: &[u8], mut out: DisjointSlice<u8>) {
+        let idx = thread::index_1d().get();
+        if let Some(o) = out.get_mut(thread::index_1d()) {
+            let (x, y) = e2m1x2_to_f32x2(values[idx]);
+            *o = f32x2_to_e2m1x2_rne_satfinite(x, y);
+        }
+    }
+
+    /// Encodes (a[i], b[i]) f32 pairs into packed E4M3 x2. The host pairs the
+    /// midpoint spread forward x mirrored so lane mix-ups cannot hide.
+    #[kernel]
+    pub fn encode_pairs_e4m3x2(a: &[f32], b: &[f32], mut out: DisjointSlice<u16>) {
+        let idx = thread::index_1d().get();
+        if let Some(o) = out.get_mut(thread::index_1d()) {
+            *o = f32x2_to_e4m3x2_rne_satfinite(a[idx], b[idx]);
+        }
+    }
+
+    /// Encodes (a[i], b[i]) f32 pairs into packed E5M2 x2.
+    #[kernel]
+    pub fn encode_pairs_e5m2x2(a: &[f32], b: &[f32], mut out: DisjointSlice<u16>) {
+        let idx = thread::index_1d().get();
+        if let Some(o) = out.get_mut(thread::index_1d()) {
+            *o = f32x2_to_e5m2x2_rne(a[idx], b[idx]);
+        }
+    }
+
+    /// Encodes (a[i], b[i]) f32 pairs into packed E2M1 x2.
+    #[kernel]
+    pub fn encode_pairs_e2m1x2(a: &[f32], b: &[f32], mut out: DisjointSlice<u8>) {
+        let idx = thread::index_1d().get();
+        if let Some(o) = out.get_mut(thread::index_1d()) {
+            *o = f32x2_to_e2m1x2_rne_satfinite(a[idx], b[idx]);
         }
     }
 }
@@ -135,9 +262,9 @@ fn host_encode_reference(
     sat_max: f32,        // max finite magnitude (f32::INFINITY = never clamp)
     nan_byte: u8,
     inf_byte: u8,
-    sign_shift: u32,     // 7 for the byte formats, 3 for the E2M1 nibble
-    inf_threshold: f32,  // at/above this, RNE rounds to Inf (E5M2); the
-                         // satfinite families pass f32::INFINITY (never)
+    sign_shift: u32, // 7 for the byte formats, 3 for the E2M1 nibble
+    inf_threshold: f32, // at/above this, RNE rounds to Inf (E5M2); the
+                     // satfinite families pass f32::INFINITY (never)
 ) -> u8 {
     let s = (x.to_bits() >> 31) as u8;
     if x.is_nan() {
@@ -275,11 +402,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let mut out = cuda_core::DeviceBuffer::<f32>::zeroed(&stream, 256)?;
         // SAFETY: launch shape covers the 256-element output.
-        unsafe { module.decode_e4m3((stream).as_ref(), cuda_core::simt::LaunchConfig {
-            grid_dim: (1, 1, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        }, &mut out) }?;
+        unsafe {
+            module.decode_e4m3(
+                (stream).as_ref(),
+                cuda_core::simt::LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &mut out,
+            )
+        }?;
         stream.synchronize()?;
         let got = out.to_host_vec(&stream)?;
         for b in 0u16..256 {
@@ -291,7 +424,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if failures <= 4 {
                     println!(
                         "E4M3 decode FAIL: pattern {b:#04x}: got {} ({:#x}) want {} ({:#x})",
-                        gotv, gotv.to_bits(), want, want.to_bits()
+                        gotv,
+                        gotv.to_bits(),
+                        want,
+                        want.to_bits()
                     );
                 }
             }
@@ -303,25 +439,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let mut out = cuda_core::DeviceBuffer::<f32>::zeroed(&stream, 256)?;
         // SAFETY: launch shape covers the 256-element output.
-        unsafe { module.decode_e5m2((stream).as_ref(), cuda_core::simt::LaunchConfig {
-            grid_dim: (1, 1, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        }, &mut out) }?;
+        unsafe {
+            module.decode_e5m2(
+                (stream).as_ref(),
+                cuda_core::simt::LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &mut out,
+            )
+        }?;
         stream.synchronize()?;
         let got = out.to_host_vec(&stream)?;
         for b in 0u16..256 {
             let want = host_e5m2_to_f32(b as u8);
             let gotv = got[b as usize];
             total += 1;
-            if gotv.to_bits() != want.to_bits()
-                && !(gotv.is_nan() && want.is_nan())
-            {
+            if gotv.to_bits() != want.to_bits() && !(gotv.is_nan() && want.is_nan()) {
                 failures += 1;
                 if failures <= 8 {
                     println!(
                         "E5M2 decode FAIL: pattern {b:#04x}: got {} ({:#x}) want {} ({:#x})",
-                        gotv, gotv.to_bits(), want, want.to_bits()
+                        gotv,
+                        gotv.to_bits(),
+                        want,
+                        want.to_bits()
                     );
                 }
             }
@@ -333,11 +476,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let mut out = cuda_core::DeviceBuffer::<f32>::zeroed(&stream, 16)?;
         // SAFETY: launch shape covers the 16-element output.
-        unsafe { module.decode_e2m1((stream).as_ref(), cuda_core::simt::LaunchConfig {
-            grid_dim: (1, 1, 1),
-            block_dim: (16, 1, 1),
-            shared_mem_bytes: 0,
-        }, &mut out) }?;
+        unsafe {
+            module.decode_e2m1(
+                (stream).as_ref(),
+                cuda_core::simt::LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (16, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &mut out,
+            )
+        }?;
         stream.synchronize()?;
         let got = out.to_host_vec(&stream)?;
         for b in 0u16..16 {
@@ -378,15 +527,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         // SAFETY: launch shape covers the n-element buffers.
         match name {
-            "E4M3" => unsafe {
-                module.encode_e4m3(&stream, cfg, &values_dev, &mut out)
-            }?,
-            "E5M2" => unsafe {
-                module.encode_e5m2(&stream, cfg, &values_dev, &mut out)
-            }?,
-            _ => unsafe {
-                module.encode_e2m1(&stream, cfg, &values_dev, &mut out)
-            }?,
+            "E4M3" => unsafe { module.encode_e4m3(&stream, cfg, &values_dev, &mut out) }?,
+            "E5M2" => unsafe { module.encode_e5m2(&stream, cfg, &values_dev, &mut out) }?,
+            _ => unsafe { module.encode_e2m1(&stream, cfg, &values_dev, &mut out) }?,
         }
         stream.synchronize()?;
         let got = out.to_host_vec(&stream)?;
@@ -398,7 +541,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let mut fam_fail = 0;
         for (i, x) in values.iter().enumerate() {
-            let want = host_encode_reference(*x, mags, sat_max, nan_byte, inf_byte, sign_shift, inf_threshold);
+            let want = host_encode_reference(
+                *x,
+                mags,
+                sat_max,
+                nan_byte,
+                inf_byte,
+                sign_shift,
+                inf_threshold,
+            );
             let gotv = got[i];
             total += 1;
             // NaN results compare by NaN-ness (payload free).
@@ -411,17 +562,401 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if fam_fail <= 4 {
                     println!(
                         "{} encode FAIL: {} ({:#x}): got {:#04x} want {:#04x}",
-                        name, x, x.to_bits(), gotv, want
+                        name,
+                        x,
+                        x.to_bits(),
+                        gotv,
+                        want
                     );
                 }
             }
         }
         println!(
             "{} encode: {} values checked, {} failures",
-            name,
-            n,
-            fam_fail
+            name, n, fam_fail
         );
+    }
+
+    // ---- Packed x2 families ------------------------------------------------
+    // Lane convention under test: lane 0 (x) in the low byte (low nibble for
+    // FP4), lane 1 (y) in the high byte (high nibble) — the CUDA
+    // __nv_fp8x2_* / __nv_fp4x2_* layout.
+
+    /// Host packed-encode reference: per-lane scalar reference, packed.
+    /// `hi_shift` is 8 for the FP8 x2 pairs (y in bits [15:8]) and 4 for the
+    /// FP4 x2 pairs (y nibble in bits [7:4]).
+    fn pack_ref(
+        x: f32,
+        y: f32,
+        mags: &[(u32, f32)],
+        sat_max: f32,
+        nan_byte: u8,
+        inf_byte: u8,
+        sign_shift: u32,
+        inf_threshold: f32,
+        hi_shift: u32,
+    ) -> u16 {
+        let lo = host_encode_reference(
+            x,
+            mags,
+            sat_max,
+            nan_byte,
+            inf_byte,
+            sign_shift,
+            inf_threshold,
+        );
+        let hi = host_encode_reference(
+            y,
+            mags,
+            sat_max,
+            nan_byte,
+            inf_byte,
+            sign_shift,
+            inf_threshold,
+        );
+        u16::from(lo) | (u16::from(hi) << hi_shift)
+    }
+
+    let wide_cfg = cuda_core::simt::LaunchConfig {
+        grid_dim: ((65536u32 + 1023) / 1024, 1, 1),
+        block_dim: (1024, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    // ---- Family 7-8: E4M3x2/E5M2x2 decode (all 2^16 patterns, exhaustive) --
+    for family in ["E4M3x2", "E5M2x2"] {
+        let patterns: Vec<u16> = (0u32..65536).map(|v| v as u16).collect();
+        let values_dev = cuda_core::DeviceBuffer::from_host(&stream, &patterns)?;
+        let mut out_x = cuda_core::DeviceBuffer::<f32>::zeroed(&stream, 65536)?;
+        let mut out_y = cuda_core::DeviceBuffer::<f32>::zeroed(&stream, 65536)?;
+        // SAFETY: launch shape covers the 65536-element buffers.
+        if family == "E4M3x2" {
+            unsafe {
+                module.decode_e4m3x2(&stream, wide_cfg, &values_dev, &mut out_x, &mut out_y)
+            }?;
+        } else {
+            unsafe {
+                module.decode_e5m2x2(&stream, wide_cfg, &values_dev, &mut out_x, &mut out_y)
+            }?;
+        }
+        stream.synchronize()?;
+        let gx = out_x.to_host_vec(&stream)?;
+        let gy = out_y.to_host_vec(&stream)?;
+        let mut fam_fail = 0;
+        for v in 0u32..65536 {
+            let lo = (v & 0xFF) as u8;
+            let hi = (v >> 8) as u8;
+            let (want_x, want_y) = if family == "E4M3x2" {
+                (host_e4m3_to_f32(lo), host_e4m3_to_f32(hi))
+            } else {
+                (host_e5m2_to_f32(lo), host_e5m2_to_f32(hi))
+            };
+            total += 2;
+            if gx[v as usize].to_bits() != want_x.to_bits() {
+                fam_fail += 1;
+                failures += 1;
+                if fam_fail <= 4 {
+                    println!(
+                        "{family} decode FAIL x-lane: {v:#06x}: got {} want {}",
+                        gx[v as usize], want_x
+                    );
+                }
+            }
+            if gy[v as usize].to_bits() != want_y.to_bits() {
+                fam_fail += 1;
+                failures += 1;
+                if fam_fail <= 4 {
+                    println!(
+                        "{family} decode FAIL y-lane: {v:#06x}: got {} want {}",
+                        gy[v as usize], want_y
+                    );
+                }
+            }
+        }
+        println!("{family} decode: 65536 patterns x 2 lanes checked, {fam_fail} failures");
+    }
+
+    // ---- Family 9: E2M1x2 decode (all 2^8 patterns, exhaustive) ------------
+    {
+        let patterns: Vec<u8> = (0u16..256).map(|v| v as u8).collect();
+        let values_dev = cuda_core::DeviceBuffer::from_host(&stream, &patterns)?;
+        let mut out_x = cuda_core::DeviceBuffer::<f32>::zeroed(&stream, 256)?;
+        let mut out_y = cuda_core::DeviceBuffer::<f32>::zeroed(&stream, 256)?;
+        let cfg = cuda_core::simt::LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: launch shape covers the 256-element buffers.
+        unsafe { module.decode_e2m1x2(&stream, cfg, &values_dev, &mut out_x, &mut out_y) }?;
+        stream.synchronize()?;
+        let gx = out_x.to_host_vec(&stream)?;
+        let gy = out_y.to_host_vec(&stream)?;
+        let mut fam_fail = 0;
+        for v in 0u16..256 {
+            let want_x = host_e2m1_to_f32((v & 0xF) as u8);
+            let want_y = host_e2m1_to_f32((v >> 4) as u8);
+            total += 2;
+            if gx[v as usize].to_bits() != want_x.to_bits() {
+                fam_fail += 1;
+                failures += 1;
+                println!("{v:#04x} x-lane: got {} want {}", gx[v as usize], want_x);
+            }
+            if gy[v as usize].to_bits() != want_y.to_bits() {
+                fam_fail += 1;
+                failures += 1;
+                println!("{v:#04x} y-lane: got {} want {}", gy[v as usize], want_y);
+            }
+        }
+        println!("E2M1x2 decode: 256 patterns x 2 lanes checked, {fam_fail} failures");
+    }
+
+    // ---- Families 10-12: packed round-trip over the FULL pattern space -----
+    // Every pattern decodes and re-encodes; the expectation is the per-lane
+    // host reference of the decoded lanes (not identity), which also pins
+    // NaN canonicalization (E5M2 payload NaNs -> 0x7E|s).
+    for (name, mags, sat_max, nan_byte, inf_byte, sign_shift, inf_threshold, fp4) in [
+        (
+            "E4M3x2",
+            &e4_table,
+            448.0f32,
+            0x7Fu8,
+            0x7Fu8,
+            7u32,
+            f32::INFINITY,
+            false,
+        ),
+        (
+            "E5M2x2",
+            &e5_table,
+            f32::INFINITY,
+            0x7Eu8,
+            0x7Cu8,
+            7u32,
+            61440.0f32,
+            false,
+        ),
+        (
+            "E2M1x2",
+            &e2_table,
+            6.0f32,
+            0x07u8,
+            0x07u8,
+            3u32,
+            f32::INFINITY,
+            true,
+        ),
+    ] {
+        let is_e4 = name == "E4M3x2";
+        let is_e5 = name == "E5M2x2";
+        let (n, wide) = if fp4 {
+            (256usize, false)
+        } else {
+            (65536, true)
+        };
+        let cfg = if wide {
+            wide_cfg
+        } else {
+            cuda_core::simt::LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            }
+        };
+        let mut fam_fail = 0;
+        if fp4 {
+            let patterns: Vec<u8> = (0u16..256).map(|v| v as u8).collect();
+            let values_dev = cuda_core::DeviceBuffer::from_host(&stream, &patterns)?;
+            let mut out = cuda_core::DeviceBuffer::<u8>::zeroed(&stream, n)?;
+            // SAFETY: launch shape covers the 256-element buffers.
+            unsafe { module.roundtrip_e2m1x2(&stream, cfg, &values_dev, &mut out) }?;
+            stream.synchronize()?;
+            let got = out.to_host_vec(&stream)?;
+            for v in 0u16..256 {
+                let (x, y) = e2m1x2_to_f32x2(v as u8);
+                let want = pack_ref(
+                    x,
+                    y,
+                    mags,
+                    sat_max,
+                    nan_byte,
+                    inf_byte,
+                    sign_shift,
+                    inf_threshold,
+                    4,
+                ) as u8;
+                total += 1;
+                if got[v as usize] != want {
+                    fam_fail += 1;
+                    failures += 1;
+                    if fam_fail <= 4 {
+                        println!(
+                            "{name} roundtrip FAIL: {v:#04x}: got {:#04x} want {:#04x}",
+                            got[v as usize], want
+                        );
+                    }
+                }
+            }
+        } else {
+            let patterns: Vec<u16> = (0u32..65536).map(|v| v as u16).collect();
+            let values_dev = cuda_core::DeviceBuffer::from_host(&stream, &patterns)?;
+            let mut out = cuda_core::DeviceBuffer::<u16>::zeroed(&stream, n)?;
+            // SAFETY: launch shape covers the 65536-element buffers.
+            if is_e4 {
+                unsafe { module.roundtrip_e4m3x2(&stream, wide_cfg, &values_dev, &mut out) }?;
+            } else if is_e5 {
+                unsafe { module.roundtrip_e5m2x2(&stream, wide_cfg, &values_dev, &mut out) }?;
+            }
+            stream.synchronize()?;
+            let got = out.to_host_vec(&stream)?;
+            for v in 0u32..65536 {
+                let bits = v as u16;
+                let (x, y) = if is_e4 {
+                    e4m3x2_to_f32x2(bits)
+                } else {
+                    e5m2x2_to_f32x2(bits)
+                };
+                let want = pack_ref(
+                    x,
+                    y,
+                    mags,
+                    sat_max,
+                    nan_byte,
+                    inf_byte,
+                    sign_shift,
+                    inf_threshold,
+                    8,
+                );
+                total += 1;
+                if got[v as usize] != want {
+                    fam_fail += 1;
+                    failures += 1;
+                    if fam_fail <= 4 {
+                        println!(
+                            "{name} roundtrip FAIL: {bits:#06x}: got {:#06x} want {:#06x}",
+                            got[v as usize], want
+                        );
+                    }
+                }
+            }
+        }
+        let space = if fp4 { 256 } else { 65536 };
+        println!("{name} roundtrip: {space} patterns checked, {fam_fail} failures");
+    }
+
+    // ---- Families 13-15: packed encode of the RNE spread as lane-mixed pairs
+    // x = spread[i] (forward), y = spread[n-1-i] (mirrored): any lane swap or
+    // wrong shift breaks the symmetry of the check.
+    for (name, mags, sat_max, nan_byte, inf_byte, sign_shift, inf_threshold, fp4) in [
+        (
+            "E4M3x2",
+            &e4_table,
+            448.0f32,
+            0x7Fu8,
+            0x7Fu8,
+            7u32,
+            f32::INFINITY,
+            false,
+        ),
+        (
+            "E5M2x2",
+            &e5_table,
+            f32::INFINITY,
+            0x7Eu8,
+            0x7Cu8,
+            7u32,
+            61440.0f32,
+            false,
+        ),
+        (
+            "E2M1x2",
+            &e2_table,
+            6.0f32,
+            0x07u8,
+            0x07u8,
+            3u32,
+            f32::INFINITY,
+            true,
+        ),
+    ] {
+        let values = generate_test_values(mags, true);
+        let n = values.len();
+        let a: Vec<f32> = values.clone();
+        let b: Vec<f32> = values.iter().rev().copied().collect();
+        let a_dev = cuda_core::DeviceBuffer::from_host(&stream, &a)?;
+        let b_dev = cuda_core::DeviceBuffer::from_host(&stream, &b)?;
+        let cfg = cuda_core::simt::LaunchConfig {
+            grid_dim: (((n as u32) + 1023) / 1024, 1, 1),
+            block_dim: (1024, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut fam_fail = 0;
+        if fp4 {
+            let mut out = cuda_core::DeviceBuffer::<u8>::zeroed(&stream, n)?;
+            // SAFETY: launch shape covers the n-element buffers.
+            unsafe { module.encode_pairs_e2m1x2(&stream, cfg, &a_dev, &b_dev, &mut out) }?;
+            stream.synchronize()?;
+            let got = out.to_host_vec(&stream)?;
+            for i in 0..n {
+                let want = pack_ref(
+                    a[i],
+                    b[i],
+                    mags,
+                    sat_max,
+                    nan_byte,
+                    inf_byte,
+                    sign_shift,
+                    inf_threshold,
+                    4,
+                ) as u8;
+                total += 1;
+                if got[i] != want {
+                    fam_fail += 1;
+                    failures += 1;
+                    if fam_fail <= 4 {
+                        println!(
+                            "{name} pair FAIL [{}]: got {:#04x} want {:#04x}",
+                            i, got[i], want
+                        );
+                    }
+                }
+            }
+        } else {
+            let mut out = cuda_core::DeviceBuffer::<u16>::zeroed(&stream, n)?;
+            // SAFETY: launch shape covers the n-element buffers.
+            if name == "E4M3x2" {
+                unsafe { module.encode_pairs_e4m3x2(&stream, cfg, &a_dev, &b_dev, &mut out) }?;
+            } else {
+                unsafe { module.encode_pairs_e5m2x2(&stream, cfg, &a_dev, &b_dev, &mut out) }?;
+            }
+            stream.synchronize()?;
+            let got = out.to_host_vec(&stream)?;
+            for i in 0..n {
+                let want = pack_ref(
+                    a[i],
+                    b[i],
+                    mags,
+                    sat_max,
+                    nan_byte,
+                    inf_byte,
+                    sign_shift,
+                    inf_threshold,
+                    8,
+                );
+                total += 1;
+                if got[i] != want {
+                    fam_fail += 1;
+                    failures += 1;
+                    if fam_fail <= 4 {
+                        println!(
+                            "{name} pair FAIL [{}]: got {:#06x} want {:#06x}",
+                            i, got[i], want
+                        );
+                    }
+                }
+            }
+        }
+        println!("{name} encode pairs: {n} lane-mixed pairs checked, {fam_fail} failures");
     }
 
     println!("\nTotal checks: {}, failures: {}", total, failures);
