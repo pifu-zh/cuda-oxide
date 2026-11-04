@@ -2373,6 +2373,10 @@ pub fn rewrite_ir_for_amdgcn(ll: &str) -> Result<String, String> {
     //     ntid args to every one-arg call of these helpers (idempotent:
     //     the check requires exactly one argument).
     text = append_index_call_ntid_args(&text);
+    // 5c. [adapt-rocm] transitive ntid threading: intermediate device fns on
+    //     a kernel->...->index_helper chain gain the parameter tail and their
+    //     call sites gain the args (call-graph fixed point; see the fn doc).
+    text = append_ntid_transitive(&text);
     // 6. nctaid .y/.z → constant 1 (1-D GRID semantics; the launch macros'
     //    grid dims stay 1-D across the batch — the block dims are the ones
     //    that went multi-dimensional).
@@ -2485,6 +2489,199 @@ pub fn rewrite_ir_for_amdgcn(ll: &str) -> Result<String, String> {
 /// cp.async GEP -1 -> cross-page load fault). Appends the three ntid args
 /// to every one-arg call of these helpers (idempotent: the check requires
 /// exactly one argument).
+/// Transitive ntid threading (Step 5 closure).
+///
+/// `append_index_call_ntid_args` rewrites index-helper calls to pass the
+/// three ntid args, and `append_ntid_kernarg_params` adds the parameters to
+/// defines whose bodies reference them — but a call chain that passes ntid
+/// through intermediate device functions (`kernel -> Index1D::from_scope ->
+/// index_1d`) leaves the middle defines without the parameters while their
+/// call sites already carry `%ntid_x` references: llc rejects the module
+/// with `use of undefined value '%ntid_x'` (batch examples
+/// struct_constant_provenance / copy_nonoverlapping / ...).
+///
+/// This pass closes the gap: seed the needs-params set with functions whose
+/// bodies reference `%ntid_*` (kernels are already parameterized
+/// unconditionally), propagate the set backwards over the call graph to a
+/// fixed point, append the parameter tail to member defines that lack it,
+/// and append the three args to every call targeting a member whose call
+/// line does not carry `%ntid_z` yet. Idempotent: both rewrites skip lines
+/// that already carry `%ntid_z`.
+fn append_ntid_transitive(ll: &str) -> String {
+    const NTIDS: &str = "i32 %ntid_x, i32 %ntid_y, i32 %ntid_z";
+
+    // Parse defines: name, has-params, body-references-ntid; and the call
+    // graph (caller -> callee) with each call's line index.
+    struct FnInfo {
+        is_kernel: bool,
+        has_params: bool,
+        body_refs_ntid: bool,
+    }
+    let lines: Vec<&str> = ll.lines().collect();
+    let mut fn_info: std::collections::BTreeMap<String, FnInfo> =
+        std::collections::BTreeMap::new();
+    let mut calls: Vec<(String, String, usize)> = Vec::new(); // (caller, callee, line)
+    let mut current = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("define ") {
+            let name = trimmed
+                .split('@')
+                .nth(1)
+                .and_then(|rest| rest.split('(').next())
+                .unwrap_or("")
+                .to_string();
+            let is_kernel = trimmed.contains("amdgpu_kernel");
+            let has_params = trimmed.contains("%ntid_z");
+            let body_refs_ntid = false;
+            current = name.clone();
+            fn_info.insert(
+                name,
+                FnInfo {
+                    is_kernel,
+                    has_params,
+                    body_refs_ntid,
+                },
+            );
+            continue;
+        }
+        if trimmed == "}" {
+            current.clear();
+            continue;
+        }
+        if trimmed.contains("%ntid_")
+            && let Some(info) = fn_info.get_mut(&current)
+        {
+            info.body_refs_ntid = true;
+        }
+        if let Some(at) = trimmed.find("@") {
+            let callee: String = trimmed[at + 1..]
+                .split('(')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            if !callee.is_empty() && fn_info.contains_key(&callee) {
+                calls.push((current.clone(), callee, i));
+            }
+        }
+    }
+
+    // Seed + backward propagation to a fixed point.
+    let mut needs: std::collections::BTreeSet<String> = fn_info
+        .iter()
+        .filter(|(_, info)| info.is_kernel || info.body_refs_ntid)
+        .map(|(name, _)| name.clone())
+        .collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (caller, callee, _) in &calls {
+            if needs.contains(callee) && !needs.contains(caller) {
+                needs.insert(caller.clone());
+                changed = true;
+            }
+        }
+    }
+
+    // Rewrite defines lacking the parameter tail.
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if !(line.starts_with("define ") && line.trim_end().ends_with('{')) {
+            out.push(line.to_string());
+            i += 1;
+            continue;
+        }
+        let mut block: Vec<String> = vec![line.to_string()];
+        i += 1;
+        while i < lines.len() && lines[i] != "}" {
+            block.push(lines[i].to_string());
+            i += 1;
+        }
+        if i < lines.len() {
+            block.push(lines[i].to_string());
+            i += 1;
+        }
+        let define = block[0].clone();
+        let name = define
+            .split('@')
+            .nth(1)
+            .and_then(|rest| rest.split('(').next())
+            .unwrap_or("")
+            .to_string();
+        if needs.contains(&name) && !define.contains("%ntid_z") {
+            if let Some(brace) = define.rfind('{') {
+                if let Some(paren) = define[..brace].rfind(')') {
+                    let between = &define[paren + 1..brace];
+                    let between_ok = between
+                        .chars()
+                        .all(|c| c.is_whitespace() || c.is_ascii_alphanumeric() || "#,=_".contains(c));
+                    if between_ok {
+                        let open = define[..paren].rfind('(').unwrap_or(paren);
+                        let insertion = if define[open + 1..paren].trim().is_empty() {
+                            NTIDS.to_string()
+                        } else {
+                            format!(", {NTIDS}")
+                        };
+                        block[0] =
+                            format!("{}{}{}", &define[..paren], insertion, &define[paren..]);
+                    }
+                }
+            }
+        }
+        out.extend(block.into_iter());
+    }
+
+    // Rewrite calls to needs-members whose call line lacks the ntid args.
+    let mut result: Vec<String> = Vec::with_capacity(out.len());
+    for (i, line) in out.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let is_call = (trimmed.starts_with("call ") || trimmed.starts_with("tail call "))
+            && trimmed.contains('@');
+        let mut pushed = false;
+        if is_call && !trimmed.contains("%ntid_z") {
+            if let Some(at) = trimmed.find('@') {
+                let callee: String = trimmed[at + 1..]
+                    .split('(')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                if needs.contains(&callee) {
+                    let Some(close) = trimmed.rfind(')') else {
+                        result.push(line.clone());
+                        continue;
+                    };
+                    // The args end at the last ')' before any attribute tail;
+                    // with opaque pointers the arg list cannot contain a ')'
+                    // itself, so rfind is the arg-list closer.
+                    let indent = &line[..line.len() - trimmed.len()];
+                    let args_end = close;
+                    result.push(format!(
+                        "{}{}{}, {}{}",
+                        indent,
+                        &trimmed[..args_end],
+                        NTIDS,
+                        "",
+                        &trimmed[args_end..]
+                    ));
+                    pushed = true;
+                }
+            }
+        }
+        if !pushed {
+            result.push(line.clone());
+        }
+        let _ = i;
+    }
+
+    let mut text = result.join("\n");
+    if ll.ends_with('\n') && !text.is_empty() {
+        text.push('\n');
+    }
+    text
+}
+
 fn append_index_call_ntid_args(ll: &str) -> String {
     const NTIDS: &str = "i32 %ntid_x, i32 %ntid_y, i32 %ntid_z";
     let mut out: Vec<String> = Vec::with_capacity(ll.lines().count());

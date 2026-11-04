@@ -107,6 +107,13 @@ def translate_nvvm_to_amdgcn(ll_text: str) -> str:
         text,
     )
 
+    # 5c. [adapt-rocm 2026-11-05] 传递性 ntid 线程穿透：kernel -> ... ->
+    #     index_helper 链上的中间设备函数从调用点获得 %ntid_* 引用后，
+    #     其 define 追加形参，且其对上游的调用点补齐三实参（调用图不动点；
+    #     Rust 镜像 = append_ntid_transitive）。batch 例
+    #     struct_constant_provenance 等 6 例的 from_scope -> index_1d 链实证。
+    text = _append_ntid_transitive(text)
+
     # 6. nctaid .y|.z → 常量 1（1D grid：launch 的 y,z 网格维度为 1；
     #    ntid 不在此列——见步骤 5）
     text = re.sub(
@@ -2122,3 +2129,104 @@ def _append_ntid_kernarg_params(text: str) -> str:
             out.append(line)
             i += 1
     return "\n".join(out)
+
+def _append_ntid_transitive(text: str) -> str:
+    """传递性 ntid 线程穿透（Step 5c，Rust 镜像 = append_ntid_transitive）。
+
+    种子 = kernel 与体内引用 %ntid_* 的函数；沿调用图反向传播到不动点；
+    成员 define 追加形参尾，成员调用点补齐三实参（幂等：两处 rewrite 都
+    跳过已含 %ntid_z 的行）。
+    """
+    import re as _re
+
+    # Preserve the exact trailing-newline count (idempotence across runs).
+    had_nl = text.endswith("\n")
+    body = text[:-1] if had_nl else text
+    lines = body.split("\n")
+    fn_info: dict[str, dict] = {}
+    calls: list[tuple[str, str, int]] = []
+    current = ""
+    for i, line in enumerate(lines):
+        trimmed = line.lstrip()
+        if trimmed.startswith("define "):
+            name = trimmed.split("@")[1].split("(")[0]
+            current = name
+            fn_info[name] = {
+                "is_kernel": "amdgpu_kernel" in trimmed,
+                "has_params": "%ntid_z" in trimmed,
+                "refs": False,
+            }
+            continue
+        if trimmed == "}":
+            current = ""
+            continue
+        if "%ntid_" in trimmed and current in fn_info:
+            fn_info[current]["refs"] = True
+        if "@" in trimmed:
+            at = trimmed.find("@")
+            callee = trimmed[at + 1 :].split("(")[0]
+            if callee and callee in fn_info:
+                calls.append((current, callee, i))
+
+    needs = {n for n, info in fn_info.items() if info["is_kernel"] or info["refs"]}
+    changed = True
+    while changed:
+        changed = False
+        for caller, callee, _ in calls:
+            if callee in needs and caller not in needs:
+                needs.add(caller)
+                changed = True
+
+    out = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if not (line.lstrip().startswith("define ") and line.rstrip().endswith("{")):
+            out.append(line)
+            i += 1
+            continue
+        block = [line]
+        i += 1
+        while i < len(lines) and lines[i] != "}":
+            block.append(lines[i])
+            i += 1
+        if i < len(lines):
+            block.append(lines[i])
+            i += 1
+        define = block[0]
+        name = define.split("@")[1].split("(")[0]
+        if name in needs and "%ntid_z" not in define:
+            brace = define.rfind("{")
+            paren = define[:brace].rfind(")")
+            between = define[paren + 1 : brace]
+            if all(c.isspace() or c.isalnum() or c in "#,=_" for c in between):
+                open_p = define[:paren].rfind("(")
+                insertion = (
+                    "i32 %ntid_x, i32 %ntid_y, i32 %ntid_z"
+                    if not define[open_p + 1 : paren].strip()
+                    else ", i32 %ntid_x, i32 %ntid_y, i32 %ntid_z"
+                )
+                block[0] = f"{define[:paren]}{insertion}{define[paren:]}"
+        out.extend(block)
+
+    result = []
+    for line in out:
+        trimmed = line.lstrip()
+        is_call = trimmed.startswith(("call ", "tail call ")) and "@" in trimmed
+        if is_call and "%ntid_z" not in line:
+            at = trimmed.find("@")
+            callee = trimmed[at + 1 :].split("(")[0]
+            if callee in needs and (close := trimmed.rfind(")")):
+                indent = line[: line.len() - len(trimmed)] if hasattr(line, "len") else line[: len(line) - len(trimmed)]
+                indent = line[: len(line) - len(trimmed)]
+                args_end = close
+                result.append(
+                    f"{indent}{trimmed[:args_end]}, i32 %ntid_x, i32 %ntid_y, i32 %ntid_z{trimmed[args_end:]}"
+                )
+                continue
+        result.append(line)
+
+    result_text = "\n".join(result)
+    if had_nl:
+        result_text += "\n"
+    return result_text
