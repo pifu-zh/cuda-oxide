@@ -592,7 +592,7 @@ pub fn run_pipeline(
             eprintln!("{}", func_op_ptr.deref(&ctx).disp(&ctx));
         }
 
-        verify_operation(&ctx, func_op_ptr, &func.export_name)?;(&ctx, func_op_ptr, &func.export_name)?;
+        verify_operation(&ctx, func_op_ptr, &func.export_name)?;
 
         if func.is_kernel
             && let Some(bounds) = launch_bounds_from_mir_func(&ctx, func_op_ptr)

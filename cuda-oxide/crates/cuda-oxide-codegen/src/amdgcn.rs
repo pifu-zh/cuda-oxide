@@ -176,6 +176,29 @@ fn rewrite_allocas(ll: &str) -> String {
 }
 
 /// Single-function alloca rewrite (body = define line .. "}" line).
+/// True when `tail` parses as one LLVM metadata attachment: `!name !value`
+/// (e.g. `!dbg !4`), `!N` (bare node ref), `!"string"`, or with a leading
+/// `distinct `. The attachment name and value are `!` + metadata-word chars.
+fn is_metadata_attachment(tail: &str) -> bool {
+    let t = tail.strip_prefix("distinct ").unwrap_or(tail);
+    let mut words = t.split_whitespace();
+    let Some(first) = words.next() else {
+        return false;
+    };
+    if !first.starts_with('!') {
+        return false;
+    }
+    let meta_word =
+        |w: &str| w.len() > 1 && w[1..].bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'$' || b == b'"');
+    let second = words.next();
+    match second {
+        // `!name !value` / `!value` — both start with '!' and carry only
+        // metadata-word characters.
+        Some(second) => meta_word(first) && meta_word(second),
+        None => meta_word(first),
+    }
+}
+
 fn rewrite_allocas_in_function(body: &[&str]) -> Vec<String> {
     struct Alloca<'a> {
         line: usize,
@@ -212,16 +235,36 @@ fn rewrite_allocas_in_function(body: &[&str]) -> Vec<String> {
         }
         // Script order: strip the trailing `, align N` FIRST, then split the
         // remaining `<ty>[, <count>]` on top-level commas.
+        // Peel trailing metadata attachments (`, !dbg !N`, ...) FIRST — they
+        // trail the alignment and would break its all-digit check — then
+        // extract the alignment, re-checking after each peel.
         let mut align = None;
+        let mut metadata = String::new();
         let mut head = rest;
-        if let Some(idx) = rest.rfind(", align ") {
-            let candidate = rest[idx + ", align ".len()..].trim();
-            if !candidate.is_empty() && candidate.bytes().all(|b| b.is_ascii_digit()) {
-                align = Some(candidate);
-                head = rest[..idx].trim();
+        loop {
+            if let Some(idx) = head.rfind(", align ") {
+                let candidate = head[idx + ", align ".len()..].trim();
+                if !candidate.is_empty() && candidate.bytes().all(|b| b.is_ascii_digit()) {
+                    align = Some(candidate);
+                    head = head[..idx].trim_end();
+                    continue;
+                }
             }
+            let Some(bang) = head.rfind(", !") else {
+                break;
+            };
+            let tail = head[bang + 2..].trim();
+            if !is_metadata_attachment(tail) {
+                break;
+            }
+            // Peel right-to-left, prepending each attachment so the restored
+            // tail keeps its original order (allocas can carry several: the
+            // exporter's `!dbg` plus rustc's `!annotation`, ...). Each peeled
+            // tail brings back its own leading separator.
+            metadata = format!(", {tail}{metadata}");
+            head = head[..bang].trim_end();
         }
-        let parts = split_top_level_commas(head);
+        let parts = split_top_level_commas(&head);
         if parts.len() > 2 || parts.first() == Some(&"void") {
             continue; // unparseable shape: keep as-is, llc verifier fails loudly
         }
@@ -246,6 +289,7 @@ fn rewrite_allocas_in_function(body: &[&str]) -> Vec<String> {
             new_def.push_str(&format!(", align {align}"));
         }
         new_def.push_str(", addrspace(5)");
+        new_def.push_str(&metadata);
         allocas.push(Alloca {
             line: k,
             name,
@@ -2244,21 +2288,50 @@ fn rewrite_calls(ll: &str, callee: &str, replacement: &str) -> (String, bool) {
             out.push(line.to_string());
             continue;
         };
-        // Only bare calls or calls with `#N` attribute suffixes are rewrite
-        // targets; anything else (unusual spellings) is left for llc to
-        // reject explicitly rather than silently mangled.
+        // Rewrite targets: bare calls, calls with `#N` attribute suffixes,
+        // calls with trailing metadata attachments (`, !dbg !N`), and mixes
+        // (`#0, !dbg !60` — debug builds attach !dbg to sreg reads). Tokens
+        // arrive comma-glued (`#0,` `!dbg`), so separators are stripped
+        // before validating. The attribute/meta tail is preserved on the
+        // rewritten line (legal on the replacement op); `#N` groups are
+        // dropped with the call.
         let attrs = attrs.trim_start();
         let is_bare = attrs.is_empty();
-        let is_attr_list = attrs.starts_with('#')
+        let tokens_ok = !attrs.is_empty()
             && attrs
                 .split_whitespace()
-                .all(|token| token.starts_with('#') && token[1..].bytes().all(|b| b.is_ascii_digit()));
-        if !(is_bare || is_attr_list) {
+                .filter(|token| *token != ",")
+                .all(|token| {
+                    let token = token.trim_matches(',');
+                    token.starts_with('#') && token[1..].bytes().all(|b| b.is_ascii_digit())
+                        || (token.starts_with("!")
+                            && token.len() > 1
+                            && token[1..]
+                                .bytes()
+                                .next()
+                                .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_'))
+                });
+        if !(is_bare || tokens_ok) {
             out.push(line.to_string());
             continue;
         }
         let indent = &line[..line.len() - line.trim_start().len()];
-        out.push(format!("{indent}{} = {replacement}", &line[..eq]));
+        // Metadata attachments survive the rewrite (legal on arithmetic ops);
+        // `#N` attribute groups are dropped with the call.
+        let meta_tail = attrs
+            .split_whitespace()
+            .filter(|token| token.starts_with('!'))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let meta_tail = if meta_tail.is_empty() {
+            String::new()
+        } else {
+            format!(", {meta_tail}")
+        };
+        out.push(format!(
+            "{indent}{} = {replacement}{meta_tail}",
+            &line[..eq]
+        ));
         changed = true;
     }
     let mut text = out.join("\n");
@@ -2319,9 +2392,12 @@ fn append_ntid_kernarg_params(ll: &str) -> String {
             if let Some(brace) = define.rfind('{') {
                 if let Some(paren) = define[..brace].rfind(')') {
                     let between = &define[paren + 1..brace];
-                    let between_ok = between
-                        .chars()
-                        .all(|c| c.is_whitespace() || c.is_ascii_alphanumeric() || "#,=_".contains(c));
+                    // `!` and `.` cover debug metadata tails (`!dbg !47`,
+                    // `!llvm...`): debug builds attach !dbg to every define,
+                    // including the fns these passes widen.
+                    let between_ok = between.chars().all(|c| {
+                        c.is_whitespace() || c.is_ascii_alphanumeric() || "#,=_!.".contains(c)
+                    });
                     if between_ok {
                         // Zero-parameter functions take the parameters without
                         // a leading comma.
@@ -2518,8 +2594,36 @@ fn append_ntid_transitive(ll: &str) -> String {
         body_refs_ntid: bool,
     }
     let lines: Vec<&str> = ll.lines().collect();
-    let mut fn_info: std::collections::BTreeMap<String, FnInfo> =
-        std::collections::BTreeMap::new();
+    // Pass 1: register every define. Calls may reference functions defined
+    // LATER in the file, so the callee registry must be complete before any
+    // call edge is collected (a single pass dropped the
+    // caller->later-defined-callee edges, and the fixed point then left
+    // those callers without the parameter tail their widened callees need —
+    // batch slice_from_raw_parts_cast llc "use of undefined value %ntid_x").
+    let mut fn_info: std::collections::BTreeMap<String, FnInfo> = std::collections::BTreeMap::new();
+    for line in &lines {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("define ") {
+            continue;
+        }
+        let name = trimmed
+            .split('@')
+            .nth(1)
+            .and_then(|rest| rest.split('(').next())
+            .unwrap_or("")
+            .to_string();
+        let is_kernel = trimmed.contains("amdgpu_kernel");
+        let has_params = trimmed.contains("%ntid_z");
+        fn_info.insert(
+            name,
+            FnInfo {
+                is_kernel,
+                has_params,
+                body_refs_ntid: false,
+            },
+        );
+    }
+    // Pass 2: per-function body facts (ntid references) and call edges.
     let mut calls: Vec<(String, String, usize)> = Vec::new(); // (caller, callee, line)
     let mut current = String::new();
     for (i, line) in lines.iter().enumerate() {
@@ -2531,18 +2635,7 @@ fn append_ntid_transitive(ll: &str) -> String {
                 .and_then(|rest| rest.split('(').next())
                 .unwrap_or("")
                 .to_string();
-            let is_kernel = trimmed.contains("amdgpu_kernel");
-            let has_params = trimmed.contains("%ntid_z");
-            let body_refs_ntid = false;
-            current = name.clone();
-            fn_info.insert(
-                name,
-                FnInfo {
-                    is_kernel,
-                    has_params,
-                    body_refs_ntid,
-                },
-            );
+            current = name;
             continue;
         }
         if trimmed == "}" {
@@ -2614,9 +2707,12 @@ fn append_ntid_transitive(ll: &str) -> String {
             if let Some(brace) = define.rfind('{') {
                 if let Some(paren) = define[..brace].rfind(')') {
                     let between = &define[paren + 1..brace];
-                    let between_ok = between
-                        .chars()
-                        .all(|c| c.is_whitespace() || c.is_ascii_alphanumeric() || "#,=_".contains(c));
+                    // `!` and `.` cover debug metadata tails (`!dbg !47`,
+                    // `!llvm...`): debug builds attach !dbg to every define,
+                    // including the fns these passes widen.
+                    let between_ok = between.chars().all(|c| {
+                        c.is_whitespace() || c.is_ascii_alphanumeric() || "#,=_!.".contains(c)
+                    });
                     if between_ok {
                         let open = define[..paren].rfind('(').unwrap_or(paren);
                         let insertion = if define[open + 1..paren].trim().is_empty() {
@@ -2634,10 +2730,16 @@ fn append_ntid_transitive(ll: &str) -> String {
     }
 
     // Rewrite calls to needs-members whose call line lacks the ntid args.
+    // Result-bound calls (`%v33 = call i64 @helper(...)`) must match too:
+    // the debug (no-opt) pipeline keeps them alive to llc, where missing
+    // args turn into poison and the garbage register picks wrong paths.
     let mut result: Vec<String> = Vec::with_capacity(out.len());
     for (i, line) in out.iter().enumerate() {
         let trimmed = line.trim_start();
-        let is_call = (trimmed.starts_with("call ") || trimmed.starts_with("tail call "))
+        let is_call = (trimmed.starts_with("call ")
+            || trimmed.starts_with("tail call ")
+            || trimmed.contains(" = call ")
+            || trimmed.contains(" = tail call "))
             && trimmed.contains('@');
         let mut pushed = false;
         if is_call && !trimmed.contains("%ntid_z") {
@@ -2654,15 +2756,25 @@ fn append_ntid_transitive(ll: &str) -> String {
                     };
                     // The args end at the last ')' before any attribute tail;
                     // with opaque pointers the arg list cannot contain a ')'
-                    // itself, so rfind is the arg-list closer.
+                    // itself, so rfind is the arg-list closer. The `)` comes
+                    // from the preserved tail; the insertion carries its own
+                    // leading separator (none for an empty arg list).
+                    let Some(open) = trimmed.find('(') else {
+                        result.push(line.clone());
+                        continue;
+                    };
                     let indent = &line[..line.len() - trimmed.len()];
                     let args_end = close;
+                    let insertion = if trimmed[open + 1..close].trim().is_empty() {
+                        NTIDS.to_string()
+                    } else {
+                        format!(", {NTIDS}")
+                    };
                     result.push(format!(
-                        "{}{}{}, {}{}",
+                        "{}{}{}{}",
                         indent,
                         &trimmed[..args_end],
-                        NTIDS,
-                        "",
+                        insertion,
                         &trimmed[args_end..]
                     ));
                     pushed = true;
@@ -2688,10 +2800,17 @@ fn append_index_call_ntid_args(ll: &str) -> String {
     for line in ll.lines() {
         let trimmed = line.trim_start();
         let is_define = trimmed.starts_with("define ");
+        // Calls bind results (`%v33 = call i64 @index_1d(...)`); the debug
+        // (no-opt) pipeline keeps those call sites alive to llc, so both the
+        // line-leading and the result-bound forms must match.
         let is_call = (trimmed.starts_with("call i64 @_R")
             || trimmed.starts_with("call i1 @_R")
             || trimmed.starts_with("tail call i64 @_R")
-            || trimmed.starts_with("tail call i1 @_R"))
+            || trimmed.starts_with("tail call i1 @_R")
+            || trimmed.contains(" = call i64 @_R")
+            || trimmed.contains(" = call i1 @_R")
+            || trimmed.contains(" = tail call i64 @_R")
+            || trimmed.contains(" = tail call i1 @_R"))
             && (trimmed.contains("index_1d")
                 || trimmed.contains("index_2d")
                 || trimmed.contains("index_3d")
@@ -2716,13 +2835,14 @@ fn append_index_call_ntid_args(ll: &str) -> String {
             continue;
         }
         let indent = &line[..line.len() - trimmed.len()];
-        let args_end = open + 1 + args.len();
+        // The `)` comes from the preserved tail; the insertion carries its
+        // own leading separator (the arity guard above leaves >= 1 arg).
+        let args_end = close;
         out.push(format!(
-            "{}{}{}, {}{}",
+            "{}{}{}{}",
             indent,
             &trimmed[..args_end],
-            NTIDS,
-            "",
+            format!(", {NTIDS}"),
             &trimmed[args_end..]
         ));
     }
@@ -3735,6 +3855,105 @@ entry:
         assert!(out.contains(
             "define hidden i32 @helper(i32 %ntid_x, i32 %ntid_y, i32 %ntid_z) #0 {"
         ));
+    }
+
+    #[test]
+    fn forward_referenced_helper_still_threads_ntid() {
+        // The caller appears BEFORE the callee's define. The call-graph scan
+        // must register all defines before collecting edges: a single pass
+        // dropped caller->later-callee edges and the fixed point then left
+        // the caller without the parameter tail, while the call-site append
+        // still added `%ntid_x` args — llc "use of undefined value
+        // %ntid_x" (batch slice_from_raw_parts_cast regression).
+        let ll = "\
+define amdgpu_kernel void @k() #0 {
+entry:
+  %v0 = call i32 @caller() #0
+  ret void
+}
+
+define i32 @caller() #0 {
+entry:
+  %v1 = call i32 @helper() #0
+  ret i32 %v1
+}
+
+define i32 @helper() #0 {
+entry:
+  %v2 = call i32 @llvm.nvvm.read.ptx.sreg.ntid.x() #0
+  ret i32 %v2
+}
+";
+        let out = rewrite_ir_for_amdgcn(ll).unwrap();
+
+        assert!(out.contains("= or i32 %ntid_x, 0"));
+        // Every function on the kernel->helper chain gains the tail…
+        assert!(
+            out.contains(
+                "define amdgpu_kernel void @k(i32 %ntid_x, i32 %ntid_y, i32 %ntid_z) #0 {"
+            )
+        );
+        assert!(out.contains("define i32 @caller(i32 %ntid_x, i32 %ntid_y, i32 %ntid_z) #0 {"));
+        assert!(out.contains("define i32 @helper(i32 %ntid_x, i32 %ntid_y, i32 %ntid_z) #0 {"));
+        // …and every call site on it gains the args, so no appended
+        // `%ntid_x` can reference an undefined value.
+        assert!(out.contains("%v0 = call i32 @caller(i32 %ntid_x, i32 %ntid_y, i32 %ntid_z) #0"));
+        assert!(out.contains("%v1 = call i32 @helper(i32 %ntid_x, i32 %ntid_y, i32 %ntid_z) #0"));
+    }
+
+    #[test]
+    fn debug_shaped_module_is_rewritten_with_dbg_tails_preserved() {
+        // The CUDA_OXIDE_DEBUG=full shape: every define carries a
+        // `#N !dbg !M` tail, every call a `#N, !dbg !M` tail, and calls bind
+        // results (`%vN = call ...`) — the no-opt pipeline keeps them alive
+        // to llc, so the ntid threading must widen result-bound call sites
+        // too (missing args turn into poison there). Recorded on the vecadd
+        // debug build: defines widened but call sites skipped -> the kernel
+        // took the -1 sentinel path and wrote zeros.
+        let ll = "\
+define amdgpu_kernel void @vecadd(ptr %v0) #0 !dbg !3 {
+entry:
+  %v15 = alloca {}, align 1, !dbg !20
+  %v16 = alloca i64, align 8, !dbg !21, !annotation !22
+  %v33 = call i64 @_RINvX8index_1dE6vecadd(ptr %v15) #0, !dbg !34
+  ret void, !dbg !35
+}
+
+define i64 @_RINvX8index_1dE6vecadd(ptr %f) alwaysinline #0 !dbg !47 {
+bb0:
+  %v19 = call i32 @llvm.nvvm.read.ptx.sreg.ntid.x() #0, !dbg !60
+  %v20 = zext nneg i32 %v19 to i64
+  ret i64 %v20, !dbg !61
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.ntid.x() #1
+";
+        let out = rewrite_ir_for_amdgcn(ll).unwrap();
+        // sreg reads rewritten with the metadata tail preserved.
+        assert!(out.contains("%v19 = or i32 %ntid_x, 0, !dbg !60\n"));
+        // The result-bound call site gains the three args; `!dbg !34` stays.
+        // The frame use is renamed to the addrspace(5) cast's result.
+        assert!(out.contains(
+            "%v33 = call i64 @_RINvX8index_1dE6vecadd(ptr %v15.ac, i32 %ntid_x, i32 %ntid_y, i32 %ntid_z) #0, !dbg !34\n"
+        ));
+        // The helper define gains the params before its `!dbg !47` tail…
+        assert!(out.contains(
+            "define i64 @_RINvX8index_1dE6vecadd(ptr %f, i32 %ntid_x, i32 %ntid_y, i32 %ntid_z) alwaysinline #0 !dbg !47 {"
+        ));
+        // …and the kernel define before its `!dbg !3` tail.
+        assert!(out.contains(
+            "define amdgpu_kernel void @vecadd(ptr %v0, i32 %ntid_x, i32 %ntid_y, i32 %ntid_z) #0 !dbg !3 {"
+        ));
+        // The debug alloca still moved to addrspace(5) with its !dbg tail…
+        assert!(out.contains("  %v15 = alloca {}, align 1, addrspace(5), !dbg !20\n"));
+        // …and a multi-attachment alloca keeps BOTH attachments in order.
+        assert!(
+            out.contains("  %v16 = alloca i64, align 8, addrspace(5), !dbg !21, !annotation !22\n")
+        );
+
+        // Idempotent on the rewritten (debug-shaped) module.
+        let out2 = rewrite_ir_for_amdgcn(&out).unwrap();
+        assert_eq!(out2, out);
     }
 
     #[test]

@@ -479,6 +479,7 @@ fn find_rocm_bitcode(name: &str) -> Option<std::path::PathBuf> {
 fn generate_amdgcn_code_object(
     module: PtxModule<'_>,
     gfx: &str,
+    debug_kind: DebugKind,
     toolchain: &LlvmToolchain,
     opts: &BackendOptions,
     diagnostic_sink: Option<fn(&str)>,
@@ -509,19 +510,15 @@ fn generate_amdgcn_code_object(
     //    ntid/nctaid rewrite so `alwaysinline` device helpers fold into
     //    their kernels first (Phase-1 pipeline order, see
     //    [`crate::amdgcn::rewrite_allocas_for_amdgcn`]).
-    let opt_output: std::path::PathBuf = if opts.no_opt {
+    //    Full-debug builds skip opt like `nvcc -G`: the O2 pipeline destroys
+    //    local-variable debug info, and the alloca rewrite has already
+    //    satisfied the amdgcn module verifier contract.
+    let opt_output: std::path::PathBuf = if opts.no_opt || debug_kind.variables_enabled() {
         preopt_ll.clone()
     } else {
-        optimize_ll(
-            &preopt_ll,
-            module.public_symbols,
-            toolchain,
-            opts,
-            true,
-            llvm_export::export::DebugKind::Off,
-        )?
-        .0
-        .unwrap_or_else(|| preopt_ll.clone())
+        optimize_ll(&preopt_ll, module.public_symbols, toolchain, opts, true, debug_kind)?
+            .0
+            .unwrap_or_else(|| preopt_ll.clone())
     };
 
     // 3. Post-opt prep (ntid kernarg / 1-D constant folding / declare
@@ -951,7 +948,9 @@ fn generate_ptx_impl(
     // path; every `sm_…` value (and no override) keeps the NVPTX path
     // byte-identical to before.
     if let Some(gfx) = crate::amdgcn::amdgcn_target(opts.target_arch.as_deref()) {
-        return generate_amdgcn_code_object(module, gfx, toolchain, opts, diagnostic_sink);
+        return generate_amdgcn_code_object(
+            module, gfx, debug_kind, toolchain, opts, diagnostic_sink,
+        );
     }
     // Explicit, hard override: `--arch` or a caller-set `opts.target_arch`.
     let explicit_override = opts.target_arch.clone();

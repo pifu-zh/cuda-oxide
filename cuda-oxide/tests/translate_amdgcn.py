@@ -77,19 +77,23 @@ def translate_nvvm_to_amdgcn(ll_text: str) -> str:
     #    （如 warp_reduce 的 (3,5,3) 块形，块内秩 = 3-D 坐标展开），折叠会
     #    破坏 rank/size 语义（GPU 实证硬件异常）。host 恒推三个参数，故
     #    每个 kernel 无条件追加三个形参（子集签名会与 host 推参错位）。
+    # 带 `#0, !dbg !N` 混合尾缀的调用（debug 构建）同样改写：`#N` 组随调用
+    # 一起丢弃，元数据尾缀原样保留（替换后的算术指令可合法携带 !dbg）。
+    # 注意替换串不带 \1：整个调用文本（含 `call i32 @llvm...`）被替换为
+    # `or i32 %ntid_x, 0`，与 Rust 镜像 rewrite_calls 行为一致。
     text = re.sub(
-        r"(?:tail )?call i32 @llvm\.nvvm\.read\.ptx\.sreg\.ntid\.x\(\)(?:\s*#\d+)?",
-        "or i32 %ntid_x, 0",
+        r"(?:tail )?call i32 @llvm\.nvvm\.read\.ptx\.sreg\.ntid\.x\(\)(?:\s*#\d+)?((?:,\s*![\w.$]+(?:\s+![\w.$]+)?)*)",
+        r"or i32 %ntid_x, 0\1",
         text,
     )
     text = re.sub(
-        r"(?:tail )?call i32 @llvm\.nvvm\.read\.ptx\.sreg\.ntid\.y\(\)(?:\s*#\d+)?",
-        "or i32 %ntid_y, 0",
+        r"(?:tail )?call i32 @llvm\.nvvm\.read\.ptx\.sreg\.ntid\.y\(\)(?:\s*#\d+)?((?:,\s*![\w.$]+(?:\s+![\w.$]+)?)*)",
+        r"or i32 %ntid_y, 0\1",
         text,
     )
     text = re.sub(
-        r"(?:tail )?call i32 @llvm\.nvvm\.read\.ptx\.sreg\.ntid\.z\(\)(?:\s*#\d+)?",
-        "or i32 %ntid_z, 0",
+        r"(?:tail )?call i32 @llvm\.nvvm\.read\.ptx\.sreg\.ntid\.z\(\)(?:\s*#\d+)?((?:,\s*![\w.$]+(?:\s+![\w.$]+)?)*)",
+        r"or i32 %ntid_z, 0\1",
         text,
     )
     text = _append_ntid_kernarg_params(text)
@@ -314,11 +318,23 @@ def _rewrite_allocas_in_function(body: list) -> list:
         rest = m.group("rest")
         # 语法顺序（hipcc gfx1030 实产对照）：alloca <ty>[, <count>][, align N],
         # addrspace(5)
-        align = None
-        ma = re.search(r",\s*align\s+(\d+)\s*$", rest)
-        if ma:
-            align = ma.group(1)
-            rest = rest[: ma.start()]
+        # 尾随元数据附件（`, !dbg !N`）先剥（会破坏 align 的行尾匹配），
+        # 对齐提取后回填到改写定义上（Rust 镜像同序）。
+        meta_parts = []
+        loop_guard = 0
+        while loop_guard < 8:
+            loop_guard += 1
+            ma = re.search(r",\s*align\s+(\d+)\s*$", rest)
+            if ma:
+                align = ma.group(1)
+                rest = rest[: ma.start()]
+                continue
+            mb = re.search(r",\s*(![\w.\"$]+(?:\s+![\w.\"$]+)?)\s*$", rest)
+            if mb:
+                meta_parts.insert(0, mb.group(1))
+                rest = rest[: mb.start()]
+                continue
+            break
         parts = _split_top_level_commas(rest)
         if len(parts) > 2 or parts[0] == "void":
             continue  # 不可解析形态：保留原样（llc verifier 显式失败）
@@ -339,6 +355,8 @@ def _rewrite_allocas_in_function(body: list) -> list:
         if align is not None:
             new_def += f", align {align}"
         new_def += ", addrspace(5)"
+        if meta_parts:
+            new_def += ", " + ", ".join(meta_parts)
         allocas.append((k, name, new_def))
 
     if not allocas:
@@ -2143,19 +2161,27 @@ def _append_ntid_transitive(text: str) -> str:
     had_nl = text.endswith("\n")
     body = text[:-1] if had_nl else text
     lines = body.split("\n")
+    # 两遍扫描：先注册全部 define（调用可指向文件后部才定义的函数——单遍
+    # 会丢 caller->后定义 callee 的边，不动点漏掉中间函数，调用点补了实参
+    # 而 define 没加形参 = llc "use of undefined value %ntid_x"，批
+    # slice_from_raw_parts_cast 实证）。
     fn_info: dict[str, dict] = {}
+    for line in lines:
+        trimmed = line.lstrip()
+        if not trimmed.startswith("define "):
+            continue
+        name = trimmed.split("@")[1].split("(")[0]
+        fn_info[name] = {
+            "is_kernel": "amdgpu_kernel" in trimmed,
+            "has_params": "%ntid_z" in trimmed,
+            "refs": False,
+        }
     calls: list[tuple[str, str, int]] = []
     current = ""
     for i, line in enumerate(lines):
         trimmed = line.lstrip()
         if trimmed.startswith("define "):
-            name = trimmed.split("@")[1].split("(")[0]
-            current = name
-            fn_info[name] = {
-                "is_kernel": "amdgpu_kernel" in trimmed,
-                "has_params": "%ntid_z" in trimmed,
-                "refs": False,
-            }
+            current = trimmed.split("@")[1].split("(")[0]
             continue
         if trimmed == "}":
             current = ""
@@ -2199,7 +2225,9 @@ def _append_ntid_transitive(text: str) -> str:
             brace = define.rfind("{")
             paren = define[:brace].rfind(")")
             between = define[paren + 1 : brace]
-            if all(c.isspace() or c.isalnum() or c in "#,=_" for c in between):
+            # `!`/`.` 覆盖 debug 元数据尾（`!dbg !47`）：debug 构建下每个
+            # define 都携带 !dbg，包括本步骤要加宽的设备函数。
+            if all(c.isspace() or c.isalnum() or c in "#,=_!." for c in between):
                 open_p = define[:paren].rfind("(")
                 insertion = (
                     "i32 %ntid_x, i32 %ntid_y, i32 %ntid_z"
@@ -2212,12 +2240,18 @@ def _append_ntid_transitive(text: str) -> str:
     result = []
     for line in out:
         trimmed = line.lstrip()
-        is_call = trimmed.startswith(("call ", "tail call ")) and "@" in trimmed
+        # 结果绑定调用（`%v33 = call i64 @helper(...)`）同样要补参：debug
+        # （无 opt）管线让这些调用点活到 llc，缺参 = poison，垃圾寄存器选错
+        # 路径（Rust 镜像同规则）。
+        is_call = (
+            trimmed.startswith(("call ", "tail call "))
+            or " = call " in trimmed
+            or " = tail call " in trimmed
+        ) and "@" in trimmed
         if is_call and "%ntid_z" not in line:
             at = trimmed.find("@")
             callee = trimmed[at + 1 :].split("(")[0]
             if callee in needs and (close := trimmed.rfind(")")):
-                indent = line[: line.len() - len(trimmed)] if hasattr(line, "len") else line[: len(line) - len(trimmed)]
                 indent = line[: len(line) - len(trimmed)]
                 args_end = close
                 result.append(
