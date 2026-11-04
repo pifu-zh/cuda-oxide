@@ -451,8 +451,13 @@ slice_from_raw_parts_cast/struct_constant_provenance/switchint_128bit）——
 干净重建现形）。根因 = Step-5 ntid 重写的 call 侧改写了
 `Index1D::from_scope` 内部的 index_1d 调用（传 ntid 三参），但 from_scope
 的 define 未加参数（其 MIR 无直接 sreg 读）——transitive ntid 线程穿透缺
-口。修复方向 = ntid 重写按调用图传递（callee 得参数 → caller 定义同步加
-参 + 所有调用点传参），独立会话处理。
+口。**[2026-11-05 已修复 a0cfe0ad9]** Step-5c 传递性 ntid pass
+（append_ntid_transitive，Rust + Python 镜像）：种子 = kernel ∪ 体内引用
+%ntid_* 的函数，调用图反向传播到不动点，成员 define 追加形参尾 + 成员
+调用点补齐三实参；幂等（跳过已含 %ntid_z 的行；Python 侧保留精确尾换行
+数防累积）。6 例全部恢复 hsaco 构建；干净重建批 97/105，唯一失败 = 4 个
+已知 flaky asm llc-fail（dotprod/atomics/redux_sum/warp_reduce，错误码
+逐轮漂移）。
 
 **[2026-11-04 step 2b：%s 探针裁定 + ptr 槽修复]** 独立 %s 探针
 （vprintf("%s\n", {ptr} 缓冲) 走 Python Step 17 全链）暴露**真管线缺口**：
