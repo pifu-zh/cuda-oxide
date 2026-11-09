@@ -7,18 +7,23 @@
 //!
 //! A kernel panics with a literal message when a runtime condition holds.
 //! The importer materializes the message as an immutable device global and
-//! calls the `__cuda_panic_str` device helper before the kernel trap; the
-//! message rides the ockl hostcall transport (device printf's service) to
-//! the host stdout as `panic: <message>`.
+//! calls the `__cuda_panic_str` device helper before the wave's clean exit.
+//! The verified reporting channel is deterministic: the host reads the
+//! message bytes back via `cuModuleGetGlobal` on the embedded
+//! `__cuda_panic_msg_<hash>` constant and prints them (PASS line below).
+//! The panic site itself is witnessed by the wave exiting cleanly instead
+//! of trapping.
 //!
-//! Scope note (honest): format-arg panics (`panic!("x = {}", x)`) are not
-//! rendered yet - they stay plain traps. Literal panics report exactly.
+//! Channel note: this literal path does not print through the ockl hostcall
+//! transport (its helper writes the handoff buffer only). Format-arg panics
+//! (`panic!("x = {}", x)`) take the other channel — the kernel macro
+//! rewrites them into the ockl printf report, whose drain DOES reach host
+//! stdout; see the panic_format example.
 //!
 //! Run: cargo oxide run panic_message
-//! Expect on stdout: `panic: device panic: value out of range`
+//! Expect: `PANIC MESSAGE REPORTING: PASS (32 bytes ...)`
 
 use cuda_device::{DisjointSlice, cuda_module, kernel, thread};
-
 
 #[cuda_module]
 mod kernels {

@@ -15,6 +15,7 @@ use crate::kernel::scope::{
 };
 use crate::kernel::{KernelArgs, inject_grid_constant_markers};
 use proc_macro2::TokenStream as TokenStream2;
+use quote::ToTokens;
 use quote::{format_ident, quote};
 use reserved_oxide_symbols::{KERNEL_PREFIX, KERNEL_SCOPE_LOCAL};
 use syn::{Expr, ItemFn, Stmt, parse_quote, spanned::Spanned};
@@ -742,4 +743,94 @@ fn hygiene_fixtures_still_collide_with_the_generated_scope_names() {
              `{KERNEL_SCOPE_LOCAL}` so `call_site_ident_avoiding_item` is \
              forced down its rename path"
     );
+}
+
+/// A format-arg `panic!(fmt, args...)` in a unit-return kernel rewrites into
+/// the ockl printf report (via the gpu_printf machinery) followed by a bare
+/// `return` — the clean wave exit. The literal `panic!` form never reaches
+/// this pass (it keeps the MIR-level reporting path with its deterministic
+/// global readback).
+#[test]
+fn format_arg_panic_rewrites_to_report_and_clean_exit() {
+    let mut func: ItemFn = parse_quote! {
+        fn check(v: u32) {
+            if v > 100 {
+                panic!("value = {} / limit = {}", v, 100u32);
+            }
+        }
+    };
+    crate::kernel::rewrite_format_arg_panics(&mut func);
+    let out = func.block.to_token_stream().to_string().replace(' ', "");
+
+    assert!(out.contains("__gpu_vprintf"), "report call missing: {out}");
+    assert!(
+        out.contains("panic:value="),
+        "the `panic: ` prefix must reach the rendered format: {out}"
+    );
+    assert!(
+        out.contains("cuda_device::debug::GpuPrintfArg::promote"),
+        "untyped placeholders take the trait route: {out}"
+    );
+    assert!(out.contains("return"), "clean wave exit missing: {out}");
+    assert!(
+        !out.contains("panic!"),
+        "the panic! form must be gone: {out}"
+    );
+}
+
+/// Literal-message panics, runtime format strings, and non-unit kernels all
+/// keep their original form: the rewrite only fires for literal formats with
+/// at least one argument in unit-return kernels.
+#[test]
+fn out_of_scope_panics_stay_untouched() {
+    let mut func: ItemFn = parse_quote! {
+        fn check(v: u32, fmt: &str) {
+            panic!("plain literal");
+            panic!(fmt, v);
+            panic!();
+        }
+    };
+    crate::kernel::rewrite_format_arg_panics(&mut func);
+    let out = func.block.to_token_stream().to_string().replace(' ', "");
+    assert!(out.contains("panic!(\"plainliteral\")"), "{out}");
+    assert!(out.contains("panic!(fmt,v)"), "{out}");
+    assert!(out.contains("panic!()"), "{out}");
+    assert!(!out.contains("__gpu_vprintf"), "{out}");
+
+    let mut non_unit: ItemFn = parse_quote! {
+        fn scored(v: u32) -> u32 {
+            if v > 100 {
+                panic!("value = {}", v);
+            }
+            v
+        }
+    };
+    crate::kernel::rewrite_format_arg_panics(&mut non_unit);
+    let out = non_unit
+        .block
+        .to_token_stream()
+        .to_string()
+        .replace(' ', "");
+    assert!(out.contains("panic!("), "{out}");
+    assert!(!out.contains("__gpu_vprintf"), "{out}");
+}
+
+/// `panic!` inside a closure keeps its original form: a `return` there would
+/// exit the closure, not the wave.
+#[test]
+fn panic_inside_closure_stays_untouched() {
+    let mut func: ItemFn = parse_quote! {
+        fn check(v: u32) {
+            let f = |x: u32| {
+                if x > 0 {
+                    panic!("closure value = {}", x);
+                }
+            };
+            f(v);
+        }
+    };
+    crate::kernel::rewrite_format_arg_panics(&mut func);
+    let out = func.block.to_token_stream().to_string().replace(' ', "");
+    assert!(out.contains("panic!("), "{out}");
+    assert!(!out.contains("__gpu_vprintf"), "{out}");
 }

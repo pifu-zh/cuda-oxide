@@ -19,7 +19,7 @@ use crate::kernel::codegen::{
 use crate::launch_attrs::{add_launch_bounds_evaluatability_from_attrs, rewrite_loop_unroll_attrs};
 use proc_macro::TokenStream;
 use syn::{
-    FnArg, GenericParam, Ident, ItemFn, Token, Type,
+    Expr, FnArg, GenericParam, Ident, ItemFn, ReturnType, Stmt, Token, Type,
     parse::{Parse, ParseStream},
     parse_macro_input, parse_quote,
 };
@@ -143,6 +143,126 @@ fn scope_parameter_collision(input: &ItemFn, scope: &Ident) -> Option<Ident> {
     finder.found
 }
 
+/// Rewrites explicit `panic!("format", args...)` calls inside the kernel body
+/// into a formatted panic report — `panic: <rendered>` through the ockl
+/// printf transport, arguments packed exactly like `gpu_printf!` — followed
+/// by a clean wave exit.
+///
+/// Scope:
+/// - Unit-return kernels only. The exit is a bare `return`; a non-unit
+///   kernel cannot exit its wave this way, so those keep the MIR-level
+///   plain trap (matching the importer's kernel-only report gate).
+/// - The format string must be a literal with at least one argument.
+///   Single-literal panics keep the MIR path, which additionally supports
+///   the deterministic global readback.
+/// - Panic machinery that never appears as a source `panic!` (slice bounds
+///   checks, `unwrap`, `assert!` expansion inside core) keeps the plain
+///   trap.
+/// - `panic!` inside a closure keeps its original form: a `return` there
+///   would exit the closure, not the wave.
+///
+/// The rewrite is type-safe in every expression position: the replacement
+/// block ends in `return`, so its type is `!` and coerces wherever the
+/// diverging `panic!` was accepted.
+pub(crate) fn rewrite_format_arg_panics(input: &mut ItemFn) {
+    if !matches!(input.sig.output, ReturnType::Default) {
+        return;
+    }
+    use syn::visit_mut::VisitMut as _;
+    PanicRewriter.visit_block_mut(&mut input.block);
+}
+
+struct PanicRewriter;
+
+/// The argument list of a `panic!(fmt, args...)` invocation.
+struct PanicArgs(Vec<Expr>);
+
+impl Parse for PanicArgs {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let mut args = Vec::new();
+        while !input.is_empty() {
+            args.push(input.parse::<Expr>()?);
+            if !input.is_empty() {
+                input.parse::<Token![,]>()?;
+            }
+        }
+        Ok(PanicArgs(args))
+    }
+}
+
+impl syn::visit_mut::VisitMut for PanicRewriter {
+    fn visit_stmt_mut(&mut self, stmt: &mut Stmt) {
+        // A statement-level `panic!(...);` parses as `Stmt::Macro`, not as
+        // an expression statement holding an `Expr::Macro`.
+        if let Stmt::Macro(stmt_macro) = stmt {
+            let mut replacement = None;
+            if self.rewrite_panic_macro(&stmt_macro.mac, &mut replacement) {
+                *stmt = Stmt::Expr(
+                    replacement.expect("rewrite sets the replacement"),
+                    Some(<Token![;]>::default()),
+                );
+                return;
+            }
+        }
+        syn::visit_mut::visit_stmt_mut(self, stmt);
+    }
+
+    fn visit_expr_mut(&mut self, expr: &mut Expr) {
+        // Closures keep their original panic form (see the fn doc).
+        if matches!(expr, Expr::Closure(_)) {
+            return;
+        }
+        if let Expr::Macro(macro_call) = expr {
+            let mut replacement = None;
+            if self.rewrite_panic_macro(&macro_call.mac, &mut replacement) {
+                *expr = replacement.expect("rewrite sets the replacement");
+                return;
+            }
+        }
+        syn::visit_mut::visit_expr_mut(self, expr);
+    }
+}
+
+impl PanicRewriter {
+    /// Matches `panic!("literal", args...)` and writes the report-and-exit
+    /// block into `out`. Returns false (and leaves `out` untouched) when the
+    /// call is out of the rewrite's scope.
+    fn rewrite_panic_macro(&mut self, mac: &syn::Macro, out: &mut Option<Expr>) -> bool {
+        let path = &mac.path;
+        let is_panic =
+            path.is_ident("panic") || path.is_ident("core::panic") || path.is_ident("std::panic");
+        if !is_panic {
+            return false;
+        }
+        let Ok(PanicArgs(args)) = syn::parse2::<PanicArgs>(mac.tokens.clone()) else {
+            return false;
+        };
+        let mut args = args;
+        let fmt_is_literal = matches!(
+            args.first(),
+            Some(Expr::Lit(lit)) if matches!(lit.lit, syn::Lit::Str(_))
+        );
+        if args.len() < 2 || !fmt_is_literal {
+            return false;
+        }
+        let first = args.remove(0);
+        // The first argument was just matched as a string literal.
+        let fmt = match first {
+            Expr::Lit(lit) => match lit.lit {
+                syn::Lit::Str(s) => s,
+                _ => unreachable!("checked above"),
+            },
+            _ => unreachable!("checked above"),
+        };
+        let report = crate::printf::panic_report_expr(&fmt, args);
+        *out = Some(parse_quote!({
+            #report;
+            return;
+        }));
+        true
+    }
+}
+
 /// Consume parameter-local `#[grid_constant]` declarations and plant one
 /// source-index marker per parameter for the MIR importer.
 ///
@@ -235,6 +355,10 @@ pub(crate) fn kernel_entry(attr: TokenStream, item: TokenStream) -> TokenStream 
         };
         input.block.stmts.insert(0, marker_call);
     }
+
+    // Format-arg `panic!(fmt, args...)` calls report through the ockl printf
+    // transport and exit the wave cleanly (see the fn doc for the scope).
+    rewrite_format_arg_panics(&mut input);
 
     // Only type and const parameters create distinct codegen instances.
     // Lifetimes are erased before monomorphization.

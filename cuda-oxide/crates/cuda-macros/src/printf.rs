@@ -68,6 +68,23 @@ pub struct GpuPrintfInput {
     args: Vec<Expr>,
 }
 
+/// Builds the report expression for a format-arg `panic!(fmt, args...)`
+/// rewrite: the message rendered as `panic: <fmt>\n` through the ockl printf
+/// transport, with the arguments packed exactly like `gpu_printf!`. The
+/// returned expression is a block evaluating to the `__gpu_vprintf` status;
+/// the caller appends the wave exit.
+pub(crate) fn panic_report_expr(fmt: &LitStr, args: Vec<Expr>) -> Expr {
+    let report_fmt = LitStr::new(&format!("panic: {}\n", fmt.value()), fmt.span());
+    let input = GpuPrintfInput {
+        format_string: report_fmt,
+        args,
+    };
+    let tokens = gpu_printf_impl(input);
+    syn::parse2::<Expr>(tokens).unwrap_or_else(|error| {
+        Expr::Verbatim(syn::Error::new(fmt.span(), error).to_compile_error())
+    })
+}
+
 impl Parse for GpuPrintfInput {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let format_string: LitStr = input.parse()?;

@@ -3519,10 +3519,15 @@ impl<'tcx> DeviceCollector<'tcx> {
                 // [panic-report] A literal-message panic (exactly one &str
                 // constant in the block) rides the (export name, block index)
                 // key to the importer, which materializes the bytes and calls
-                // __cuda_panic_str before the trap. Format-arg panics
-                // (multiple pieces) stay plain traps: rendering the pieces
-                // needs runtime Debug support the device pipeline does not
-                // have yet.
+                // __cuda_panic_str before the clean wave exit. Format-arg
+                // `panic!("x = {}", v)` calls never reach this scan: the
+                // kernel macro rewrites them at the source level into the
+                // ockl printf report plus a clean return (see
+                // cuda-macros rewrite_format_arg_panics). What still traps:
+                // panic machinery raised inside core (slice bounds checks,
+                // unwrap, assert expansion), panics in device functions, and
+                // panics in non-unit kernels — none of which can exit the
+                // wave cleanly with this design.
                 // The longest &str in the block is the message: the inlined
                 // panic machinery also carries the location string (file!()),
                 // which is always shorter.
