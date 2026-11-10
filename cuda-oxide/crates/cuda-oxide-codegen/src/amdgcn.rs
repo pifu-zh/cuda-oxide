@@ -482,8 +482,11 @@ fn rewrite_shuffle(ll: &str) -> String {
 /// semantics (segment-local self-fallback), which is the call-site intent
 /// under both accepted literals. A dynamic clamp stays unsupported.
 fn shfl_in_envelope(shfl: &ShflLine<'_>) -> bool {
+    // mask 拼写归一化：Signless i32 常量的无符号十进制（4294967295）与
+    // -1 同值（与 Python 镜像一致）。
+    let full_warp = shfl.mask == "-1" || shfl.mask == "4294967295";
     let literal_mask = shfl.mask.parse::<i32>().is_ok();
-    if literal_mask && shfl.mask != "-1" {
+    if literal_mask && !full_warp {
         return false;
     }
     match shfl.clamp.parse::<i32>() {
@@ -579,7 +582,11 @@ fn rewrite_shfl_asm(ll: &str) -> String {
     }
     let mut out = Vec::with_capacity(ll.lines().count());
     for line in ll.lines() {
-        let expanded = match_shfl_asm_line(line).filter(|parts| parts.mask == "-1");
+        // mask 拼写归一化：Signless i32 常量的无符号十进制拼写与 -1 同值
+        // （与 Python 镜像 Step 11/同步修复一致）。
+        let expanded = match_shfl_asm_line(line).filter(|parts| {
+            parts.mask == "-1" || parts.mask == "4294967295"
+        });
         match expanded {
             Some(parts) => out.extend(expand_shfl_asm(parts)),
             None => out.push(line.to_string()),
@@ -730,7 +737,7 @@ fn rewrite_redux_add(ll: &str) -> String {
     let mut out = Vec::with_capacity(ll.lines().count());
     for line in ll.lines() {
         let expanded = match_redux_line(line)
-            .filter(|rd| rd.mask == "-1")
+            .filter(|rd| rd.mask == "-1" || rd.mask == "4294967295")
             .map(expand_redux_add);
         match expanded {
             Some(lines) => out.extend(lines),

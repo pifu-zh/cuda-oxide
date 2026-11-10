@@ -500,7 +500,8 @@ def _expand_shfl(m) -> "list[str] | None":
     # "全 wavefront 执行 bpermute"一致——故字面量 -1 与动态值都接受，仅拒绝
     # 其它字面量（显式部分 warp 语义无从核对）。
     mm = _SHFL_MASK_RE.match(mask_arg)
-    if mm and mm.group(1) != "-1":
+    # mask 拼写归一化（同 Step 11）：Signless i32 的无符号十进制与 -1 同值。
+    if mm and mm.group(1) not in ("-1", "4294967295"):
         return None
     cm = _SHFL_MASK_RE.match(clamp_arg)
     if cm:
@@ -576,7 +577,9 @@ def _rewrite_shfl_asm(text: str) -> str:
             out.append(line)
             continue
         mask = m.group("mask").strip()
-        if mask != "-1":
+        # mask 拼写归一化：Signless i32 常量的无符号十进制拼写（与 Step 11
+        # redux 同因）；只认全 warp mask，其余显式不支持留给 llc 报错。
+        if mask not in ("-1", "4294967295"):
             out.append(line)  # mask 非 -1：显式不支持，留给 llc 报错
             continue
         res, val = m.group("res"), m.group("val")
@@ -632,7 +635,11 @@ def _rewrite_redux_add(text: str) -> str:
         if not m:
             out.append(line)
             continue
-        if m.group("mask").strip() != "-1":
+        # mask 拼写归一化：导出器把 Signless i32 常量打成无符号十进制
+        # （4294967295），Rust 镜像接受两种拼写——Python 对齐（只认字面量
+        # 全 warp mask，部分参与仍留给 llc 显式失败）。
+        mask_txt = m.group("mask").strip()
+        if mask_txt not in ("-1", "4294967295") or int(mask_txt, 0) & 0xFFFFFFFF != 0xFFFFFFFF:
             out.append(line)  # 部分 warp 参与：不支持，留给 llc 显式失败
             continue
         res, val, ind = m.group("res"), m.group("val"), m.group("indent")
@@ -723,19 +730,20 @@ _PTXX_ASM_FENCE_RE = re.compile(
 _PTXX_ASM_LOAD_RE = re.compile(
     r'^(?P<indent>\s*)(?:(?P<res>%[\w.$]+)\s*=\s*)?(?:tail )?call\s+'
     r'(?P<ty>i32|i64|ptr)\s+asm\s+sideeffect\s+'
-    r'"(?:(?P<sc>fence\.sc\.sys); )?ld\.acquire\.(?P<scope>gpu|sys)\.'
-    r'b(?P<bits>32|64)\s+\$0,\s*\[\$1\];",\s*"=[rl],l,~\{memory\}"\('
+    r'"(?:(?P<sc>fence\.sc\.sys); )?ld\.(?P<ord>acquire|relaxed)\.'
+    r'(?P<scope>gpu|sys)\.b(?P<bits>32|64)\s+\$0,\s*\[\$1\];",\s*"=[rl],l,~\{memory\}"\('
     r'(?P<args>.*)\)\s*(?:#\d+)?\s*$'
 )
 
 _PTXX_ASM_STORE_RE = re.compile(
     r'^(?P<indent>\s*)(?:tail )?call\s+void\s+asm\s+sideeffect\s+'
-    r'"st\.release\.(?P<scope>gpu|sys)\.b(?P<bits>32|64)\s+\[\$0\], \$1;",\s*'
+    r'"(?:(?P<sc>fence\.sc\.sys); )?st\.(?P<ord>release|relaxed)\.'
+    r'(?P<scope>gpu|sys)\.b(?P<bits>32|64)\s+\[\$0\], \$1;",\s*'
     r'"l,[rl],~\{memory\}"\((?P<args>.*)\)\s*(?:#\d+)?\s*$'
 )
 
 _SCOPE_MAP = {"cta": 'syncscope("workgroup")', "gpu": 'syncscope("agent")', "sys": ""}
-_ORD_MAP = {"acq_rel": "acq_rel", "sc": "seq_cst"}
+_ORD_MAP = {"acq_rel": "acq_rel", "sc": "seq_cst", "acquire": "acquire", "relaxed": "monotonic", "release": "release"}
 
 
 def _strip_param_attrs(operand: str) -> str:
@@ -745,7 +753,8 @@ def _strip_param_attrs(operand: str) -> str:
 
 def _rewrite_ptx_atomic_asm(text: str) -> str:
     if 'asm sideeffect "fence.' not in text and "ld.acquire." not in text \
-            and "st.release." not in text:
+            and "st.release." not in text and "ld.relaxed." not in text \
+            and "st.relaxed." not in text:
         return text
     lines = text.split("\n")
     out = []
@@ -771,7 +780,7 @@ def _rewrite_ptx_atomic_asm(text: str) -> str:
             ptr = _strip_param_attrs(parts[0][len("ptr "):])
             scope = _SCOPE_MAP[m.group("scope")]
             scope_s = f" {scope}" if scope else ""
-            order = "seq_cst" if m.group("sc") else "acquire"
+            order = "seq_cst" if m.group("sc") else _ORD_MAP[m.group("ord")]
             align = 4 if m.group("bits") == "32" else 8
             out.append(
                 f"{m.group('indent')}{m.group('res')} = load atomic "
@@ -791,6 +800,7 @@ def _rewrite_ptx_atomic_asm(text: str) -> str:
             if len(vsplit) != 2 or vsplit[0] not in ("i32", "i64", "ptr"):
                 out.append(line)
                 continue
+            order = "seq_cst" if m.group("sc") else _ORD_MAP[m.group("ord")]
             vty, val = vsplit[0], _strip_param_attrs(vsplit[1])
             scope = _SCOPE_MAP[m.group("scope")]
             scope_s = f" {scope}" if scope else ""
@@ -798,7 +808,7 @@ def _rewrite_ptx_atomic_asm(text: str) -> str:
             out.append(
                 f"{m.group('indent')}store atomic {vty} "
                 f"{val}, ptr {ptr}"
-                f"{scope_s} release, align {align}"
+                f"{scope_s} {order}, align {align}"
             )
             continue
         out.append(line)
@@ -870,9 +880,11 @@ def _expand_idp2a(m) -> "list[str] | None":
     if len(args) != 4:
         return None
     a, b, isbot, c = (_arg_operand(x) for x in args)
-    if isbot == "false":
+    # isbottom 拼写归一化：immarg 在导出 IR 里是数字（i1 0/i1 1），
+    # 文档形态是 false/true——两种都收（Rust 镜像同规则）。
+    if isbot in ("false", "0"):
         sh = 0
-    elif isbot == "true":
+    elif isbot in ("true", "1"):
         sh = 16
     else:
         return None  # 非字面量 select：保守不支持
@@ -2254,8 +2266,17 @@ def _append_ntid_transitive(text: str) -> str:
             if callee in needs and (close := trimmed.rfind(")")):
                 indent = line[: len(line) - len(trimmed)]
                 args_end = close
+                # 空参表调用（@f()）不带前导逗号（Rust 镜像同规则；warp_reduce
+                # 的零参 helper 调用点实证：`(, i32 %ntid_x...` 是语法错误）。
+                open_p = trimmed.find("(", at)
+                lead = (
+                    ""
+                    if open_p is not None
+                    and not trimmed[open_p + 1 : close].strip()
+                    else ", "
+                )
                 result.append(
-                    f"{indent}{trimmed[:args_end]}, i32 %ntid_x, i32 %ntid_y, i32 %ntid_z{trimmed[args_end:]}"
+                    f"{indent}{trimmed[:args_end]}{lead}i32 %ntid_x, i32 %ntid_y, i32 %ntid_z{trimmed[args_end:]}"
                 )
                 continue
         result.append(line)

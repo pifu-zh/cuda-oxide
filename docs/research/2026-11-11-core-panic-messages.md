@@ -73,3 +73,26 @@ terminator**（`AssertKind::BoundsCheck{index,len}`/`DivisionByZero`/
   panic、其余 AssertKind（溢出类——release 语义下不触发）保持 trap。
 - 消息文本锚定 rustc 1.99 的 core::panicking；rustc 升级若改文案需同步
   （helper 与 core 的文本对照在 rustc_public body.rs 的 message() 映射）。
+
+
+## 附：flaky 四例定性收官（同日，Python 管线缺口）
+
+dotprod/atomics/redux_sum/warp_reduce 的批 llc_fail 定性为 **Python 管线确
+定性缺口**，非间歇 flaky——四例在 Rust 维度一直通过，"flaky" 是两维度结果
+不一致的误称。四类缺口：
+
+1. **mask 拼写**（Step 11 redux / Step 10 shfl intrinsic / Step 10c
+   shfl-asm 三处判定）：导出器把 Signless i32 常量打成无符号十进制
+   （`4294967295`），三处只认 `-1` → 归一化两拼写（Rust 镜像同日对齐两处）。
+2. **immarg 拼写**（Step 13 idp2a）：`i1 0/1`（数字）vs `false/true`（文档）
+   → 都收。
+3. **零参调用补 ntid 实参**（Step 5c 传递传播）：`@f()` 补成 `@f(, i32...)`
+   畸形 IR——空参表不带前导逗号（Rust 镜像已有此分支，Python 缺）。
+4. **PTX-asm 原子 relaxed 序 + sc-fence 组合**（Step 12d）：`ld/st.relaxed.
+   {gpu,sys}.b{32,64}`（→ load/store atomic monotonic）与
+   `fence.sc.sys; st.release...`（→ store atomic seq_cst）未覆盖。
+
+结果：Python 维度 **101/104 全过、零 llc 失败**（3 诚实排除=抽取器限制）；
+四例真卡全绿（warp_reduce 77 launch shapes、atomics 24 tests、redux_sum
+8 warp sums、dotprod dp4a/dp2a 全对）。批跑分母口径：runner 报 105 系含
+device_heap 双条目，report.json 实为 104 例。
