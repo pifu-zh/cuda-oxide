@@ -24,9 +24,10 @@
 //! Run: cargo oxide run fp8_decode
 
 use cuda_device::fp8::{
-    e2m1_to_f32, e2m1x2_to_f32x2, e4m3_to_f32, e4m3x2_to_f32x2, e5m2_to_f32, e5m2x2_to_f32x2,
-    f32_to_e2m1_rne_satfinite, f32_to_e4m3_rne_satfinite, f32_to_e5m2_rne,
-    f32x2_to_e2m1x2_rne_satfinite, f32x2_to_e4m3x2_rne_satfinite, f32x2_to_e5m2x2_rne,
+    e2m1_to_f32, e2m1x2_to_f32x2, e4m3_to_f32, e4m3x2_to_f32x2, e4m3x4_to_f32x4, e5m2_to_f32,
+    e5m2x2_to_f32x2, e5m2x4_to_f32x4, f32_to_e2m1_rne_satfinite, f32_to_e4m3_rne_satfinite,
+    f32_to_e5m2_rne, f32x2_to_e2m1x2_rne_satfinite, f32x2_to_e4m3x2_rne_satfinite,
+    f32x2_to_e5m2x2_rne, f32x4_to_e4m3x4_rne_satfinite, f32x4_to_e5m2x4_rne,
 };
 use cuda_device::{DisjointSlice, cuda_module, kernel, thread};
 
@@ -199,6 +200,80 @@ mod kernels {
         let idx = thread::index_1d().get();
         if let Some(o) = out.get_mut(thread::index_1d()) {
             *o = f32x2_to_e2m1x2_rne_satfinite(a[idx], b[idx]);
+        }
+    }
+
+    // ---- packed x4 families ------------------------------------------------
+    // The x4 form composes two x2 halves; the x2 layers are exhaustively
+    // verified above, so here a sampled sweep (stride over the 2^32 space
+    // plus an all-byte-patterns block in the low half) checks only the
+    // composition: byte order (x lowest, w highest) and shift placement.
+
+    /// Decodes sampled u32 patterns into the four f32 lanes.
+    #[kernel]
+    pub fn decode_e4m3x4(
+        values: &[u32],
+        mut out0: DisjointSlice<f32>,
+        mut out1: DisjointSlice<f32>,
+        mut out2: DisjointSlice<f32>,
+        mut out3: DisjointSlice<f32>,
+    ) {
+        let idx = thread::index_1d().get();
+        let (x, y, z, w) = e4m3x4_to_f32x4(values[idx]);
+        if let Some(o) = out0.get_mut(thread::index_1d()) {
+            *o = x;
+        }
+        if let Some(o) = out1.get_mut(thread::index_1d()) {
+            *o = y;
+        }
+        if let Some(o) = out2.get_mut(thread::index_1d()) {
+            *o = z;
+        }
+        if let Some(o) = out3.get_mut(thread::index_1d()) {
+            *o = w;
+        }
+    }
+
+    /// Decodes sampled u32 patterns into the four f32 lanes.
+    #[kernel]
+    pub fn decode_e5m2x4(
+        values: &[u32],
+        mut out0: DisjointSlice<f32>,
+        mut out1: DisjointSlice<f32>,
+        mut out2: DisjointSlice<f32>,
+        mut out3: DisjointSlice<f32>,
+    ) {
+        let idx = thread::index_1d().get();
+        let (x, y, z, w) = e5m2x4_to_f32x4(values[idx]);
+        if let Some(o) = out0.get_mut(thread::index_1d()) {
+            *o = x;
+        }
+        if let Some(o) = out1.get_mut(thread::index_1d()) {
+            *o = y;
+        }
+        if let Some(o) = out2.get_mut(thread::index_1d()) {
+            *o = z;
+        }
+        if let Some(o) = out3.get_mut(thread::index_1d()) {
+            *o = w;
+        }
+    }
+
+    /// Encodes four f32 streams into packed E4M3 x4.
+    #[kernel]
+    pub fn encode_e4m3x4(a: &[f32], b: &[f32], c: &[f32], d: &[f32], mut out: DisjointSlice<u32>) {
+        let idx = thread::index_1d().get();
+        if let Some(o) = out.get_mut(thread::index_1d()) {
+            *o = f32x4_to_e4m3x4_rne_satfinite(a[idx], b[idx], c[idx], d[idx]);
+        }
+    }
+
+    /// Encodes four f32 streams into packed E5M2 x4.
+    #[kernel]
+    pub fn encode_e5m2x4(a: &[f32], b: &[f32], c: &[f32], d: &[f32], mut out: DisjointSlice<u32>) {
+        let idx = thread::index_1d().get();
+        if let Some(o) = out.get_mut(thread::index_1d()) {
+            *o = f32x4_to_e5m2x4_rne(a[idx], b[idx], c[idx], d[idx]);
         }
     }
 }
@@ -957,6 +1032,163 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         println!("{name} encode pairs: {n} lane-mixed pairs checked, {fam_fail} failures");
+    }
+
+    // ---- Families 16-19: packed x4 (composition verification) --------------
+    // The x2 layers are exhaustively verified above; x4 composes two x2
+    // halves, so a sampled sweep (2^32 space at a stride, plus the full
+    // all-byte-patterns block in the low half with a fixed high half)
+    // checks the composition: byte order (x in bits [7:0], w in [31:24]).
+    {
+        const N4: usize = 4096;
+        let mut patterns: Vec<u32> = Vec::with_capacity(N4);
+        // Fixed-stride samples across the whole u32 space.
+        let stride = ((u32::MAX as u64 + 1) / N4 as u64) as u32;
+        for i in 0..N4 {
+            patterns.push((i as u64 * stride as u64) as u32);
+        }
+        // All byte patterns in the low half, fixed high half.
+        for b in 0..=255u32 {
+            patterns.push(b | (0x37_AB_00_00));
+        }
+        // Round up to a whole block so every thread's idx is in bounds.
+        let n_round = (patterns.len() + 1023) / 1024 * 1024;
+        while patterns.len() < n_round {
+            patterns.push(0);
+        }
+        let n = patterns.len();
+        let values_dev = cuda_core::DeviceBuffer::from_host(&stream, &patterns)?;
+        let mut outs: Vec<cuda_core::DeviceBuffer<f32>> = (0..4)
+            .map(|_| cuda_core::DeviceBuffer::<f32>::zeroed(&stream, n))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Box::new)?;
+        let cfg = cuda_core::simt::LaunchConfig {
+            grid_dim: ((n as u32 + 1023) / 1024, 1, 1),
+            block_dim: (1024, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut fam_fail = 0;
+        for family in ["E4M3x4", "E5M2x4"] {
+            // SAFETY: launch shape covers the n-element buffers.
+            if family == "E4M3x4" {
+                let [o0, o1, o2, o3] = outs.as_mut_slice() else {
+                    unreachable!("4 buffers");
+                };
+                // SAFETY: launch shape covers the n-element buffers.
+                unsafe { module.decode_e4m3x4(&stream, cfg, &values_dev, o0, o1, o2, o3) }?;
+            } else {
+                let [o0, o1, o2, o3] = outs.as_mut_slice() else {
+                    unreachable!("4 buffers");
+                };
+                // SAFETY: launch shape covers the n-element buffers.
+                unsafe { module.decode_e5m2x4(&stream, cfg, &values_dev, o0, o1, o2, o3) }?;
+            }
+            stream.synchronize()?;
+            let lanes: [Vec<f32>; 4] = [
+                outs[0].to_host_vec(&stream)?,
+                outs[1].to_host_vec(&stream)?,
+                outs[2].to_host_vec(&stream)?,
+                outs[3].to_host_vec(&stream)?,
+            ];
+            for (i, &bits) in patterns.iter().enumerate() {
+                let bytes = [
+                    (bits & 0xFF) as u8,
+                    ((bits >> 8) & 0xFF) as u8,
+                    ((bits >> 16) & 0xFF) as u8,
+                    ((bits >> 24) & 0xFF) as u8,
+                ];
+                for lane in 0..4 {
+                    let want = if family == "E4M3x4" {
+                        host_e4m3_to_f32(bytes[lane])
+                    } else {
+                        host_e5m2_to_f32(bytes[lane])
+                    };
+                    total += 1;
+                    if lanes[lane][i].to_bits() != want.to_bits() {
+                        fam_fail += 1;
+                        failures += 1;
+                        if fam_fail <= 4 {
+                            println!(
+                                "{family} decode FAIL lane {lane} [{bits:#010x}]: got {} want {}",
+                                lanes[lane][i], want
+                            );
+                        }
+                    }
+                }
+            }
+            println!(
+                "{family} x4 decode: {n} sampled patterns x 4 lanes checked, {fam_fail} failures"
+            );
+        }
+    }
+    // x4 encode: four independent spreads, checked against the per-lane
+    // scalar reference packed at the right shifts.
+    for family in ["E4M3x4", "E5M2x4"] {
+        let mags = if family == "E4M3x4" {
+            &e4_table
+        } else {
+            &e5_table
+        };
+        let (sat_max, nan_byte, inf_byte, inf_threshold) = if family == "E4M3x4" {
+            (448.0f32, 0x7Fu8, 0x7Fu8, f32::INFINITY)
+        } else {
+            (f32::INFINITY, 0x7Eu8, 0x7Cu8, 61440.0f32)
+        };
+        let values = generate_test_values(mags, true);
+        let n = values.len();
+        let mk = |v: &[f32]| cuda_core::DeviceBuffer::from_host(&stream, v).map_err(Box::new);
+        let a_dev = mk(&values)?;
+        let b_dev = mk(&values.iter().rev().copied().collect::<Vec<_>>())?;
+        let c_dev = mk(&values)?;
+        let d_dev = mk(&values.iter().rev().copied().collect::<Vec<_>>())?;
+        let mut out = cuda_core::DeviceBuffer::<u32>::zeroed(&stream, n).map_err(Box::new)?;
+        let cfg = cuda_core::simt::LaunchConfig {
+            grid_dim: (((n as u32) + 1023) / 1024, 1, 1),
+            block_dim: (1024, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: launch shape covers the n-element buffers.
+        if family == "E4M3x4" {
+            unsafe {
+                module.encode_e4m3x4(&stream, cfg, &a_dev, &b_dev, &c_dev, &d_dev, &mut out)
+            }?;
+        } else {
+            unsafe {
+                module.encode_e5m2x4(&stream, cfg, &a_dev, &b_dev, &c_dev, &d_dev, &mut out)
+            }?;
+        }
+        stream.synchronize()?;
+        let got = out.to_host_vec(&stream)?;
+        let mut fam_fail = 0;
+        let rev: Vec<f32> = values.iter().rev().copied().collect();
+        for (i, &x) in values.iter().enumerate() {
+            let y = rev[i];
+            let z = values[i];
+            let w = rev[i];
+            let x2_lo =
+                host_encode_reference(x, mags, sat_max, nan_byte, inf_byte, 7, inf_threshold);
+            let x2_hi =
+                host_encode_reference(y, mags, sat_max, nan_byte, inf_byte, 7, inf_threshold);
+            let lo16 = (u16::from(x2_hi) << 8) | u16::from(x2_lo);
+            let z2_lo =
+                host_encode_reference(z, mags, sat_max, nan_byte, inf_byte, 7, inf_threshold);
+            let z2_hi =
+                host_encode_reference(w, mags, sat_max, nan_byte, inf_byte, 7, inf_threshold);
+            let hi16 = (u16::from(z2_hi) << 8) | u16::from(z2_lo);
+            let want = (u32::from(hi16) << 16) | u32::from(lo16);
+            total += 1;
+            if got[i] != want {
+                fam_fail += 1;
+                failures += 1;
+                if fam_fail <= 4 {
+                    println!(
+                        "{family} x4 encode FAIL [{i}]: got {:#010x} want {:#010x}",
+                        got[i], want
+                    );
+                }
+            }
+        }
+        println!("{family} x4 encode: {n} quad encodes checked, {fam_fail} failures");
     }
 
     println!("\nTotal checks: {}, failures: {}", total, failures);

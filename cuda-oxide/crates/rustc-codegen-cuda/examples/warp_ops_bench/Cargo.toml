@@ -1,0 +1,13 @@
+[package]
+name = "warp_ops_bench"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace]
+
+[dependencies]
+cuda-core = { path = "../../../../../cuda-core" }
+cuda-macros = { path = "../../../../crates/cuda-macros" }
+cuda-device = { path = "../../../../crates/cuda-device" }
+cuda-host = { path = "../../../../crates/cuda-host" }

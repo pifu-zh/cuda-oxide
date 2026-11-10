@@ -65,7 +65,7 @@ pub fn e5m2_to_f32(bits: u8) -> f32 {
             (s << 31) | 0x7FC0_0000 // NaN
         } else {
             (s << 31) | 0x7F80_0000 // Inf: raw f32 infinity bits (e+112 = 143
-                                    // would overflow the 8-bit f32 field)
+            // would overflow the 8-bit f32 field)
         }
     } else {
         // Normal: exponent field (e-15)+127 = e+112.
@@ -140,7 +140,11 @@ pub fn f32_to_e4m3_rne_satfinite(x: f32) -> u8 {
 
     // Normal target: round the 24-bit significand to 3 fraction bits.
     let v = rne_shift(mant, 20); // in [8, 16]; 16 = mantissa overflow
-    let (e3, m3) = if v == 16 { (e + 1, 0) } else { (e, (v - 8) as i32) };
+    let (e3, m3) = if v == 16 {
+        (e + 1, 0)
+    } else {
+        (e, (v - 8) as i32)
+    };
     if e3 > 15 || (e3 == 15 && m3 == 7) {
         // Overflow past the max finite (448): the NaN zone (1111.111) is
         // next, so .satfinite clamps to 448.
@@ -186,7 +190,11 @@ pub fn f32_to_e5m2_rne(x: f32) -> u8 {
 
     // Normal target: round the 24-bit significand to 2 fraction bits.
     let v = rne_shift(mant, 21); // in [4, 8]; 8 = mantissa overflow
-    let (e5, m2) = if v == 8 { (e + 1, 0) } else { (e, (v - 4) as i32) };
+    let (e5, m2) = if v == 8 {
+        (e + 1, 0)
+    } else {
+        (e, (v - 4) as i32)
+    };
     if e5 >= 31 {
         // Overflow: round to Inf (IEEE semantics for E5M2).
         return (s << 7) | 0x7C;
@@ -223,7 +231,11 @@ pub fn f32_to_e2m1_rne_satfinite(x: f32) -> u8 {
 
     // Normal target: round the 24-bit significand to 1 fraction bit.
     let v = rne_shift(mant, 22); // in [2, 4]; 4 = mantissa overflow
-    let (e2, m2) = if v == 4 { (e + 1, 0) } else { (e, (v - 2) as i32) };
+    let (e2, m2) = if v == 4 {
+        (e + 1, 0)
+    } else {
+        (e, (v - 2) as i32)
+    };
     if e2 > 3 || (e2 == 3 && m2 == 1) {
         // Overflow past 6.0: the 8.0 slot does not exist in E2M1, so
         // satfinite clamps to the max finite 6.0 (e=3, m=1).
@@ -272,6 +284,38 @@ pub fn f32x2_to_e4m3x2_rne_satfinite(x: f32, y: f32) -> u16 {
 #[inline(always)]
 pub fn f32x2_to_e5m2x2_rne(x: f32, y: f32) -> u16 {
     u16::from(f32_to_e5m2_rne(x)) | (u16::from(f32_to_e5m2_rne(y)) << 8)
+}
+
+/// Decodes a packed E4M3 x4 (`__nv_fp8x4_e4m3`) to `(x, y, z, w)` exactly:
+/// two x2 halves, lane 0 (x) in bits [7:0], w in bits [31:24].
+#[inline(always)]
+pub fn e4m3x4_to_f32x4(bits: u32) -> (f32, f32, f32, f32) {
+    let (x, y) = e4m3x2_to_f32x2(bits as u16);
+    let (z, w) = e4m3x2_to_f32x2((bits >> 16) as u16);
+    (x, y, z, w)
+}
+
+/// Decodes a packed E5M2 x4 (`__nv_fp8x4_e5m2`) to `(x, y, z, w)` exactly.
+#[inline(always)]
+pub fn e5m2x4_to_f32x4(bits: u32) -> (f32, f32, f32, f32) {
+    let (x, y) = e5m2x2_to_f32x2(bits as u16);
+    let (z, w) = e5m2x2_to_f32x2((bits >> 16) as u16);
+    (x, y, z, w)
+}
+
+/// Packs four `f32` into one E4M3 x4: each lane RNE + satfinite (the scalar
+/// rules); `x` in the low byte.
+#[inline(always)]
+pub fn f32x4_to_e4m3x4_rne_satfinite(x: f32, y: f32, z: f32, w: f32) -> u32 {
+    u32::from(f32x2_to_e4m3x2_rne_satfinite(x, y))
+        | (u32::from(f32x2_to_e4m3x2_rne_satfinite(z, w)) << 16)
+}
+
+/// Packs four `f32` into one E5M2 x4: each lane RNE with IEEE overflow
+/// (scalar rules); `x` in the low byte.
+#[inline(always)]
+pub fn f32x4_to_e5m2x4_rne(x: f32, y: f32, z: f32, w: f32) -> u32 {
+    u32::from(f32x2_to_e5m2x2_rne(x, y)) | (u32::from(f32x2_to_e5m2x2_rne(z, w)) << 16)
 }
 
 /// Packs two `f32` into one E2M1 x2: each lane RNE + satfinite (scalar

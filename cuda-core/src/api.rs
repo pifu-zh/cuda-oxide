@@ -195,6 +195,42 @@ pub unsafe fn malloc_managed(
     crate::cudarc_shim::memory::malloc_managed(num_bytes, flags)
 }
 
+/// Advises the driver about the expected access pattern for a managed
+/// allocation (`cuMemAdvise_v2`). `advice` is one of the `CU_MEM_ADVISE_*`
+/// values; `location` selects the device (id `0` for the first GPU) or the
+/// `CU_MEM_LOCATION_TYPE_INVALID` spelling for non-device advice.
+///
+/// HIP-backed stacks implement this through `hipMemAdvise`; advice that the
+/// platform cannot honor is a driver error (`Err`), not a silent no-op —
+/// callers should treat `Err` as "advice unsupported here" and retry without
+/// it, mirroring CUDA's own portability guidance.
+///
+/// # Safety
+/// `dptr` must be a live managed allocation of at least `num_bytes`.
+pub unsafe fn mem_advise(
+    dptr: sys::CUdeviceptr,
+    num_bytes: usize,
+    advice: sys::CUmem_advise,
+    location: sys::CUmemLocation,
+) -> Result<(), DriverError> {
+    crate::cudarc_shim::memory::mem_advise(dptr, num_bytes, advice, location)
+}
+
+/// Asynchronously prefetches a managed allocation to a device or to host
+/// memory (`cuMemPrefetchAsync_v2`) on the given stream.
+///
+/// # Safety
+/// `dptr` must be a live managed allocation of at least `num_bytes`; `hStream`
+/// must belong to the current context.
+pub unsafe fn mem_prefetch_async(
+    dptr: sys::CUdeviceptr,
+    num_bytes: usize,
+    location: sys::CUmemLocation,
+    stream: sys::CUstream,
+) -> Result<(), DriverError> {
+    crate::cudarc_shim::memory::mem_prefetch_async(dptr, num_bytes, location, stream)
+}
+
 /// Asynchronously allocates `num_bytes` of device memory from a specific pool on the given stream.
 ///
 /// Driver failures come back as `Err`, as for [`malloc_async`].

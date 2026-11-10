@@ -584,9 +584,8 @@ fn rewrite_shfl_asm(ll: &str) -> String {
     for line in ll.lines() {
         // mask 拼写归一化：Signless i32 常量的无符号十进制拼写与 -1 同值
         // （与 Python 镜像 Step 11/同步修复一致）。
-        let expanded = match_shfl_asm_line(line).filter(|parts| {
-            parts.mask == "-1" || parts.mask == "4294967295"
-        });
+        let expanded = match_shfl_asm_line(line)
+            .filter(|parts| parts.mask == "-1" || parts.mask == "4294967295");
         match expanded {
             Some(parts) => out.extend(expand_shfl_asm(parts)),
             None => out.push(line.to_string()),
@@ -1942,6 +1941,256 @@ fn rewrite_ocml(ll: &str) -> String {
 ///
 /// The ockl.bc link itself happens in ptx.rs (oclc_isa_version_<gfx>.bc
 /// configuration), and the module gains the `amdgpu_printf_kind` metadata.
+/// [PORT gfx1030][goal gpu_assert] `__assertfail` → 合成消息全局 +
+/// vprintf(null-args)（ockl 展开由 rewrite_vprintf_to_ockl 接管）。
+///
+/// gpu_assert!(cond, "msg") 的 MIR 形态 = `call void @__assertfail(ptr
+/// msg, ptr file, i32 line, ptr func, i64 1)` + `unreachable`。__assertfail
+/// 是 NV 专有符号，amdgcn 路径未定义。本 pass：
+/// 1. 解析 msg/file/function 三个指针操作数到各自的 as1 常量字节（宏的
+///    字面量常量），line 为 `i32 <n>` 立即数；
+/// 2. 合成 `gpu_assert: <msg> (<file>:<line>)\n\0` 的新 as1 全局；
+/// 3. 调用点改写为 `call i32 @vprintf(ptr @合成全局, ptr inttoptr i64 0)`
+///    （null-args 单串形态，ockl is_last=1），`unreachable` 替换为
+///    `ret void`（void 函数）或 `ret <ty> undef`（非 void——失败路径的
+///    返回值本就不可用）。
+///
+/// 消息送达依赖 ockl 排水（内核完成时），故必须干净退出——trap 会中止队
+/// 列丢消息（panic 管线实证）。no-message gpu_assert! 不经过本 pass。
+/// Resolves one as1-global name to its NUL-terminated content, optionally
+/// prefixed. Empty content (or missing global) yields an empty result.
+fn cstr_bytes(globals: &[(String, Vec<u8>)], name: &str, prefix: &[u8], wrap_in: bool) -> Vec<u8> {
+    let bytes = globals
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, b)| b.clone())
+        .unwrap_or_default();
+    let end = bytes.iter().position(|&x| x == 0).unwrap_or(bytes.len());
+    let content = &bytes[..end];
+    if content.is_empty() {
+        return Vec::new();
+    }
+    let mut out = prefix.to_vec();
+    out.extend_from_slice(content);
+    if wrap_in { out } else { out }
+}
+
+fn rewrite_assertfail_to_ockl(text: &str) -> String {
+    if !text.contains("__assertfail") {
+        return text.to_string();
+    }
+
+    // 常量表：as1 全局名 → 字节（复用 vprintf 重写器的解析形态）。
+    let mut globals_bytes: Vec<(String, Vec<u8>)> = Vec::new();
+    for line in text.lines() {
+        if !(line.contains("= addrspace(1) constant [") && line.contains(" c\"")) {
+            continue;
+        }
+        let Some(at) = line.find("@") else { continue };
+        let Some(eq) = line.find("= addrspace(1) constant [") else {
+            continue;
+        };
+        let name = line[at..at + (eq - at)]
+            .trim()
+            .trim_start_matches('@')
+            .to_string();
+        let Some(q1) = line.find("c\"") else { continue };
+        let raw = &line[q1 + 2..];
+        let Some(close) = raw.rfind('"') else {
+            continue;
+        };
+        let raw = &raw[..close];
+        let b = raw.as_bytes();
+        let mut bytes = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'\\'
+                && i + 2 < b.len()
+                && let Ok(v) =
+                    u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("zz"), 16)
+            {
+                bytes.push(v);
+                i += 3;
+                continue;
+            }
+            bytes.push(b[i]);
+            i += 1;
+        }
+        globals_bytes.push((name, bytes));
+    }
+
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut module_globals: Vec<String> = Vec::new();
+    let mut ret_type = "void";
+    let mut site = 0usize;
+    let mut changed = false;
+    for line in &lines {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("define ") {
+            // 记录返回类型：amdgpu_kernel 的返回恒为 void；普通函数取
+            // define 后的类型词（跳过调用约定前缀）。
+            if trimmed.contains("amdgpu_kernel") {
+                ret_type = "void";
+            } else if let Some(rest) = trimmed.strip_prefix("define ") {
+                ret_type = rest
+                    .split_whitespace()
+                    .find(|w| {
+                        !w.ends_with("cc")
+                            && !w.starts_with("llvm_")
+                            && *w != "hidden"
+                            && *w != "local_unnamed_addr"
+                    })
+                    .unwrap_or("void");
+            }
+            out.push(line.to_string());
+            continue;
+        }
+        if !trimmed.contains("call void @__assertfail(") {
+            out.push(line.to_string());
+            continue;
+        }
+        // 解析五实参。
+        let Some(open) = trimmed.find("@__assertfail(") else {
+            out.push(line.to_string());
+            continue;
+        };
+        let inner = &trimmed[open + "@__assertfail(".len()..];
+        let Some(close) = inner.rfind(')') else {
+            out.push(line.to_string());
+            continue;
+        };
+        let args: Vec<String> = inner[..close]
+            .split(", ")
+            .map(str::trim)
+            .map(str::to_string)
+            .collect();
+        if args.len() != 5 {
+            out.push(line.to_string());
+            continue;
+        }
+        // 指针操作数 → as1 全局名（内联 addrspacecast 形态或溯源链）。
+        let resolve_global = |operand: &str, lines: &[&str]| -> Option<String> {
+            let t = operand.trim();
+            if let Some(rest) = t.strip_prefix("ptr addrspacecast (ptr addrspace(1) @") {
+                return rest.split_once(" to ptr)").map(|(g, _)| g.to_string());
+            }
+            if let Some(name) = t.strip_prefix("ptr %") {
+                // 溯源：找 %name = addrspacecast ... @G 或 extractvalue 链——
+                // 宏形态是直接常量指针，通常已内联；保守失败返回 None。
+                let want = format!("%{name} = ");
+                for prev in lines {
+                    let pl = prev.trim_start();
+                    if pl.starts_with(&want)
+                        && let Some(rest) = pl
+                            .strip_prefix(&want)
+                            .and_then(|r| r.trim().strip_prefix("addrspacecast ptr addrspace(1) @"))
+                    {
+                        return rest.split_once(" to ptr").map(|(g, _)| g.to_string());
+                    }
+                }
+            }
+            None
+        };
+        let r0 = resolve_global(&args[0], &lines);
+        let r1 = resolve_global(&args[1], &lines);
+        let r3 = resolve_global(&args[3], &lines);
+        let (Some(msg_g), Some(file_g), Some(func_g)) = (r0, r1, r3) else {
+            out.push(line.to_string());
+            continue;
+        };
+        let line_no: String = args[2]
+            .trim()
+            .strip_prefix("i32 ")
+            .unwrap_or(args[2].trim())
+            .to_string();
+        // 合成消息串：gpu_assert: <msg> (<file>:<line> in <func>)\n\0
+        let mut composed = b"gpu_assert: ".to_vec();
+        composed.extend_from_slice(&cstr_bytes(&globals_bytes, &msg_g, b"", false));
+        composed.extend_from_slice(b" (");
+        composed.extend_from_slice(&cstr_bytes(&globals_bytes, &file_g, b"", false));
+        composed.extend_from_slice(b":");
+        composed.extend_from_slice(line_no.as_bytes());
+        let func_content = cstr_bytes(&globals_bytes, &func_g, b"", false);
+        if !func_content.is_empty() {
+            composed.extend_from_slice(b" in ");
+            composed.extend_from_slice(&func_content);
+        }
+        composed.extend_from_slice(b")\n\0");
+        composed.extend_from_slice(line_no.as_bytes());
+        composed.extend_from_slice(b")\n\0");
+
+        let global_name = format!("@__port_assert_msg_{site:02}");
+        let mut escaped = String::with_capacity(composed.len() * 2);
+        for b in &composed {
+            match b {
+                0x20..=0x7E if *b != b'"' && *b != b'\\' => escaped.push(*b as char),
+                _ => escaped.push_str(&format!("\\{b:02X}")),
+            }
+        }
+        let strlen = composed.len();
+        // 合成全局在模块级统一输出（不能在函数体内定义全局）。
+        module_globals.push(format!(
+            "{global_name} = addrspace(1) constant [{strlen} x i8] c\"{escaped}\", align 1"
+        ));
+        let indent = &line[..line.len() - trimmed.len()];
+        // SSA 名避免与既有冲突：前缀 af{site}。
+        out.push(format!(
+            "{indent}%af{site}h = call i64 @__ockl_printf_begin(i64 0)"
+        ));
+        out.push(format!(
+            "{indent}%af{site}f = addrspacecast ptr addrspace(1) {global_name} to ptr"
+        ));
+        out.push(format!(
+            "{indent}%af{site}s = call i64 @__ockl_printf_append_string_n(i64 %af{site}h, ptr %af{site}f, i64 {strlen}, i32 1)"
+        ));
+        // 干净退出替换 unreachable。
+        if ret_type == "void" {
+            out.push(format!("{indent}ret void"));
+        } else {
+            out.push(format!("{indent}ret {ret_type} undef"));
+        }
+        // 跳过原行之后的 `unreachable`。
+        site += 1;
+        changed = true;
+        continue;
+    }
+
+    // 合成全局插到首个 define 之前（模块级定义不可在函数体内）。
+    if !module_globals.is_empty()
+        && let Some(first_define) = out.iter().position(|l| l.starts_with("define "))
+    {
+        for (i, g) in module_globals.iter().enumerate() {
+            out.insert(first_define + i, g.clone());
+        }
+    }
+    let mut text = out.join("\n");
+    // 删掉被改写站点后的孤立 `unreachable` 行（其前的 assertfail call 已
+    // 消失；仅当该 unreachable 紧跟我们插入的 append_string_n 时才删——
+    // 精确匹配插入尾行后紧跟的 unreachable）。
+    if changed {
+        let mut cleaned: Vec<String> = Vec::with_capacity(out.len());
+        let mut skip_next_unreachable = false;
+        for l in out {
+            if skip_next_unreachable && l.trim() == "unreachable" {
+                skip_next_unreachable = false;
+                continue;
+            }
+            if l.contains("__ockl_printf_append_string_n") && l.contains("i32 1)") {
+                skip_next_unreachable = true;
+            } else if skip_next_unreachable {
+                skip_next_unreachable = false;
+            }
+            cleaned.push(l);
+        }
+        text = cleaned.join("\n");
+        if text.ends_with("\n") {
+            text.pop();
+        }
+    }
+    text
+}
+
 fn rewrite_vprintf_to_ockl(text: &str) -> String {
     // Modules with direct __ockl calls (the __cuda_panic_str helper) need the
     // declares + the hostcall metadata even without a vprintf call to expand.
@@ -2700,6 +2949,13 @@ pub fn rewrite_ir_for_amdgcn(ll: &str) -> Result<String, String> {
     text = rewrite_mbarriers(&text);
     // 17. [adapt-rocm] vprintf(NVVM) → __ockl_printf_* (hostcall printf;
     //     ABI/protocol extracted from ockl.bc llvm-dis + printf_mod probe).
+    // 17c. [adapt-rocm][gpu_assert] __assertfail（NV 专有符号，amdgcn 未
+    //      定义）→ 合成 "gpu_assert: <msg> (<file>:<line>)" as1 常量 +
+    //      vprintf(null-args) 调用，复用既有 ockl 展开管线；消息送达需
+    //      干净退出，故 assertfail 站点的 unreachable 一并替换为 ret
+    //      （void 函数 ret void / 非 void ret undef——失败路径的返回值
+    //      本就不可用）。no-message gpu_assert 保持 trap。
+    text = rewrite_assertfail_to_ockl(&text);
     text = rewrite_vprintf_to_ockl(&text);
     text = rewrite_packed_math(&text);
     // 18. [adapt-rocm] cp.async → software emulation (RDNA2 has no async
