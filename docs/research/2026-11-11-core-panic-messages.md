@@ -96,3 +96,22 @@ dotprod/atomics/redux_sum/warp_reduce 的批 llc_fail 定性为 **Python 管线�
 四例真卡全绿（warp_reduce 77 launch shapes、atomics 24 tests、redux_sum
 8 warp sums、dotprod dp4a/dp2a 全对）。批跑分母口径：runner 报 105 系含
 device_heap 双条目，report.json 实为 104 例。
+
+
+## 附 2：迭代器引用形态 default 收口（同日）
+
+矩阵最后一条 IMPLEMENTABLE 边界（`iter().min().unwrap_or(&0)` 引用形态走
+Fn-trait 分发被拒）经 iter_ref_default 例真卡验证：**四种子形态全过**
+（Some 路径 min/max、None 字面量 &7、None 闭包 unwrap_or_else(|| &42)、
+map_or 引用 &0）。该边界实被 2026-10-31 的 closure-typed struct 常量合成
+fallback 间接解锁，当时未复验此形态——本轮补验证 + 例程固化 + 矩阵行收口。
+矩阵内 IMPLEMENTABLE 行至此全部清零。
+
+## 附 3：cuda-async E0133 doctest 复核
+
+工作统计中披露的"cuda-async E0133 doctest 失败"**不复现为失败**：全
+workspace doctest 0 FAILED（cuda-async 8 passed 含 compile_fail,E0133 预
+期失败用例 ✓；cuda-host 6 ✓；cuda-macros 0 FAILED）。两处 E0133 文本来源：
+launch.rs:262 的 `compile_fail,E0133` doctest（预期错误文本，行为正确）与
+cuda-device/heap.rs 的 `unsafe_op_in_unsafe_fn` **警告**（既有基线噪音，
+非错误）。原判"FAIL"系 compile_fail 预期错误文本混入构建日志的误读。
