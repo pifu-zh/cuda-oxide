@@ -7,6 +7,11 @@ rustc-ice-*.txt
 # Generated PTX/LLVM files
 *.ptx
 *.ll
+# Linked code objects produced next to the examples (regenerated per build)
+*.hsaco
+*.co
+# Per-example artifact caches
+.oxide-artifacts/
 # Tile export descriptions written next to them
 *.tileexports.json
 # Tile library descriptions and the library itself (cargo oxide tilelib)
