@@ -91,7 +91,7 @@ thread_local! {
     // call classification must not depend on Legaliser ordering or spelling.
     static EMITTED_FUNCTIONS: std::cell::RefCell<std::collections::BTreeSet<String>> =
         const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
-    // Device panic messages keyed by (function export name, basic block
+    // Device panic reports keyed by (function export name, basic block
     // index). Both sides of the handoff - the collector's MIR scan and the
     // importer's block translation - walk the same monomorphized bodies, so
     // the pair is a stable key without relying on spans.
@@ -101,18 +101,32 @@ thread_local! {
     // Export name of the function currently being translated.
     static CURRENT_FUNCTION: std::cell::RefCell<String> =
         const { std::cell::RefCell::new(String::new()) };
+    // Export names of functions whose failed runtime asserts may report
+    // instead of trapping: unit-return kernels, as scanned by the collector.
+    // The assert translator consults this before synthesizing the failure
+    // block.
+    static PANIC_REPORT_ELIGIBLE: std::cell::RefCell<std::collections::BTreeSet<String>> =
+        const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
 }
 
 /// Replace the panic-message registry for this pipeline run.
-pub(crate) fn set_panic_messages(
-    messages: std::collections::BTreeMap<(String, u32), Vec<u8>>,
-) {
+pub(crate) fn set_panic_messages(messages: std::collections::BTreeMap<(String, u32), Vec<u8>>) {
     PANIC_MESSAGES.with(|cell| *cell.borrow_mut() = messages);
 }
 
 /// The message bytes recorded for a function's panic block, if any.
 pub(crate) fn panic_message_for(func: &str, block: u32) -> Option<Vec<u8>> {
     PANIC_MESSAGES.with(|cell| cell.borrow().get(&(func.to_string(), block)).cloned())
+}
+
+/// Replace the panic-report-eligibility set for this pipeline run.
+pub(crate) fn set_panic_report_eligible(names: std::collections::BTreeSet<String>) {
+    PANIC_REPORT_ELIGIBLE.with(|cell| *cell.borrow_mut() = names);
+}
+
+/// Whether the current function's failed asserts render a report.
+pub(crate) fn panic_report_eligible(func: &str) -> bool {
+    PANIC_REPORT_ELIGIBLE.with(|cell| cell.borrow().contains(func))
 }
 
 /// Set the export name of the function currently being translated.

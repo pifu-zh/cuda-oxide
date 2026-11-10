@@ -21,13 +21,13 @@
 //! into `core::panicking` lowers to a device trap alone, statements included
 //! (see [`translate_block`]).
 
-use crate::translator::location::span_to_location;
 use super::rvalue;
 use super::statement;
 use super::statement_debug;
 use super::terminator;
 use crate::error::TranslationResult;
 use crate::pipeline::StatementDebugInfoBlock;
+use crate::translator::location::span_to_location;
 use crate::translator::values::ValueMap;
 use pliron::basic_block::BasicBlock;
 use pliron::context::{Context, Ptr};

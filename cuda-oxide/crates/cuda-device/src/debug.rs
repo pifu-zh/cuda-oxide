@@ -259,6 +259,43 @@ pub fn __cuda_panic_str(msg: *const u8, len: u64) {
     }
 }
 
+/// Core-machinery panic report: slice bounds check. The importer calls this
+/// from a dropped `core::panicking::panic_bounds_check(index, len)` block;
+/// the message text mirrors `core::panicking` (the len renders first, then
+/// the index) and the render goes through the ockl printf transport — the
+/// same channel as the kernel macro's format-arg panic rewrite, whose drain
+/// reaches host stdout because the wave exits cleanly.
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+pub fn __cuda_panic_bounds_check(index: u64, len: u64) {
+    const FMT: &[u8; 67] = b"panic: index out of bounds: the len is %llu but the index is %llu\n\0";
+    #[repr(C)]
+    struct Args {
+        len: u64,
+        index: u64,
+    }
+    let args = Args { len, index };
+    __gpu_vprintf(FMT.as_ptr(), core::ptr::addr_of!(args) as *const u8);
+}
+
+/// Core-machinery panic report: integer division by zero. Message text
+/// mirrors `core::panicking::panic_const_div_by_zero`.
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+pub fn __cuda_panic_div_by_zero() {
+    const FMT: &[u8; 34] = b"panic: attempt to divide by zero\n\0";
+    __gpu_vprintf(FMT.as_ptr(), core::ptr::null::<u8>());
+}
+
+/// Core-machinery panic report: integer remainder with zero divisor.
+/// Message text mirrors `core::panicking::panic_const_rem_by_zero`.
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+pub fn __cuda_panic_rem_by_zero() {
+    const FMT: &[u8; 66] = b"panic: attempt to calculate the remainder with a divisor of zero\n\0";
+    __gpu_vprintf(FMT.as_ptr(), core::ptr::null::<u8>());
+}
+
 /// Conversion table for `gpu_printf!` arguments.
 ///
 /// A placeholder without a type character (`{}`, `{:8}`, `{:08}`, `{:.2}`)

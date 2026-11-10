@@ -452,6 +452,107 @@ fn translate_assert(
         cond_value
     };
 
+    // [panic-report] Reportable asserts (slice bounds check, division and
+    // remainder by zero): the failure edge calls the matching device helper,
+    // which renders the message through the ockl printf transport — the same
+    // channel as the kernel macro's format-arg panic rewrite — and exits the
+    // wave cleanly instead of trapping. Eligibility is unit-return kernels
+    // only (the exit is a bare return), scanned by the collector; every
+    // other assert kind keeps the bare trap.
+    let report = if crate::translator::facts::panic_report_eligible(
+        &crate::translator::facts::current_function(),
+    ) {
+        match msg {
+            mir::AssertMessage::BoundsCheck { len, index } => {
+                Some((Some((index, len)), "__cuda_panic_bounds_check"))
+            }
+            mir::AssertMessage::DivisionByZero(_) => Some((None, "__cuda_panic_div_by_zero")),
+            mir::AssertMessage::RemainderByZero(_) => Some((None, "__cuda_panic_rem_by_zero")),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    if let Some((report_args, helper)) = report {
+        // Failure block, created on the fly like the switch chain's
+        // intermediate blocks: helper call + bare wave exit.
+        let fail_block = BasicBlock::new(ctx, None, vec![]);
+        fail_block.insert_after(ctx, block_ptr);
+        let mut report_prev: Option<Ptr<Operation>> = None;
+        let arg_values: Vec<pliron::value::Value> = if let Some((index_op, len_op)) = report_args {
+            let (index_val, prev1) = rvalue::translate_operand(
+                ctx,
+                body,
+                index_op,
+                value_map,
+                fail_block,
+                report_prev,
+                loc.clone(),
+            )?;
+            report_prev = prev1;
+            let (len_val, prev2) = rvalue::translate_operand(
+                ctx,
+                body,
+                len_op,
+                value_map,
+                fail_block,
+                report_prev,
+                loc.clone(),
+            )?;
+            report_prev = prev2;
+            vec![index_val, len_val]
+        } else {
+            vec![]
+        };
+        let unit_ty: pliron::r#type::TypeHandle =
+            dialect_mir::types::MirTupleType::get(ctx, vec![]).into();
+        let call = helpers::emit_raw_call(
+            ctx,
+            helper,
+            arg_values,
+            unit_ty,
+            fail_block,
+            report_prev,
+            loc.clone(),
+        );
+        let ret_op = Operation::new(
+            ctx,
+            MirReturnOp::get_concrete_op_info(),
+            vec![],
+            vec![],
+            vec![],
+            0,
+        );
+        ret_op.deref_mut(ctx).set_loc(loc.clone());
+        ret_op.insert_after(ctx, call);
+
+        // The check becomes a branch: success to the original target,
+        // failure into the report block.
+        let (flat_operands, segment_sizes) =
+            MirCondBranchOp::compute_segment_sizes(vec![vec![final_cond], vec![], vec![]]);
+        let cbr = Operation::new(
+            ctx,
+            MirCondBranchOp::get_concrete_op_info(),
+            vec![],
+            flat_operands,
+            vec![block_map[target], fail_block],
+            0,
+        );
+        Operation::get_op::<MirCondBranchOp>(cbr, ctx)
+            .expect("MirCondBranchOp")
+            .set_operand_segment_sizes(ctx, segment_sizes);
+        cbr.deref_mut(ctx).set_loc(loc.clone());
+        if let Some(prev) = last_inserted {
+            cbr.insert_after(ctx, prev);
+        } else if let Some(prev) = prev_op {
+            cbr.insert_after(ctx, prev);
+        } else {
+            cbr.insert_at_front(block_ptr, ctx);
+        }
+        return Ok(cbr);
+    }
+
     // Keep the potentially trapping check separate from its success branch.
     // Generic CFG merging may erase the goto, but must retain the assertion.
     let op = MirAssertOp::new(ctx, final_cond).get_operation();
@@ -1324,8 +1425,7 @@ fn translate_call(
     // (destination, targets) is unchanged, so the regular-call tail below
     // handles it verbatim under the rewritten symbol.
     if let Some(ref name) = pattern_name
-        && (name == "core::intrinsics::write_bytes"
-            || name == "std::intrinsics::write_bytes")
+        && (name == "core::intrinsics::write_bytes" || name == "std::intrinsics::write_bytes")
     {
         let return_type = types::translate_destination_type(ctx, body, destination, &loc)?;
         // Use the definition's legalised FQDN so resolve_call finds the
@@ -1334,7 +1434,9 @@ fn translate_call(
             ctx,
             body,
             legaliser
-                .legalise(crate::translator::facts::memset_symbol().unwrap_or("__cuda_device_memset_u8"))
+                .legalise(
+                    crate::translator::facts::memset_symbol().unwrap_or("__cuda_device_memset_u8"),
+                )
                 .as_ref(),
             args,
             destination,

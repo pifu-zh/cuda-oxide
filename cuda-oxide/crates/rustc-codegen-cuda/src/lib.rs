@@ -816,6 +816,7 @@ impl CodegenBackend for CudaCodegenBackend {
                             device_functions,
                             &collection_result.device_externs,
                             &collection_result.panic_messages,
+                            &collection_result.panic_report_eligible,
                             &device_config,
                         )
                     }));

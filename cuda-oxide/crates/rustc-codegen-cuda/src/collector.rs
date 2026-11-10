@@ -532,6 +532,10 @@ pub struct CollectionResult<'tcx> {
     /// Panic messages keyed by (function export name, basic block index);
     /// see [`DeviceCollector::ensure_panic_helper_enqueued`].
     pub panic_messages: std::collections::BTreeMap<(String, u32), Vec<u8>>,
+    /// Export names of unit-return kernels whose failed runtime asserts
+    /// (bounds checks, div/rem by zero) may render a message instead of
+    /// trapping; consulted by the assert translator.
+    pub panic_report_eligible: std::collections::BTreeSet<String>,
 
     /// Whether this crate needs the run-time loader to merge PTX bundles.
     ///
@@ -932,11 +936,16 @@ const MISSING_DEVICE_STUB_MARKER: &str = "called outside #[kernel] / #[device]";
 
 fn shim_for(fn_path: &str) -> &'static str {
     let last = fn_path.rsplit("::").next().unwrap_or(fn_path);
-    ["__rust_alloc", "__rust_alloc_zeroed", "__rust_dealloc", "__rust_realloc",
-     "__rust_no_alloc_shim_is_unstable_v2"]
-        .into_iter()
-        .find(|s| *s == last)
-        .unwrap_or("handle_alloc_error")
+    [
+        "__rust_alloc",
+        "__rust_alloc_zeroed",
+        "__rust_dealloc",
+        "__rust_realloc",
+        "__rust_no_alloc_shim_is_unstable_v2",
+    ]
+    .into_iter()
+    .find(|s| *s == last)
+    .unwrap_or("handle_alloc_error")
 }
 
 fn rust_alloc_shim_name(fn_path: &str) -> Option<&str> {
@@ -1464,8 +1473,9 @@ struct DeviceCollector<'tcx> {
     /// The importer materializes each as an immutable device global and
     /// calls the `__cuda_panic_str` helper before the kernel trap.
     panic_messages: std::collections::BTreeMap<(String, u32), Vec<u8>>,
+    panic_report_eligible: std::collections::BTreeSet<String>,
     /// Whether the `__cuda_panic_str` helper has been enqueued.
-    panic_helper_enqueued: bool,
+    panic_helpers_enqueued: std::collections::BTreeSet<&'static str>,
 }
 
 impl<'tcx> DeviceCollector<'tcx> {
@@ -1483,7 +1493,8 @@ impl<'tcx> DeviceCollector<'tcx> {
             verbose,
             local_shim_defs: None,
             panic_messages: std::collections::BTreeMap::new(),
-            panic_helper_enqueued: false,
+            panic_report_eligible: std::collections::BTreeSet::new(),
+            panic_helpers_enqueued: std::collections::BTreeSet::new(),
             cgus: None,
             cgus_input: &[],
         }
@@ -1651,6 +1662,7 @@ impl<'tcx> DeviceCollector<'tcx> {
             functions: self.result,
             device_externs: self.device_externs,
             panic_messages: self.panic_messages,
+            panic_report_eligible: self.panic_report_eligible,
             requires_ptx_bundle_merge: false,
             tile_exports: Vec::new(),
         }
@@ -1695,12 +1707,17 @@ impl<'tcx> DeviceCollector<'tcx> {
             }
         }
         for krate in self.tcx.crates(()) {
-            if !matches!(self.tcx.crate_name(*krate).as_str(), "cuda_device" | "cuda-device") {
+            if !matches!(
+                self.tcx.crate_name(*krate).as_str(),
+                "cuda_device" | "cuda-device"
+            ) {
                 continue;
             }
             let root: rustc_hir::def_id::DefId = (*krate).as_def_id();
             for child in self.tcx.module_children(root).iter() {
-                let Some(did) = child.res.opt_def_id() else { continue };
+                let Some(did) = child.res.opt_def_id() else {
+                    continue;
+                };
                 if !matches!(self.tcx.def_kind(did), rustc_hir::def::DefKind::Fn) {
                     continue;
                 }
@@ -1718,7 +1735,6 @@ impl<'tcx> DeviceCollector<'tcx> {
         }
         None
     }
-
 
     /// Finds the kernel-crate-local `__cuda_device_memset_u8` definition
     /// (independent of the guard's lazily-built index, which only fills
@@ -2340,7 +2356,10 @@ impl<'tcx> DeviceCollector<'tcx> {
         let is_extern_decl = !self.tcx.is_mir_available(resolved.def_id());
         let is_cuda_device_shim = !resolved.def_id().is_local()
             && rust_alloc_shim_name(&raw_name).is_some()
-            && matches!(self.tcx.crate_name(resolved.def_id().krate).as_str(), "cuda_device" | "cuda-device");
+            && matches!(
+                self.tcx.crate_name(resolved.def_id().krate).as_str(),
+                "cuda_device" | "cuda-device"
+            );
         if !resolved.def_id().is_local()
             && !is_cuda_device_shim
             && !is_extern_decl
@@ -2365,9 +2384,14 @@ impl<'tcx> DeviceCollector<'tcx> {
                     }
                     let instance = Instance::mono(self.tcx, def_id);
                     let symbol = self.tcx.symbol_name(instance).name.to_string();
-                    for shim in ["__rust_alloc", "__rust_alloc_zeroed", "__rust_dealloc",
-                                 "__rust_realloc", "__rust_alloc_error_handler",
-                                 "__cuda_device_memset_u8"] {
+                    for shim in [
+                        "__rust_alloc",
+                        "__rust_alloc_zeroed",
+                        "__rust_dealloc",
+                        "__rust_realloc",
+                        "__rust_alloc_error_handler",
+                        "__cuda_device_memset_u8",
+                    ] {
                         if symbol.ends_with(shim) {
                             map.insert(shim, def_id);
                         }
@@ -2380,8 +2404,11 @@ impl<'tcx> DeviceCollector<'tcx> {
                 .as_ref()
                 .is_some_and(|m| m.contains_key(shim));
             if local_override {
-                if let Some(def_id) =
-                    self.local_shim_defs.as_ref().and_then(|m| m.get(shim)).copied()
+                if let Some(def_id) = self
+                    .local_shim_defs
+                    .as_ref()
+                    .and_then(|m| m.get(shim))
+                    .copied()
                 {
                     let instance = Instance::mono(self.tcx, def_id);
                     // Use the def-path FQDN (like every other non-kernel fn):
@@ -2439,14 +2466,20 @@ impl<'tcx> DeviceCollector<'tcx> {
         // hooks) resolves at link time to that definition. Forward the
         // collection: enqueue the defining instance so the module carries a
         // body instead of a dangling extern.
-        let bare_symbol = raw_name.rsplit("::").next().unwrap_or(&raw_name).to_string();
+        let bare_symbol = raw_name
+            .rsplit("::")
+            .next()
+            .unwrap_or(&raw_name)
+            .to_string();
         let is_device_runtime_symbol = rust_alloc_shim_name(&raw_name).is_some()
             || bare_symbol == "__cuda_device_memset_u8"
             || bare_symbol == "__rust_no_alloc_shim_is_unstable_v2";
         if self.verbose && bare_symbol.starts_with("__rust_no_alloc") {
-            eprintln!("[collector] forward-check: raw={raw_name} mir_avail={} shim={}",
+            eprintln!(
+                "[collector] forward-check: raw={raw_name} mir_avail={} shim={}",
                 self.tcx.is_mir_available(resolved.def_id()),
-                rust_alloc_shim_name(&raw_name).is_some());
+                rust_alloc_shim_name(&raw_name).is_some()
+            );
         }
         if !self.tcx.is_mir_available(resolved.def_id())
             && bare_symbol == "write_bytes"
@@ -3392,12 +3425,37 @@ impl<'tcx> DeviceCollector<'tcx> {
     /// crate and is referenced by no user code, so the CGU scan misses it;
     /// the definition comes through the crate metadata instead.
     fn ensure_panic_helper_enqueued(&mut self, ctx: &DiscoveryCtx) {
-        if self.panic_helper_enqueued {
+        self.ensure_device_helper_enqueued(ctx, "__cuda_panic_str");
+    }
+
+    /// `core::panicking::panic_bounds_check(index, len)` renders through the
+    /// `__cuda_panic_bounds_check` device helper.
+    fn ensure_panic_bounds_check_helper_enqueued(&mut self, ctx: &DiscoveryCtx) {
+        self.ensure_device_helper_enqueued(ctx, "__cuda_panic_bounds_check");
+    }
+
+    /// `core::panicking::panic_const_div_by_zero()` renders through the
+    /// `__cuda_panic_div_by_zero` device helper.
+    fn ensure_panic_div_by_zero_helper_enqueued(&mut self, ctx: &DiscoveryCtx) {
+        self.ensure_device_helper_enqueued(ctx, "__cuda_panic_div_by_zero");
+    }
+
+    /// `core::panicking::panic_const_rem_by_zero()` renders through the
+    /// `__cuda_panic_rem_by_zero` device helper.
+    fn ensure_panic_rem_by_zero_helper_enqueued(&mut self, ctx: &DiscoveryCtx) {
+        self.ensure_device_helper_enqueued(ctx, "__cuda_panic_rem_by_zero");
+    }
+
+    /// Enqueues one no_mangle helper from `cuda_device::debug` into the
+    /// module (idempotent per symbol): the importer's dropped-panic arm
+    /// calls it by bare symbol before the clean wave exit.
+    fn ensure_device_helper_enqueued(&mut self, ctx: &DiscoveryCtx, symbol: &'static str) {
+        if self.panic_helpers_enqueued.contains(symbol) {
             return;
         }
-        let Some(instance) = self.find_cuda_device_fn(&["debug"], "__cuda_panic_str") else {
+        let Some(instance) = self.find_cuda_device_fn(&["debug"], symbol) else {
             if self.verbose {
-                eprintln!("[panic-report] helper not found; panic paths stay plain traps");
+                eprintln!("[panic-report] helper {symbol} not found; panic paths stay plain traps");
             }
             return;
         };
@@ -3405,19 +3463,19 @@ impl<'tcx> DeviceCollector<'tcx> {
         self.discovery.insert(
             mangled.clone(),
             DiscoveryCtx {
-                root_name: "__cuda_panic_str".into(),
+                root_name: symbol.into(),
                 root_is_kernel: false,
                 user_span: self.tcx.def_span(instance.def_id()),
             },
         );
         self.seen.insert(mangled);
-        self.used_export_names.insert("__cuda_panic_str".into());
+        self.used_export_names.insert(symbol.into());
         self.worklist.push_back(CollectedFunction {
             instance,
             is_kernel: false,
-            export_name: "__cuda_panic_str".to_string(),
+            export_name: symbol.to_string(),
         });
-        self.panic_helper_enqueued = true;
+        self.panic_helpers_enqueued.insert(symbol);
         let _ = ctx;
     }
 
@@ -3436,7 +3494,10 @@ impl<'tcx> DeviceCollector<'tcx> {
             .iter()
             .copied()
             .find(|cnum| self.tcx.crate_name(*cnum).as_str() == "cuda_device")
-            .map(|cnum| DefId { krate: cnum, index: CRATE_DEF_INDEX })?;
+            .map(|cnum| DefId {
+                krate: cnum,
+                index: CRATE_DEF_INDEX,
+            })?;
         let mut module = crate_root;
         for segment in module_path {
             let child_did = self
@@ -3487,6 +3548,42 @@ impl<'tcx> DeviceCollector<'tcx> {
             let Some(term) = &bb_data.terminator else {
                 continue;
             };
+            // [panic-report] Runtime asserts with renderable messages (slice
+            // bounds checks, division/remainder by zero): mark this kernel
+            // eligible and enqueue the matching device helper. The assert
+            // translator synthesizes the failure block; eligibility is
+            // unit-return kernel only, because the wave exit is a bare
+            // return. The message text and argument shape live with the
+            // helpers in cuda-device::debug, mirroring core::panicking.
+            if let TerminatorKind::Assert { msg, .. } = &term.kind
+                && func.is_kernel
+                && self.instance_returns_unit(&func.instance)
+            {
+                let reportable = match msg.as_ref() {
+                    rustc_middle::mir::AssertMessage::BoundsCheck { .. } => {
+                        Some("__cuda_panic_bounds_check")
+                    }
+                    rustc_middle::mir::AssertMessage::DivisionByZero(_) => {
+                        Some("__cuda_panic_div_by_zero")
+                    }
+                    rustc_middle::mir::AssertMessage::RemainderByZero(_) => {
+                        Some("__cuda_panic_rem_by_zero")
+                    }
+                    _ => None,
+                };
+                if let Some(symbol) = reportable {
+                    self.panic_report_eligible.insert(func.export_name.clone());
+                    match symbol {
+                        "__cuda_panic_bounds_check" => {
+                            self.ensure_panic_bounds_check_helper_enqueued(ctx)
+                        }
+                        "__cuda_panic_div_by_zero" => {
+                            self.ensure_panic_div_by_zero_helper_enqueued(ctx)
+                        }
+                        _ => self.ensure_panic_rem_by_zero_helper_enqueued(ctx),
+                    }
+                }
+            }
             let TerminatorKind::Call { func: callee, .. } = &term.kind else {
                 continue;
             };
@@ -3524,10 +3621,10 @@ impl<'tcx> DeviceCollector<'tcx> {
                 // kernel macro rewrites them at the source level into the
                 // ockl printf report plus a clean return (see
                 // cuda-macros rewrite_format_arg_panics). What still traps:
-                // panic machinery raised inside core (slice bounds checks,
-                // unwrap, assert expansion), panics in device functions, and
-                // panics in non-unit kernels — none of which can exit the
-                // wave cleanly with this design.
+                // argumented core panics other than the signature-matched
+                // ones above, panics in device functions, and panics in
+                // non-unit kernels — none of which can exit the wave cleanly
+                // with this design.
                 // The longest &str in the block is the message: the inlined
                 // panic machinery also carries the location string (file!()),
                 // which is always shorter.
@@ -3607,6 +3704,17 @@ impl<'tcx> DeviceCollector<'tcx> {
     }
 
     /// Extracts the DefId from a call operand.
+    /// Whether the instance's return type is `()` — the report arm's wave
+    /// exit is a bare return, which only a unit-return function can emit.
+    fn instance_returns_unit(&self, instance: &rustc_middle::ty::Instance<'tcx>) -> bool {
+        instance
+            .ty(self.tcx, rustc_middle::ty::TypingEnv::fully_monomorphized())
+            .fn_sig(self.tcx)
+            .skip_binder()
+            .output()
+            .is_unit()
+    }
+
     fn get_call_def_id(&self, func: &rustc_middle::mir::Operand<'tcx>) -> Option<DefId> {
         use rustc_middle::mir::Operand;
 

@@ -66,10 +66,11 @@ pub fn amdgcn_target(arch: Option<&str>) -> Option<&str> {
     // rejecting unknown chips with a clear error.
     let arch = arch?.trim();
     let rest = arch.strip_prefix("gfx")?;
-    let split = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    let split = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
     let (digits, suffix) = rest.split_at(split);
-    let valid = !digits.is_empty()
-        && suffix.bytes().all(|b| b.is_ascii_lowercase());
+    let valid = !digits.is_empty() && suffix.bytes().all(|b| b.is_ascii_lowercase());
     valid.then_some(arch)
 }
 
@@ -81,7 +82,10 @@ fn has_typed_pointer_bitcast(ll: &str) -> bool {
         let Some(idx) = line.find("bitcast") else {
             return false;
         };
-        line[idx..].split(';').next().is_some_and(|code| code.contains("* %"))
+        line[idx..]
+            .split(';')
+            .next()
+            .is_some_and(|code| code.contains("* %"))
     })
 }
 
@@ -188,8 +192,12 @@ fn is_metadata_attachment(tail: &str) -> bool {
     if !first.starts_with('!') {
         return false;
     }
-    let meta_word =
-        |w: &str| w.len() > 1 && w[1..].bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'$' || b == b'"');
+    let meta_word = |w: &str| {
+        w.len() > 1
+            && w[1..].bytes().all(|b| {
+                b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'$' || b == b'"'
+            })
+    };
     let second = words.next();
     match second {
         // `!name !value` / `!value` — both start with '!' and carry only
@@ -274,9 +282,11 @@ fn rewrite_allocas_in_function(body: &[&str]) -> Vec<String> {
         // whose ELEMENT type is an addrspace pointer (e.g.
         // `[2 x ptr addrspace(3)]` — a generic-stack slot holding shared
         // pointers), leaving them generic and tripping the verifier.
-        if parts.iter().skip(1).any(|part| {
-            part.starts_with("addrspace(") && part.ends_with(')')
-        }) {
+        if parts
+            .iter()
+            .skip(1)
+            .any(|part| part.starts_with("addrspace(") && part.ends_with(')'))
+        {
             continue;
         }
         let ty = parts[0];
@@ -739,10 +749,7 @@ fn rewrite_redux_add(ll: &str) -> String {
 /// every downstream use is untouched.
 fn expand_redux_add(rd: ReduxLine<'_>) -> Vec<String> {
     let ReduxLine {
-        indent,
-        res,
-        val,
-        ..
+        indent, res, val, ..
     } = rd;
     let base = format!("{res}.b_");
     let mut seq = Vec::with_capacity(17);
@@ -754,8 +761,12 @@ fn expand_redux_add(rd: ReduxLine<'_>) -> Vec<String> {
     ));
     let mut cur = val.to_string();
     for shift in [16usize, 8, 4, 2, 1] {
-        seq.push(format!("{indent}{base}m{shift} = xor i32 {base}ln, {shift}"));
-        seq.push(format!("{indent}{base}o{shift} = shl i32 {base}m{shift}, 2"));
+        seq.push(format!(
+            "{indent}{base}m{shift} = xor i32 {base}ln, {shift}"
+        ));
+        seq.push(format!(
+            "{indent}{base}o{shift} = shl i32 {base}m{shift}, 2"
+        ));
         seq.push(format!(
             "{indent}{base}g{shift} = call i32 @llvm.amdgcn.ds.bpermute(i32 {base}o{shift}, i32 {cur})"
         ));
@@ -1074,9 +1085,7 @@ fn match_mb_line(line: &str) -> Option<MbLine<'_>> {
         None => return None,
     };
     let call = strip_call_prefix(rhs)?;
-    if let Some(rest) =
-        call.strip_prefix("i64 @llvm.nvvm.mbarrier.arrive.noComplete.shared(")
-    {
+    if let Some(rest) = call.strip_prefix("i64 @llvm.nvvm.mbarrier.arrive.noComplete.shared(") {
         let (ptr, count) = mb_ptr_count_args(rest)?;
         return Some(MbLine::ArriveNoComplete {
             indent,
@@ -1621,7 +1630,12 @@ fn match_counted_barrier_line(line: &str) -> Option<CountedBarrierLine<'_>> {
     if !(0..16).contains(&id) {
         return None;
     }
-    Some(CountedBarrierLine { indent, kind, id, n })
+    Some(CountedBarrierLine {
+        indent,
+        kind,
+        id,
+        n,
+    })
 }
 
 /// The helper module text appended when any counted barrier is rewritten.
@@ -1790,15 +1804,87 @@ fn rewrite_counted_barriers_in_function(body: &[&str]) -> (Vec<String>, bool) {
 
 /// The shared stem set (identical to the Python `_OCML_STEM_SET`).
 const OCML_STEMS: &[&str] = &[
-    "acos", "acosh", "asin", "asinh", "atan", "atan2", "atanh", "cabs", "cacos", "cacosh",
-    "casin", "casinh", "catan", "catanh", "cbrt", "ccos", "ccosh", "ceil", "cexp", "clog",
-    "copysign", "cos", "cosh", "csin", "csinh", "csqrt", "ctan", "ctanh", "erf", "erfc",
-    "erfcinv", "erfcx", "erfinv", "exp", "exp10", "exp2", "expm1", "fabs", "fdim", "floor",
-    "fma", "fmax", "fmin", "fmod", "frexp", "hypot", "i0", "i1", "ilogb", "isfinite", "isinf",
-    "isnan", "j0", "j1", "ldexp", "lgamma", "log", "log10", "log1p", "log2", "modf",
-    "nearbyint", "nextafter", "pow", "remainder", "remquo", "rint", "round", "rsqrt",
-    "scalbn", "signbit", "sin", "sincos", "sinh", "sqrt", "tan", "tanh", "tgamma", "trunc",
-    "y0", "y1",
+    "acos",
+    "acosh",
+    "asin",
+    "asinh",
+    "atan",
+    "atan2",
+    "atanh",
+    "cabs",
+    "cacos",
+    "cacosh",
+    "casin",
+    "casinh",
+    "catan",
+    "catanh",
+    "cbrt",
+    "ccos",
+    "ccosh",
+    "ceil",
+    "cexp",
+    "clog",
+    "copysign",
+    "cos",
+    "cosh",
+    "csin",
+    "csinh",
+    "csqrt",
+    "ctan",
+    "ctanh",
+    "erf",
+    "erfc",
+    "erfcinv",
+    "erfcx",
+    "erfinv",
+    "exp",
+    "exp10",
+    "exp2",
+    "expm1",
+    "fabs",
+    "fdim",
+    "floor",
+    "fma",
+    "fmax",
+    "fmin",
+    "fmod",
+    "frexp",
+    "hypot",
+    "i0",
+    "i1",
+    "ilogb",
+    "isfinite",
+    "isinf",
+    "isnan",
+    "j0",
+    "j1",
+    "ldexp",
+    "lgamma",
+    "log",
+    "log10",
+    "log1p",
+    "log2",
+    "modf",
+    "nearbyint",
+    "nextafter",
+    "pow",
+    "remainder",
+    "remquo",
+    "rint",
+    "round",
+    "rsqrt",
+    "scalbn",
+    "signbit",
+    "sin",
+    "sincos",
+    "sinh",
+    "sqrt",
+    "tan",
+    "tanh",
+    "tgamma",
+    "trunc",
+    "y0",
+    "y1",
 ];
 
 /// Step 15 driver: swap the `__nv_` symbol spellings for their ocml ones.
@@ -1809,10 +1895,7 @@ fn rewrite_ocml(ll: &str) -> String {
     let mut text = ll.to_string();
     for stem in OCML_STEMS {
         // f32 variant first; the `(` terminator keeps the pairs unambiguous.
-        text = text.replace(
-            &format!("@__nv_{stem}f("),
-            &format!("@__ocml_{stem}_f32("),
-        );
+        text = text.replace(&format!("@__nv_{stem}f("), &format!("@__ocml_{stem}_f32("));
         text = text.replace(&format!("@__nv_{stem}("), &format!("@__ocml_{stem}_f64("));
     }
     text
@@ -1866,21 +1949,27 @@ fn rewrite_vprintf_to_ockl(text: &str) -> String {
             continue;
         }
         let Some(at) = line.find("@") else { continue };
-        let Some(eq) = line.find("= addrspace(1) constant [") else { continue };
-        let name = line[at..at + (eq - at)].trim().trim_start_matches('@').to_string();
+        let Some(eq) = line.find("= addrspace(1) constant [") else {
+            continue;
+        };
+        let name = line[at..at + (eq - at)]
+            .trim()
+            .trim_start_matches('@')
+            .to_string();
         let Some(q1) = line.find("c\"") else { continue };
         let raw = &line[q1 + 2..];
-        let Some(close) = raw.rfind('"') else { continue };
+        let Some(close) = raw.rfind('"') else {
+            continue;
+        };
         let raw = &raw[..close];
         let mut bytes = Vec::new();
         let b = raw.as_bytes();
         let mut i = 0;
         while i < b.len() {
             if b[i] == b'\\' && i + 2 < b.len() {
-                if let Ok(v) = u8::from_str_radix(
-                    std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("zz"),
-                    16,
-                ) {
+                if let Ok(v) =
+                    u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("zz"), 16)
+                {
                     bytes.push(v);
                     i += 3;
                     continue;
@@ -1902,7 +1991,9 @@ fn rewrite_vprintf_to_ockl(text: &str) -> String {
         if !l.starts_with('%') {
             continue;
         }
-        let Some((name, rhs)) = l.split_once(" = ") else { continue };
+        let Some((name, rhs)) = l.split_once(" = ") else {
+            continue;
+        };
         let g = rhs
             .strip_prefix("addrspacecast ptr addrspace(1) @")
             .and_then(|r| r.split(" to ptr").next())
@@ -1913,9 +2004,7 @@ fn rewrite_vprintf_to_ockl(text: &str) -> String {
                     .strip_prefix("extractvalue { ptr, i64 } ")
                     .and_then(|r| r.rsplit(", 0").next())
                     .and_then(|r| r.rsplit_once('}'))
-                    .map(|(_, lhs)| {
-                        lhs.trim().strip_prefix("undef, ptr ").unwrap_or(lhs.trim())
-                    })
+                    .map(|(_, lhs)| lhs.trim().strip_prefix("undef, ptr ").unwrap_or(lhs.trim()))
                 {
                     return origin_of(&ptr_origin, src);
                 }
@@ -1943,12 +2032,53 @@ fn rewrite_vprintf_to_ockl(text: &str) -> String {
         if !l.contains(" = alloca ") {
             continue;
         }
-        let Some((name, rhs)) = l.split_once(" = alloca ") else { continue };
+        let Some((name, rhs)) = l.split_once(" = alloca ") else {
+            continue;
+        };
         if !(rhs.starts_with('{') || rhs.starts_with("<{")) {
             continue;
         }
         let end = rhs.find(", align").unwrap_or(rhs.len());
-        alloca_ty.push((format!("%{}", name.trim_start_matches('%')), rhs[..end].to_string()));
+        alloca_ty.push((
+            format!("%{}", name.trim_start_matches('%')),
+            rhs[..end].to_string(),
+        ));
+    }
+    // opt 内联会改写名字段：cast 与其 alloca 的后缀错位（%X.ac.i6 =
+    // addrspacecast %X.i5——内联第 6 份用了第 5 份的 alloca 名）。把指向
+    // as5 alloca 的 addrspacecast 别名并进类型表（不动点），调用点的
+    // args 指针（cast 名）即可查到元素类型。
+    loop {
+        let mut added = false;
+        for line in text.lines() {
+            let l = line.trim();
+            let Some((dst, rest)) = l.split_once(" = addrspacecast ") else {
+                continue;
+            };
+            let Some(src) = rest.strip_prefix("ptr addrspace(5) %") else {
+                continue;
+            };
+            let src = format!(
+                "%{}",
+                src.split(" to ptr")
+                    .next()
+                    .unwrap_or(src)
+                    .trim_start_matches('%')
+            );
+            let dst = format!("%{}", dst.trim_start_matches('%'));
+            let dst_known = alloca_ty.iter().any(|(n, _)| n == &dst);
+            let src_ty = alloca_ty
+                .iter()
+                .find(|(n, _)| n == &src)
+                .map(|(_, t)| t.clone());
+            if !dst_known && let Some(ty) = src_ty {
+                alloca_ty.push((dst, ty));
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
     }
     let alloca_ty_of = |name: &str| -> Option<String> {
         alloca_ty
@@ -1991,9 +2121,11 @@ fn rewrite_vprintf_to_ockl(text: &str) -> String {
         let attrs_tail = &inner[close + 1..];
         // 空尾巴 = 无属性组（合法）；非空必须全是 #N 组
         let at = attrs_tail.trim();
-        if !(at.is_empty() || at.split_whitespace().all(|t| {
-            t.starts_with('#') && t[1..].bytes().all(|b| b.is_ascii_digit())
-        })) {
+        if !(at.is_empty()
+            || at
+                .split_whitespace()
+                .all(|t| t.starts_with('#') && t[1..].bytes().all(|b| b.is_ascii_digit())))
+        {
             out.push(line.to_string());
             continue;
         }
@@ -2004,7 +2136,8 @@ fn rewrite_vprintf_to_ockl(text: &str) -> String {
         };
         // fmt 形态："%name" 或内联 "addrspacecast (ptr addrspace(1) @G to ptr)"
         // fmt 两形态：内联 addrspacecast（即全局名）或 SSA %name（需溯源）
-        let (fmt, fmt_is_global) = if let Some(rest) = f.trim()
+        let (fmt, fmt_is_global) = if let Some(rest) = f
+            .trim()
             .strip_prefix("ptr addrspacecast (ptr addrspace(1) @")
             .and_then(|r| r.split_once(" to ptr)"))
             .map(|(g, _)| g)
@@ -2012,7 +2145,10 @@ fn rewrite_vprintf_to_ockl(text: &str) -> String {
             (rest.to_string(), true)
         } else {
             (
-                f.trim().strip_prefix("ptr ").unwrap_or(f.trim()).to_string(),
+                f.trim()
+                    .strip_prefix("ptr ")
+                    .unwrap_or(f.trim())
+                    .to_string(),
                 false,
             )
         };
@@ -2036,17 +2172,17 @@ fn rewrite_vprintf_to_ockl(text: &str) -> String {
         // NUL 也能过，7.2 起必须含（乱码根因之一）。
         let strlen = blob.iter().position(|&b| b == 0).unwrap_or(blob.len()) + 1;
 
-        let null_args = args == "null" || args == "ptr null"
+        let null_args = args == "null"
+            || args == "ptr null"
             || args == "i64 0"
-            || text.lines().any(|l| {
-                l.trim() == format!("{args} = inttoptr i64 0 to ptr").as_str()
-            });
-        let base = format!(
-            "{}.pf_",
-            res.strip_prefix('%').unwrap_or(res.as_str())
-        );
+            || text
+                .lines()
+                .any(|l| l.trim() == format!("{args} = inttoptr i64 0 to ptr").as_str());
+        let base = format!("{}.pf_", res.strip_prefix('%').unwrap_or(res.as_str()));
         let mut seq: Vec<String> = Vec::new();
-        seq.push(format!("{indent}%{base}h = call i64 @__ockl_printf_begin(i64 0)"));
+        seq.push(format!(
+            "{indent}%{base}h = call i64 @__ockl_printf_begin(i64 0)"
+        ));
         seq.push(format!(
             "{indent}%{base}f = addrspacecast ptr addrspace(1) @{g} to ptr"
         ));
@@ -2067,8 +2203,10 @@ fn rewrite_vprintf_to_ockl(text: &str) -> String {
                 .trim_start_matches("nonnull ")
                 .trim_start_matches("noundef ")
                 .trim();
-            let base_args = bare.strip_suffix(".ac").unwrap_or(bare);
-            let Some(ty) = alloca_ty_of(base_args) else {
+            // opt 内联会改写名字段（%X.ac → %X.ac.i6，或 alloca 本身改名
+            // %X.i）：先按调用点原名查表，再按剥掉 .ac 段的名字兜底。
+            let stripped = bare.split(".ac").collect::<String>();
+            let Some(ty) = alloca_ty_of(bare).or_else(|| alloca_ty_of(&stripped)) else {
                 out.push(line.to_string());
                 continue;
             };
@@ -2169,7 +2307,11 @@ fn rewrite_vprintf_to_ockl(text: &str) -> String {
                     while cs.len() < 7 {
                         cs.push("i64 0".to_string());
                     }
-                    let oname = if last { format!("{base}r") } else { format!("{base}rc{ci}") };
+                    let oname = if last {
+                        format!("{base}r")
+                    } else {
+                        format!("{base}rc{ci}")
+                    };
                     seq.push(format!(
                         "{indent}%{oname} = call i64 @__ockl_printf_append_args(i64 {handle}, i32 {}, {}, i32 {})",
                         chunk.len(),
@@ -2209,7 +2351,9 @@ fn rewrite_vprintf_to_ockl(text: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    if !needed.is_empty() && let Some(idx) = text.find("\ndefine ") {
+    if !needed.is_empty()
+        && let Some(idx) = text.find("\ndefine ")
+    {
         text = format!("{}\n{}\n{}", &text[..idx], needed, &text[idx..]);
     }
     if !text.contains("amdgpu_printf_kind") {
@@ -2382,10 +2526,11 @@ fn append_ntid_kernarg_params(ll: &str) -> String {
         }
         let define = block[0].clone();
         let is_kernel = define.contains("amdgpu_kernel");
-        let refs_ntid = block
-            .iter()
-            .skip(1)
-            .any(|l| ["%ntid_x", "%ntid_y", "%ntid_z"].iter().any(|n| l.contains(n)));
+        let refs_ntid = block.iter().skip(1).any(|l| {
+            ["%ntid_x", "%ntid_y", "%ntid_z"]
+                .iter()
+                .any(|n| l.contains(n))
+        });
         // Idempotence: the three arrive together, so `%ntid_z` in the
         // signature means this define was already extended.
         if (is_kernel || refs_ntid) && !define.contains("%ntid_z") {
@@ -2720,8 +2865,7 @@ fn append_ntid_transitive(ll: &str) -> String {
                         } else {
                             format!(", {NTIDS}")
                         };
-                        block[0] =
-                            format!("{}{}{}", &define[..paren], insertion, &define[paren..]);
+                        block[0] = format!("{}{}{}", &define[..paren], insertion, &define[paren..]);
                     }
                 }
             }
@@ -2924,8 +3068,7 @@ fn rewrite_cp_async(text: &str) -> String {
         let is_copy = trimmed.contains("@llvm.nvvm.cp.async.ca.shared.global.")
             || trimmed.contains("@llvm.nvvm.cp.async.cg.shared.global.");
         if !is_copy
-            || !(trimmed.starts_with("call void @")
-                || trimmed.starts_with("tail call void @"))
+            || !(trimmed.starts_with("call void @") || trimmed.starts_with("tail call void @"))
         {
             out.push(line.to_string());
             continue;
@@ -2970,12 +3113,8 @@ fn rewrite_cp_async(text: &str) -> String {
         if !zfill {
             // Vector direct copy: operand texts pass through verbatim.
             let vty = format!("<{dwords} x i32>");
-            out.push(format!(
-                "{indent}%{pfx}v = load {vty}, {src}, align {size}"
-            ));
-            out.push(format!(
-                "{indent}store {vty} %{pfx}v, {dst}, align {size}"
-            ));
+            out.push(format!("{indent}%{pfx}v = load {vty}, {src}, align {size}"));
+            out.push(format!("{indent}store {vty} %{pfx}v, {dst}, align {size}"));
             continue;
         }
 
@@ -2988,10 +3127,7 @@ fn rewrite_cp_async(text: &str) -> String {
         }
         // The src_size arg: strip the i32 type prefix for the value.
         let ssz = args.get(2).copied().unwrap_or("");
-        let ssz_val = ssz
-            .trim()
-            .trim_start_matches("i32")
-            .trim();
+        let ssz_val = ssz.trim().trim_start_matches("i32").trim();
         let const_s = ssz_val.chars().all(|c| c.is_ascii_digit());
         let s_val: usize = const_s.then(|| ssz_val.parse().unwrap()).unwrap_or(0);
 
@@ -3002,12 +3138,18 @@ fn rewrite_cp_async(text: &str) -> String {
                 // smax floor keeps src_size=0 from underflowing to a -1 GEP.
                 if i == 0 {
                     out.push(format!("{indent}%{pfx}.m1 = sub i32 {ssz_val}, 1"));
-                    out.push(format!("{indent}%{pfx}.lim = call i32 @llvm.smax.i32(i32 %{pfx}.m1, i32 0)"));
+                    out.push(format!(
+                        "{indent}%{pfx}.lim = call i32 @llvm.smax.i32(i32 %{pfx}.m1, i32 0)"
+                    ));
                 }
                 out.append(&mut vec![
-                    format!("{indent}%{pfx}.idx{i} = call i32 @llvm.smin.i32(i32 {i}, i32 %{pfx}.lim)"),
+                    format!(
+                        "{indent}%{pfx}.idx{i} = call i32 @llvm.smin.i32(i32 {i}, i32 %{pfx}.lim)"
+                    ),
                     format!("{indent}%{pfx}.gep{i} = getelementptr i8, {src}, i32 %{pfx}.idx{i}"),
-                    format!("{indent}%{pfx}.ld{i} = load i8, ptr addrspace(1) %{pfx}.gep{i}, align 1"),
+                    format!(
+                        "{indent}%{pfx}.ld{i} = load i8, ptr addrspace(1) %{pfx}.gep{i}, align 1"
+                    ),
                     format!("{indent}%{pfx}.gt{i} = icmp sgt i32 {ssz_val}, {i}"),
                     format!("{indent}%{pfx}.b{i} = select i1 %{pfx}.gt{i}, i8 %{pfx}.ld{i}, i8 0"),
                 ]);
@@ -3027,18 +3169,13 @@ fn rewrite_cp_async(text: &str) -> String {
         for d in 0..dwords {
             for j in 0..4 {
                 let i = d * 4 + j;
-                out.push(format!(
-                    "{indent}%{pfx}.z{i} = zext i8 {} to i32",
-                    bytes[i]
-                ));
+                out.push(format!("{indent}%{pfx}.z{i} = zext i8 {} to i32", bytes[i]));
                 out.push(format!(
                     "{indent}%{pfx}.s{i} = shl i32 %{pfx}.z{i}, {}",
                     8 * j
                 ));
                 if j == 0 {
-                    out.push(format!(
-                        "{indent}%{pfx}.w{d}_0 = or i32 %{pfx}.s{i}, 0"
-                    ));
+                    out.push(format!("{indent}%{pfx}.w{d}_0 = or i32 %{pfx}.s{i}, 0"));
                 } else {
                     let jm1 = j - 1;
                     out.push(format!(
@@ -3122,7 +3259,9 @@ fn rewrite_packed_math(text: &str) -> String {
         // -- b16 atomic load: ld.acquire.gpu.b16 $0, [$1]; "=h,l"(ptr %p)
         if body == "ld.acquire.gpu.b16 $0, [$1]" {
             if let Some(ptr) = ops_text.strip_prefix("ptr ") {
-                out.push(format!("{indent}%{np}v = load atomic i16, ptr {ptr} acquire, align 2"));
+                out.push(format!(
+                    "{indent}%{np}v = load atomic i16, ptr {ptr} acquire, align 2"
+                ));
                 out.push(format!("{indent}{res} = bitcast i16 %{np}v to i16"));
                 continue;
             }
@@ -3133,22 +3272,37 @@ fn rewrite_packed_math(text: &str) -> String {
             if parts.len() == 2 {
                 let ptr = parts[0].strip_prefix("ptr ").unwrap_or(parts[0]);
                 let val = parts[1].trim();
-                out.push(format!("{indent}store atomic i16 {val}, ptr {ptr} release, align 2"));
+                out.push(format!(
+                    "{indent}store atomic i16 {val}, ptr {ptr} release, align 2"
+                ));
                 continue;
             }
         }
         // -- abs/neg.bf16x2: exact i32 masks
         if opcode == "abs.bf16x2" || opcode == "neg.bf16x2" {
             let v = ops_text.split("i32 ").nth(1).map(str::trim).unwrap_or("");
-            let (mask, xop) = if opcode == "abs.bf16x2" { ("2147418111", "and") } else { ("-2147450880", "xor") };
+            let (mask, xop) = if opcode == "abs.bf16x2" {
+                ("2147418111", "and")
+            } else {
+                ("-2147450880", "xor")
+            };
             out.push(format!("{indent}{res} = {xop} i32 {v}, {mask}"));
             continue;
         }
         // -- bf16x2 binary: add/sub/mul/min/max "=r,r,r"(i32, i32)
-        let binops = ["add.rn.bf16x2", "sub.rn.bf16x2", "mul.rn.bf16x2", "min.bf16x2", "max.bf16x2"];
+        let binops = [
+            "add.rn.bf16x2",
+            "sub.rn.bf16x2",
+            "mul.rn.bf16x2",
+            "min.bf16x2",
+            "max.bf16x2",
+        ];
         if binops.contains(&opcode) {
-            let args: Vec<&str> = ops_text.split("i32 ").skip(1)
-                .map(|s| s.split(',').next().unwrap_or("").trim()).collect();
+            let args: Vec<&str> = ops_text
+                .split("i32 ")
+                .skip(1)
+                .map(|s| s.split(',').next().unwrap_or("").trim())
+                .collect();
             if args.len() == 2 {
                 let (a, b) = (args[0], args[1]);
                 let mut sq = Vec::new();
@@ -3156,38 +3310,70 @@ fn rewrite_packed_math(text: &str) -> String {
                 sq.push(format!("{indent}%{np}alo = and i32 {a}, 65535"));
                 sq.push(format!("{indent}%{np}alo32 = shl i32 %{np}alo, 16"));
                 sq.push(format!("{indent}%{np}ahi = lshr i32 {a}, 16"));
-                sq.push(format!("{indent}%{np}alo_f = bitcast i32 %{np}alo32 to float"));
-                sq.push(format!("{indent}%{np}ahi_f = bitcast i32 %{np}ahi to float"));
+                sq.push(format!(
+                    "{indent}%{np}alo_f = bitcast i32 %{np}alo32 to float"
+                ));
+                sq.push(format!(
+                    "{indent}%{np}ahi_f = bitcast i32 %{np}ahi to float"
+                ));
                 sq.push(format!("{indent}%{np}blo = and i32 {b}, 65535"));
                 sq.push(format!("{indent}%{np}blo32 = shl i32 %{np}blo, 16"));
                 sq.push(format!("{indent}%{np}bhi = lshr i32 {b}, 16"));
-                sq.push(format!("{indent}%{np}blo_f = bitcast i32 %{np}blo32 to float"));
-                sq.push(format!("{indent}%{np}bhi_f = bitcast i32 %{np}bhi to float"));
+                sq.push(format!(
+                    "{indent}%{np}blo_f = bitcast i32 %{np}blo32 to float"
+                ));
+                sq.push(format!(
+                    "{indent}%{np}bhi_f = bitcast i32 %{np}bhi to float"
+                ));
                 if opcode == "min.bf16x2" || opcode == "max.bf16x2" {
                     let cnd = if opcode == "min.bf16x2" { "olt" } else { "ogt" };
-                    sq.push(format!("{indent}%{np}c1 = fcmp {cnd} float %{np}alo_f, %{np}blo_f"));
-                    sq.push(format!("{indent}%{np}slo = select i1 %{np}c1, i32 %{np}alo, i32 %{np}blo"));
-                    sq.push(format!("{indent}%{np}c2 = fcmp {cnd} float %{np}ahi_f, %{np}bhi_f"));
-                    sq.push(format!("{indent}%{np}shi = select i1 %{np}c2, i32 %{np}ahi, i32 %{np}bhi"));
+                    sq.push(format!(
+                        "{indent}%{np}c1 = fcmp {cnd} float %{np}alo_f, %{np}blo_f"
+                    ));
+                    sq.push(format!(
+                        "{indent}%{np}slo = select i1 %{np}c1, i32 %{np}alo, i32 %{np}blo"
+                    ));
+                    sq.push(format!(
+                        "{indent}%{np}c2 = fcmp {cnd} float %{np}ahi_f, %{np}bhi_f"
+                    ));
+                    sq.push(format!(
+                        "{indent}%{np}shi = select i1 %{np}c2, i32 %{np}ahi, i32 %{np}bhi"
+                    ));
                     sq.push(format!("{indent}%{np}shs = shl i32 %{np}shi, 16"));
                     sq.push(format!("{indent}{res} = or i32 %{np}slo, %{np}shs"));
                 } else {
-                    let flop = match opcode.split('.').next() { Some("add") => "fadd", Some("sub") => "fsub", _ => "fmul" };
-                    sq.push(format!("{indent}%{np}flo = {flop} float %{np}alo_f, %{np}blo_f"));
-                    sq.push(format!("{indent}%{np}fhi = {flop} float %{np}ahi_f, %{np}bhi_f"));
+                    let flop = match opcode.split('.').next() {
+                        Some("add") => "fadd",
+                        Some("sub") => "fsub",
+                        _ => "fmul",
+                    };
+                    sq.push(format!(
+                        "{indent}%{np}flo = {flop} float %{np}alo_f, %{np}blo_f"
+                    ));
+                    sq.push(format!(
+                        "{indent}%{np}fhi = {flop} float %{np}ahi_f, %{np}bhi_f"
+                    ));
                     sq.push(format!("{indent}%{np}lo32 = bitcast float %{np}flo to i32"));
                     sq.push(format!("{indent}%{np}hi32 = bitcast float %{np}fhi to i32"));
                     // RNE pack lo
                     sq.push(format!("{indent}%{np}lo32.ls1 = lshr i32 %{np}lo32, 16"));
                     sq.push(format!("{indent}%{np}lo32.ls2 = and i32 %{np}lo32.ls1, 1"));
-                    sq.push(format!("{indent}%{np}lo32.rnd = add i32 %{np}lo32.ls2, 32767"));
-                    sq.push(format!("{indent}%{np}lo32.rn = add i32 %{np}lo32, %{np}lo32.rnd"));
+                    sq.push(format!(
+                        "{indent}%{np}lo32.rnd = add i32 %{np}lo32.ls2, 32767"
+                    ));
+                    sq.push(format!(
+                        "{indent}%{np}lo32.rn = add i32 %{np}lo32, %{np}lo32.rnd"
+                    ));
                     sq.push(format!("{indent}%{np}lo16 = lshr i32 %{np}lo32.rn, 16"));
                     // RNE pack hi
                     sq.push(format!("{indent}%{np}hi32.ls1 = lshr i32 %{np}hi32, 16"));
                     sq.push(format!("{indent}%{np}hi32.ls2 = and i32 %{np}hi32.ls1, 1"));
-                    sq.push(format!("{indent}%{np}hi32.rnd = add i32 %{np}hi32.ls2, 32767"));
-                    sq.push(format!("{indent}%{np}hi32.rn = add i32 %{np}hi32, %{np}hi32.rnd"));
+                    sq.push(format!(
+                        "{indent}%{np}hi32.rnd = add i32 %{np}hi32.ls2, 32767"
+                    ));
+                    sq.push(format!(
+                        "{indent}%{np}hi32.rn = add i32 %{np}hi32, %{np}hi32.rnd"
+                    ));
                     sq.push(format!("{indent}%{np}hi16 = lshr i32 %{np}hi32.rn, 16"));
                     sq.push(format!("{indent}%{np}hi16s = shl i32 %{np}hi16, 16"));
                     sq.push(format!("{indent}{res} = or i32 %{np}lo16, %{np}hi16s"));
@@ -3198,8 +3384,11 @@ fn rewrite_packed_math(text: &str) -> String {
         }
         // -- bf16x2 fma (incl relu): fma.rn[.relu].bf16x2 "=r,r,r,r"(i32, i32, i32)
         if opcode.starts_with("fma.rn") && opcode.contains("bf16x2") {
-            let args: Vec<&str> = ops_text.split("i32 ").skip(1)
-                .map(|s| s.split(',').next().unwrap_or("").trim()).collect();
+            let args: Vec<&str> = ops_text
+                .split("i32 ")
+                .skip(1)
+                .map(|s| s.split(',').next().unwrap_or("").trim())
+                .collect();
             if args.len() == 3 {
                 let mut sq = Vec::new();
                 let relu = opcode.contains("relu");
@@ -3207,8 +3396,12 @@ fn rewrite_packed_math(text: &str) -> String {
                     sq.push(format!("{indent}%{np}{tag}lo = and i32 {v}, 65535"));
                     sq.push(format!("{indent}%{np}{tag}lo32 = shl i32 %{np}{tag}lo, 16"));
                     sq.push(format!("{indent}%{np}{tag}hi = lshr i32 {v}, 16"));
-                    sq.push(format!("{indent}%{np}{tag}lo_f = bitcast i32 %{np}{tag}lo32 to float"));
-                    sq.push(format!("{indent}%{np}{tag}hi_f = bitcast i32 %{np}{tag}hi to float"));
+                    sq.push(format!(
+                        "{indent}%{np}{tag}lo_f = bitcast i32 %{np}{tag}lo32 to float"
+                    ));
+                    sq.push(format!(
+                        "{indent}%{np}{tag}hi_f = bitcast i32 %{np}{tag}hi to float"
+                    ));
                 }
                 sq.push(format!("{indent}%{np}flo = call float @llvm.fma.f32(float %{np}alo_f, float %{np}blo_f, float %{np}clo_f)"));
                 sq.push(format!("{indent}%{np}fhi = call float @llvm.fma.f32(float %{np}ahi_f, float %{np}bhi_f, float %{np}chi_f)"));
@@ -3217,13 +3410,21 @@ fn rewrite_packed_math(text: &str) -> String {
                 // RNE pack
                 sq.push(format!("{indent}%{np}lo32.ls1 = lshr i32 %{np}lo32, 16"));
                 sq.push(format!("{indent}%{np}lo32.ls2 = and i32 %{np}lo32.ls1, 1"));
-                sq.push(format!("{indent}%{np}lo32.rnd = add i32 %{np}lo32.ls2, 32767"));
-                sq.push(format!("{indent}%{np}lo32.rn = add i32 %{np}lo32, %{np}lo32.rnd"));
+                sq.push(format!(
+                    "{indent}%{np}lo32.rnd = add i32 %{np}lo32.ls2, 32767"
+                ));
+                sq.push(format!(
+                    "{indent}%{np}lo32.rn = add i32 %{np}lo32, %{np}lo32.rnd"
+                ));
                 sq.push(format!("{indent}%{np}lo16 = lshr i32 %{np}lo32.rn, 16"));
                 sq.push(format!("{indent}%{np}hi32.ls1 = lshr i32 %{np}hi32, 16"));
                 sq.push(format!("{indent}%{np}hi32.ls2 = and i32 %{np}hi32.ls1, 1"));
-                sq.push(format!("{indent}%{np}hi32.rnd = add i32 %{np}hi32.ls2, 32767"));
-                sq.push(format!("{indent}%{np}hi32.rn = add i32 %{np}hi32, %{np}hi32.rnd"));
+                sq.push(format!(
+                    "{indent}%{np}hi32.rnd = add i32 %{np}hi32.ls2, 32767"
+                ));
+                sq.push(format!(
+                    "{indent}%{np}hi32.rn = add i32 %{np}hi32, %{np}hi32.rnd"
+                ));
                 sq.push(format!("{indent}%{np}hi16 = lshr i32 %{np}hi32.rn, 16"));
                 sq.push(format!("{indent}%{np}hi16s = shl i32 %{np}hi16, 16"));
                 sq.push(format!("{indent}{res} = or i32 %{np}lo16, %{np}hi16s"));
@@ -3234,11 +3435,20 @@ fn rewrite_packed_math(text: &str) -> String {
         }
         // -- cvt.rn/rz.f16x2.f32 "=r,f,f"(float hi, float lo)
         if (opcode == "cvt.rn.f16x2.f32" || opcode == "cvt.rz.f16x2.f32") {
-            let fls: Vec<&str> = ops_text.split("float ").skip(1)
-                .map(|s| s.split(',').next().unwrap_or("").trim()).collect();
+            let fls: Vec<&str> = ops_text
+                .split("float ")
+                .skip(1)
+                .map(|s| s.split(',').next().unwrap_or("").trim())
+                .collect();
             if fls.len() == 2 {
-                out.push(format!("{indent}%{np}h0 = fptrunc float {} to half", fls[0]));
-                out.push(format!("{indent}%{np}h1 = fptrunc float {} to half", fls[1]));
+                out.push(format!(
+                    "{indent}%{np}h0 = fptrunc float {} to half",
+                    fls[0]
+                ));
+                out.push(format!(
+                    "{indent}%{np}h1 = fptrunc float {} to half",
+                    fls[1]
+                ));
                 out.push(format!("{indent}%{np}b0 = bitcast half %{np}h0 to i16"));
                 out.push(format!("{indent}%{np}b1 = bitcast half %{np}h1 to i16"));
                 out.push(format!("{indent}%{np}x0 = zext i16 %{np}b0 to i32"));
@@ -3250,11 +3460,16 @@ fn rewrite_packed_math(text: &str) -> String {
         }
         // -- cvt.rn/rz[.relu].bf16x2.f32 "=r,f,f"(float lo, float hi)
         //    两 f32 → packed bf16x2（RNE 或 RTZ，可选 relu clamp）
-        if (opcode.starts_with("cvt.rn") || opcode.starts_with("cvt.rz")) && opcode.contains("bf16x2") {
+        if (opcode.starts_with("cvt.rn") || opcode.starts_with("cvt.rz"))
+            && opcode.contains("bf16x2")
+        {
             let is_rz = opcode.contains("rz");
             let is_relu = opcode.contains("relu");
-            let fls: Vec<&str> = ops_text.split("float ").skip(1)
-                .map(|s| s.split(',').next().unwrap_or("").trim()).collect();
+            let fls: Vec<&str> = ops_text
+                .split("float ")
+                .skip(1)
+                .map(|s| s.split(',').next().unwrap_or("").trim())
+                .collect();
             if fls.len() == 2 {
                 // fls[0] = lo half source, fls[1] = hi half source
                 for (tag, src) in [("lo", fls[0]), ("hi", fls[1])] {
@@ -3262,21 +3477,35 @@ fn rewrite_packed_math(text: &str) -> String {
                         out.push(format!("{indent}%{np}b{tag} = bitcast float {src} to i32"));
                     } else {
                         out.push(format!("{indent}%{np}f{tag} = fadd float {src}, 0.0"));
-                        out.push(format!("{indent}%{np}b{tag} = bitcast float %{np}f{tag} to i32"));
+                        out.push(format!(
+                            "{indent}%{np}b{tag} = bitcast float %{np}f{tag} to i32"
+                        ));
                     }
                     if is_relu {
                         out.push(format!("{indent}%{np}z{tag} = icmp slt i32 %{np}b{tag}, 0"));
-                        out.push(format!("{indent}%{np}b{tag}z = select i1 %{np}z{tag}, i32 0, i32 %{np}b{tag}"));
+                        out.push(format!(
+                            "{indent}%{np}b{tag}z = select i1 %{np}z{tag}, i32 0, i32 %{np}b{tag}"
+                        ));
                     }
-                    let bz = if is_relu { format!("%{np}b{tag}z") } else { format!("%{np}b{tag}") };
+                    let bz = if is_relu {
+                        format!("%{np}b{tag}z")
+                    } else {
+                        format!("%{np}b{tag}")
+                    };
                     if is_rz {
                         out.push(format!("{indent}%{np}h{tag} = lshr i32 {bz}, 16"));
                     } else {
                         // RNE: bits + 0x7FFF + lsb(bits>>16), then >>16
                         out.push(format!("{indent}%{np}r{tag}.ls1 = lshr i32 {bz}, 16"));
-                        out.push(format!("{indent}%{np}r{tag}.ls2 = and i32 %{np}r{tag}.ls1, 1"));
-                        out.push(format!("{indent}%{np}r{tag}.rnd = add i32 %{np}r{tag}.ls2, 32767"));
-                        out.push(format!("{indent}%{np}r{tag}.rn = add i32 {bz}, %{np}r{tag}.rnd"));
+                        out.push(format!(
+                            "{indent}%{np}r{tag}.ls2 = and i32 %{np}r{tag}.ls1, 1"
+                        ));
+                        out.push(format!(
+                            "{indent}%{np}r{tag}.rnd = add i32 %{np}r{tag}.ls2, 32767"
+                        ));
+                        out.push(format!(
+                            "{indent}%{np}r{tag}.rn = add i32 {bz}, %{np}r{tag}.rnd"
+                        ));
                         out.push(format!("{indent}%{np}h{tag} = lshr i32 %{np}r{tag}.rn, 16"));
                     }
                 }
@@ -3287,14 +3516,23 @@ fn rewrite_packed_math(text: &str) -> String {
         }
         // -- cvt.rn/rz[.relu].f16x2.f32 relu 变体（已有 f16x2 非 relu 处理器）
         if (opcode.starts_with("cvt.rn.relu.f16x2") || opcode.starts_with("cvt.rz.relu.f16x2")) {
-            let fls: Vec<&str> = ops_text.split("float ").skip(1)
-                .map(|s| s.split(',').next().unwrap_or("").trim()).collect();
+            let fls: Vec<&str> = ops_text
+                .split("float ")
+                .skip(1)
+                .map(|s| s.split(',').next().unwrap_or("").trim())
+                .collect();
             if fls.len() == 2 {
                 for (tag, src) in [("lo", fls[0]), ("hi", fls[1])] {
                     out.push(format!("{indent}%{np}h{tag} = fptrunc float {src} to half"));
-                    out.push(format!("{indent}%{np}z{tag} = fcmp olt half %{np}h{tag}, 0.0"));
-                    out.push(format!("{indent}%{np}h{tag}r = select i1 %{np}z{tag}, half 0.0, half %{np}h{tag}"));
-                    out.push(format!("{indent}%{np}b{tag} = bitcast half %{np}h{tag}r to i16"));
+                    out.push(format!(
+                        "{indent}%{np}z{tag} = fcmp olt half %{np}h{tag}, 0.0"
+                    ));
+                    out.push(format!(
+                        "{indent}%{np}h{tag}r = select i1 %{np}z{tag}, half 0.0, half %{np}h{tag}"
+                    ));
+                    out.push(format!(
+                        "{indent}%{np}b{tag} = bitcast half %{np}h{tag}r to i16"
+                    ));
                     out.push(format!("{indent}%{np}x{tag} = zext i16 %{np}b{tag} to i32"));
                 }
                 out.push(format!("{indent}%{np}xs = shl i32 %{np}xhi, 16"));
@@ -3307,7 +3545,9 @@ fn rewrite_packed_math(text: &str) -> String {
             let v = ops_text.split("i16 ").nth(1).map(str::trim).unwrap_or("");
             out.push(format!("{indent}%{np}h = bitcast i16 {v} to half"));
             out.push(format!("{indent}%{np}f = fpext half %{np}h to float"));
-            out.push(format!("{indent}%{np}e = call float @llvm.amdgcn.exp2.f32(float %{np}f)"));
+            out.push(format!(
+                "{indent}%{np}e = call float @llvm.amdgcn.exp2.f32(float %{np}f)"
+            ));
             out.push(format!("{indent}%{np}t = fptrunc float %{np}e to half"));
             out.push(format!("{indent}{res} = bitcast half %{np}t to i16"));
             if !text.contains("declare float @llvm.amdgcn.exp2.f32") {
@@ -3317,21 +3557,41 @@ fn rewrite_packed_math(text: &str) -> String {
         }
         // -- f32x2: add/sub/mul/fma "=l,l,l[,l]"(i64, i64[, i64])
         if opcode.contains("f32x2") {
-            let args: Vec<&str> = ops_text.split("i64 ").skip(1)
-                .map(|s| s.split(',').next().unwrap_or("").trim()).collect();
+            let args: Vec<&str> = ops_text
+                .split("i64 ")
+                .skip(1)
+                .map(|s| s.split(',').next().unwrap_or("").trim())
+                .collect();
             if args.len() >= 2 {
                 let is_fma = opcode.starts_with("fma");
-                out.push(format!("{indent}%{np}va = bitcast i64 {} to <2 x float>", args[0]));
-                out.push(format!("{indent}%{np}vb = bitcast i64 {} to <2 x float>", args[1]));
+                out.push(format!(
+                    "{indent}%{np}va = bitcast i64 {} to <2 x float>",
+                    args[0]
+                ));
+                out.push(format!(
+                    "{indent}%{np}vb = bitcast i64 {} to <2 x float>",
+                    args[1]
+                ));
                 if is_fma && args.len() >= 3 {
-                    out.push(format!("{indent}%{np}vc = bitcast i64 {} to <2 x float>", args[2]));
+                    out.push(format!(
+                        "{indent}%{np}vc = bitcast i64 {} to <2 x float>",
+                        args[2]
+                    ));
                     out.push(format!("{indent}%{np}vs = call <2 x float> @llvm.fma.v2f32(<2 x float> %{np}va, <2 x float> %{np}vb, <2 x float> %{np}vc)"));
                     // declare 尾部统一插入
                 } else {
-                    let flop = match opcode.split('.').next() { Some("add") => "fadd", Some("sub") => "fsub", _ => "fmul" };
-                    out.push(format!("{indent}%{np}vs = {flop} <2 x float> %{np}va, %{np}vb"));
+                    let flop = match opcode.split('.').next() {
+                        Some("add") => "fadd",
+                        Some("sub") => "fsub",
+                        _ => "fmul",
+                    };
+                    out.push(format!(
+                        "{indent}%{np}vs = {flop} <2 x float> %{np}va, %{np}vb"
+                    ));
                 }
-                out.push(format!("{indent}{res} = bitcast <2 x float> %{np}vs to i64"));
+                out.push(format!(
+                    "{indent}{res} = bitcast <2 x float> %{np}vs to i64"
+                ));
                 continue;
             }
         }
@@ -3339,38 +3599,69 @@ fn rewrite_packed_math(text: &str) -> String {
     }
     {
         let mut text = {
-        let mut text = out.join("\n");
-        // 尾部统一插入 declares（首 define 前）
-        if text.contains("@llvm.fma.v2f32") && !text.contains("declare <2 x float> @llvm.fma.v2f32") {
-            if let Some(i) = text.find("\ndefine ") {
-                text = format!("{}\ndeclare <2 x float> @llvm.fma.v2f32(<2 x float>, <2 x float>, <2 x float>){}", &text[..i], &text[i..]);
+            let mut text = out.join("\n");
+            // 尾部统一插入 declares（首 define 前）
+            if text.contains("@llvm.fma.v2f32")
+                && !text.contains("declare <2 x float> @llvm.fma.v2f32")
+            {
+                if let Some(i) = text.find("\ndefine ") {
+                    text = format!(
+                        "{}\ndeclare <2 x float> @llvm.fma.v2f32(<2 x float>, <2 x float>, <2 x float>){}",
+                        &text[..i],
+                        &text[i..]
+                    );
+                }
             }
-        }
-        if text.contains("@llvm.amdgcn.exp2.f32") && !text.contains("declare float @llvm.amdgcn.exp2.f32") {
-            if let Some(i) = text.find("\ndefine ") {
-                text = format!("{}\ndeclare float @llvm.amdgcn.exp2.f32(float){}", &text[..i], &text[i..]);
+            if text.contains("@llvm.amdgcn.exp2.f32")
+                && !text.contains("declare float @llvm.amdgcn.exp2.f32")
+            {
+                if let Some(i) = text.find("\ndefine ") {
+                    text = format!(
+                        "{}\ndeclare float @llvm.amdgcn.exp2.f32(float){}",
+                        &text[..i],
+                        &text[i..]
+                    );
+                }
             }
-        }
+            if text.contains("@llvm.fma.f32") && !text.contains("declare float @llvm.fma.f32") {
+                if let Some(i) = text.find("\ndefine ") {
+                    text = format!(
+                        "{}\ndeclare float @llvm.fma.f32(float, float, float){}",
+                        &text[..i],
+                        &text[i..]
+                    );
+                }
+            }
+            text
+        }; // 统一插入 declares（首 define 前）
         if text.contains("@llvm.fma.f32") && !text.contains("declare float @llvm.fma.f32") {
-            if let Some(i) = text.find("\ndefine ") {
-                text = format!("{}\ndeclare float @llvm.fma.f32(float, float, float){}", &text[..i], &text[i..]);
+            if let Some(idx) = text.find("\ndefine ") {
+                text = format!(
+                    "{}\ndeclare float @llvm.fma.f32(float, float, float){}",
+                    &text[..idx],
+                    &text[idx..]
+                );
             }
         }
-        text
-    };   // 统一插入 declares（首 define 前）
-        if text.contains("@llvm.fma.f32") && !text.contains("declare float @llvm.fma.f32") {
+        if text.contains("@llvm.amdgcn.exp2.f32")
+            && !text.contains("declare float @llvm.amdgcn.exp2.f32")
+        {
             if let Some(idx) = text.find("\ndefine ") {
-                text = format!("{}\ndeclare float @llvm.fma.f32(float, float, float){}", &text[..idx], &text[idx..]);
+                text = format!(
+                    "{}\ndeclare float @llvm.amdgcn.exp2.f32(float){}",
+                    &text[..idx],
+                    &text[idx..]
+                );
             }
         }
-        if text.contains("@llvm.amdgcn.exp2.f32") && !text.contains("declare float @llvm.amdgcn.exp2.f32") {
+        if text.contains("@llvm.fma.v2f32") && !text.contains("declare <2 x float> @llvm.fma.v2f32")
+        {
             if let Some(idx) = text.find("\ndefine ") {
-                text = format!("{}\ndeclare float @llvm.amdgcn.exp2.f32(float){}", &text[..idx], &text[idx..]);
-            }
-        }
-        if text.contains("@llvm.fma.v2f32") && !text.contains("declare <2 x float> @llvm.fma.v2f32") {
-            if let Some(idx) = text.find("\ndefine ") {
-                text = format!("{}\ndeclare <2 x float> @llvm.fma.v2f32(<2 x float>, <2 x float>, <2 x float>){}", &text[..idx], &text[idx..]);
+                text = format!(
+                    "{}\ndeclare <2 x float> @llvm.fma.v2f32(<2 x float>, <2 x float>, <2 x float>){}",
+                    &text[..idx],
+                    &text[idx..]
+                );
             }
         }
         text
@@ -3406,7 +3697,8 @@ fn split_assign(line: &str) -> Option<(&str, &str, &str)> {
 
 /// Strips the `(tail )call ` prefix.
 fn strip_call_prefix(rhs: &str) -> Option<&str> {
-    rhs.strip_prefix("tail call ").or_else(|| rhs.strip_prefix("call "))
+    rhs.strip_prefix("tail call ")
+        .or_else(|| rhs.strip_prefix("call "))
 }
 
 /// Whether a call's tail after `)` is only whitespace and `#N` attribute
@@ -3517,7 +3809,9 @@ fn rewrite_byval_in_function(body: &[&str]) -> Vec<String> {
             .map(|p| {
                 tail[p + 1..]
                     .chars()
-                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.' || *c == '$')
+                    .take_while(|c| {
+                        c.is_ascii_alphanumeric() || *c == '_' || *c == '.' || *c == '$'
+                    })
                     .collect()
             })
             .unwrap_or(name);
@@ -3545,7 +3839,9 @@ fn rewrite_byval_in_function(body: &[&str]) -> Vec<String> {
         init.push(format!(
             "{indent}%{name}.p = addrspacecast ptr addrspace(5) %{name}.addr to ptr"
         ));
-        init.push(format!("{indent}store {ty} %{name}, ptr addrspace(5) %{name}.addr, align {align}"));
+        init.push(format!(
+            "{indent}store {ty} %{name}, ptr addrspace(5) %{name}.addr, align {align}"
+        ));
     }
     // 先输出 define..标签（含），插入 init，再输出剩余体（重命名）
     let head_end = if label_at.is_some() { insert_at + 1 } else { 1 };
@@ -3640,8 +3936,15 @@ fn trim_pointer_prefix(out: &mut String) {
         }
         // longest-match a pointer-only attribute token
         let mut removed = false;
-        for attr in ["nonnull", "noalias", "nofree", "readonly", "writeonly",
-                     "readnone", "nocapture"] {
+        for attr in [
+            "nonnull",
+            "noalias",
+            "nofree",
+            "readonly",
+            "writeonly",
+            "readnone",
+            "nocapture",
+        ] {
             if let Some(pos) = trimmed.rfind(attr) {
                 // must be a whole trailing token (bounded by space on the left)
                 if pos + attr.len() == trimmed.len()
@@ -3678,8 +3981,10 @@ fn trim_pointer_prefix(out: &mut String) {
                 if let Some(start) = start {
                     let head = trimmed[..start].trim_end();
                     let is_attr = head.rsplit(' ').next().is_some_and(|t| {
-                        t == "dereferenceable" || t == "dereferenceable_or_null"
-                            || t == "captures" || t == "alignment"
+                        t == "dereferenceable"
+                            || t == "dereferenceable_or_null"
+                            || t == "captures"
+                            || t == "alignment"
                     });
                     if is_attr && close + 1 == trimmed.len() {
                         let cut = head.rfind(' ').map(|p| p + 1).unwrap_or(0);
@@ -3814,9 +4119,11 @@ entry:
   ret i32 7
 }
 ";
-        assert!(rewrite_ir_for_amdgcn(ll2)
-            .unwrap()
-            .contains("define hidden i32 @helper() #0 {"));
+        assert!(
+            rewrite_ir_for_amdgcn(ll2)
+                .unwrap()
+                .contains("define hidden i32 @helper() #0 {")
+        );
     }
 
     #[test]
@@ -3831,9 +4138,9 @@ entry:
 }
 ";
         let out = rewrite_ir_for_amdgcn(ll).unwrap();
-        assert!(out.contains(
-            "@k(ptr captures(none) %v0, i32 %ntid_x, i32 %ntid_y, i32 %ntid_z) #0 {"
-        ));
+        assert!(
+            out.contains("@k(ptr captures(none) %v0, i32 %ntid_x, i32 %ntid_y, i32 %ntid_z) #0 {")
+        );
     }
 
     #[test]
@@ -3852,9 +4159,9 @@ entry:
 ";
         let out = rewrite_ir_for_amdgcn(ll).unwrap();
         assert!(out.contains("= or i32 %ntid_x, 0"));
-        assert!(out.contains(
-            "define hidden i32 @helper(i32 %ntid_x, i32 %ntid_y, i32 %ntid_z) #0 {"
-        ));
+        assert!(
+            out.contains("define hidden i32 @helper(i32 %ntid_x, i32 %ntid_y, i32 %ntid_z) #0 {")
+        );
     }
 
     #[test]
@@ -3973,9 +4280,7 @@ entry:
         assert!(out.contains("getelementptr inbounds {}, ptr %v15.ac, i64 0"));
         // no bare uses of the alloca name outside its own definition/cast
         for line in out.lines() {
-            if line.contains("%v15")
-                && !line.contains("alloca")
-                && !line.contains("addrspacecast")
+            if line.contains("%v15") && !line.contains("alloca") && !line.contains("addrspacecast")
             {
                 assert!(line.contains("%v15.ac"), "bare use survived: {line}");
             }
@@ -4017,7 +4322,11 @@ entry:
 ";
         // Typed-pointer IR is rejected upstream anyway; the pass must not
         // produce an illegal cross-address-space bitcast.
-        assert!(rewrite_ir_for_amdgcn(ll).unwrap().contains("alloca i8, align 1\n"));
+        assert!(
+            rewrite_ir_for_amdgcn(ll)
+                .unwrap()
+                .contains("alloca i8, align 1\n")
+        );
     }
 
     // ---- [PORT gfx1030 PhaseB.2] shuffle (Step 10/10c) ------------------
@@ -4121,9 +4430,11 @@ entry:
   ret void
 }
 ";
-        assert!(rewrite_ir_for_amdgcn(ll)
-            .unwrap()
-            .contains("shfl.sync.bfly.b32"));
+        assert!(
+            rewrite_ir_for_amdgcn(ll)
+                .unwrap()
+                .contains("shfl.sync.bfly.b32")
+        );
     }
 
     /// Post-rebase #1311 production shape: partial-warp collective scan with a
@@ -4285,12 +4596,12 @@ entry:
         assert!(!out.contains("llvm.nvvm"), "dotprod residue");
         // same-sign idp4a → hardware v_dot4 intrinsics, clamp=false, operands
         // passed through verbatim
-        assert!(out.contains(
-            "%d4s = call i32 @llvm.amdgcn.sdot4(i32 %a, i32 %b, i32 %c, i1 false)"
-        ));
-        assert!(out.contains(
-            "%d4u = call i32 @llvm.amdgcn.udot4(i32 %a, i32 %b, i32 %c, i1 false)"
-        ));
+        assert!(
+            out.contains("%d4s = call i32 @llvm.amdgcn.sdot4(i32 %a, i32 %b, i32 %c, i1 false)")
+        );
+        assert!(
+            out.contains("%d4u = call i32 @llvm.amdgcn.udot4(i32 %a, i32 %b, i32 %c, i1 false)")
+        );
         // idp2a.s.s isbottom=false: low half of b, sext both sides
         assert!(out.contains("%d2s.d_a0t = trunc i32 %a to i16"));
         assert!(out.contains("%d2s.d_a0 = sext i16 %d2s.d_a0t to i32"));
@@ -4385,17 +4696,32 @@ entry:
         // init/arrive/noComplete/wait replaced, results keep SSA names
         assert!(out.contains("call void @__port_mb_init(ptr addrspace(3) @bar, i32 %n)"));
         assert!(out.contains("%tok = call i64 @__port_mb_arrive(ptr addrspace(3) @bar)"));
-        assert!(out.contains(
-            "%r = call i32 @__port_mb_test_wait(ptr addrspace(3) @bar, i64 %tok)"
-        ));
+        assert!(
+            out.contains("%r = call i32 @__port_mb_test_wait(ptr addrspace(3) @bar, i64 %tok)")
+        );
         assert!(out.contains("%nc = call i64 @__port_mb_arrive_nc(ptr addrspace(3) @bar, i32 4)"));
         // inval line deleted (no replacement), downstream uses untouched
         assert!(out.contains("store i32 %r, ptr %v0, align 4"));
         // the four helpers are appended exactly once
-        assert_eq!(out.matches("define internal void @__port_mb_init").count(), 1);
-        assert_eq!(out.matches("define internal i64 @__port_mb_arrive(").count(), 1);
-        assert_eq!(out.matches("define internal i64 @__port_mb_arrive_nc").count(), 1);
-        assert_eq!(out.matches("define internal i32 @__port_mb_test_wait").count(), 1);
+        assert_eq!(
+            out.matches("define internal void @__port_mb_init").count(),
+            1
+        );
+        assert_eq!(
+            out.matches("define internal i64 @__port_mb_arrive(")
+                .count(),
+            1
+        );
+        assert_eq!(
+            out.matches("define internal i64 @__port_mb_arrive_nc")
+                .count(),
+            1
+        );
+        assert_eq!(
+            out.matches("define internal i32 @__port_mb_test_wait")
+                .count(),
+            1
+        );
         // the wait predicate must be non-blocking: no spin loop in the helper
         assert!(out.contains("load atomic volatile i64, ptr addrspace(3) %bar"));
     }
@@ -4479,9 +4805,9 @@ entry:
         assert!(out.contains("@llvm.amdgcn.is.private(ptr %buf)"));
         assert!(out.contains("fence syncscope(\"agent\") seq_cst"));
         assert!(out.contains("\n  fence seq_cst"));
-        assert!(out.contains(
-            "atomicrmw add ptr %buf, i32 1 syncscope(\"agent\") monotonic, align 4"
-        ));
+        assert!(
+            out.contains("atomicrmw add ptr %buf, i32 1 syncscope(\"agent\") monotonic, align 4")
+        );
         assert!(!out.contains("syncscope(\"device\")"));
         assert!(!out.contains("syncscope(\"block\")"));
     }
@@ -4493,15 +4819,15 @@ entry:
         assert!(out.contains("fence syncscope(\"workgroup\") acq_rel"));
         assert!(out.contains("fence syncscope(\"agent\") acq_rel"));
         assert!(out.contains("\n  fence acq_rel"));
-        assert!(out.contains(
-            "%la = load atomic i32, ptr %buf syncscope(\"agent\") acquire, align 4"
-        ));
+        assert!(
+            out.contains("%la = load atomic i32, ptr %buf syncscope(\"agent\") acquire, align 4")
+        );
         assert!(out.contains("%lb = load atomic i64, ptr %buf acquire, align 8"));
         // the fence.sc + ld.acquire asm pair folds into one seq_cst load
         assert!(out.contains("%lc = load atomic ptr, ptr %buf seq_cst, align 8"));
-        assert!(out.contains(
-            "store atomic i32 %la, ptr %buf syncscope(\"agent\") release, align 4"
-        ));
+        assert!(
+            out.contains("store atomic i32 %la, ptr %buf syncscope(\"agent\") release, align 4")
+        );
         assert!(out.contains("store atomic ptr %out, ptr %buf release, align 8"));
     }
 
@@ -4521,9 +4847,11 @@ entry:
   ret void
 }
 ";
-        assert!(rewrite_ir_for_amdgcn(ll)
-            .unwrap()
-            .contains("fence syncscope(\"workgroup\") seq_cst"));
+        assert!(
+            rewrite_ir_for_amdgcn(ll)
+                .unwrap()
+                .contains("fence syncscope(\"workgroup\") seq_cst")
+        );
     }
 
     // ---- [PORT gfx1030 PhaseB.4] counted barrier + ocml (Step 14/15) ------
@@ -4558,7 +4886,8 @@ entry:
         // entry init: both slots zeroed + one whole-group barrier
         assert!(out.contains("counted-barrier slot init (ids: 1,2)"));
         assert_eq!(
-            out.matches("store atomic i32 0, ptr addrspace(3) %__port_cb_i").count(),
+            out.matches("store atomic i32 0, ptr addrspace(3) %__port_cb_i")
+                .count(),
             4
         );
         assert!(out.contains("call void @llvm.amdgcn.s.barrier()"));
@@ -4633,7 +4962,8 @@ entry:
 }
 #[test]
 fn vprintf_probe_manual() {
-    let src = std::fs::read_to_string("../rustc-codegen-cuda/examples/printf/printf.amdgcn.ll").unwrap();
+    let src =
+        std::fs::read_to_string("../rustc-codegen-cuda/examples/printf/printf.amdgcn.ll").unwrap();
     let out = crate::amdgcn::rewrite_vprintf_to_ockl(&src);
     println!("begin={}", out.matches("__ockl_printf_begin").count());
     println!("residual={}", out.matches("@vprintf(").count());
@@ -4646,15 +4976,15 @@ mod vprintf_probe {
     use crate::amdgcn::rewrite_vprintf_to_ockl;
     #[test]
     fn fires_on_real_amdgcn_module() {
-        let src = std::fs::read_to_string(
-            "../rustc-codegen-cuda/examples/printf/printf.amdgcn.ll",
-        )
-        .unwrap();
+        let src = std::fs::read_to_string("../rustc-codegen-cuda/examples/printf/printf.amdgcn.ll")
+            .unwrap();
         let out = rewrite_vprintf_to_ockl(&src);
         let begin = out.matches("__ockl_printf_begin").count();
-        println!("begin={begin} residual={} md={}",
+        println!(
+            "begin={begin} residual={} md={}",
             out.matches("@vprintf(").count(),
-            out.contains("amdgpu_printf_kind"));
+            out.contains("amdgpu_printf_kind")
+        );
         assert!(begin > 0, "expansion did not fire");
     }
 }

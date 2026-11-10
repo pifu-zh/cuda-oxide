@@ -923,6 +923,7 @@ pub fn generate_device_code<'tcx>(
     functions: &[CollectedFunction<'tcx>],
     device_externs: &[DeviceExternDecl],
     panic_messages: &std::collections::BTreeMap<(String, u32), Vec<u8>>,
+    panic_report_eligible: &std::collections::BTreeSet<String>,
     config: &DeviceCodegenConfig,
 ) -> Result<DeviceCodegenResult, DeviceCodegenError> {
     use rustc_public::rustc_internal;
@@ -1295,6 +1296,7 @@ pub fn generate_device_code<'tcx>(
             &pipeline_config,
             known_defs,
             panic_messages.clone(),
+            panic_report_eligible.clone(),
         )
     });
 
